@@ -515,12 +515,56 @@ def api_vpn_disconnect():
     vpn_state.update({"active": False, "client": "", "iface": ""})
     return jsonify({"ok": True})
 
+VPN_IFACES = ["tailscale0", "tun0", "tun1", "wg0", "wg1", "ppp0", "nordlynx"]
+
+def _detect_vpn_ifaces():
+    """Devuelve lista de interfaces VPN activas con sus IPs."""
+    found = []
+    for iface in VPN_IFACES:
+        r = subprocess.run(["ip","a","show", iface], capture_output=True, text=True)
+        if r.returncode == 0 and "inet " in r.stdout:
+            ip = next((l.strip() for l in r.stdout.splitlines() if "inet " in l), "")
+            found.append({"iface": iface, "ip": ip})
+    return found
+
+@app.route("/api/vpn/autodetect", methods=["POST"])
+def api_vpn_autodetect():
+    """Detecta VPNs activas en el servidor y actualiza el estado global."""
+    detected = _detect_vpn_ifaces()
+    if detected:
+        best = detected[0]   # Tailscale primero por orden en VPN_IFACES
+        vpn_state["active"] = True
+        vpn_state["iface"]  = best["iface"]
+        if not vpn_state["client"]:
+            vpn_state["client"] = best["iface"]   # nombre temporal
+        return jsonify({"detected": True, "interfaces": detected, **vpn_state, "ip": best["ip"]})
+    return jsonify({"detected": False, **vpn_state})
+
 @app.route("/api/vpn/status")
 def api_vpn_status():
+    # Re-verificar si la interfaz sigue activa
     if vpn_state["active"] and vpn_state["iface"]:
         r = subprocess.run(["ip","a","show", vpn_state["iface"]], capture_output=True, text=True)
+        if "inet " not in r.stdout:
+            # Interfaz caída — intentar re-detectar automáticamente
+            detected = _detect_vpn_ifaces()
+            if detected:
+                vpn_state["iface"] = detected[0]["iface"]
+                if not vpn_state["client"]:
+                    vpn_state["client"] = detected[0]["iface"]
+            else:
+                vpn_state["active"] = False
+                vpn_state["iface"]  = ""
         ip = next((l.strip() for l in r.stdout.splitlines() if "inet " in l), "")
         return jsonify({**vpn_state, "ip": ip})
+    # Si no hay estado activo, intentar detección automática silenciosa
+    detected = _detect_vpn_ifaces()
+    if detected:
+        vpn_state["active"] = True
+        vpn_state["iface"]  = detected[0]["iface"]
+        if not vpn_state["client"]:
+            vpn_state["client"] = detected[0]["iface"]
+        return jsonify({**vpn_state, "ip": detected[0]["ip"], "autodetected": True})
     return jsonify(vpn_state)
 
 # ── API: Ping ─────────────────────────────────────────────────────────────────
@@ -1013,7 +1057,9 @@ select option{background:var(--bg3)}
         <div class="form-group">
           <label>Tipo VPN</label>
           <select id="cf_vpntype" name="vpn_type">
-            <option>OpenVPN</option><option>WireGuard</option>
+            <option>Tailscale</option>
+            <option>OpenVPN</option>
+            <option>WireGuard</option>
           </select>
         </div>
         <div class="form-group">
@@ -1174,14 +1220,27 @@ select option{background:var(--bg3)}
 
 <!-- VPN Modal -->
 <div class="modal-overlay" id="vpnModal">
-  <div class="modal">
+  <div class="modal" style="width:500px">
     <h2>&#x1F512; Gestión VPN</h2>
+
+    <!-- Detected interfaces -->
+    <div id="vpnDetectedBlock" style="display:none;margin-bottom:14px;
+         background:var(--bg3);border-radius:8px;padding:12px;border:1px solid var(--bg4)">
+      <div style="font-size:.78rem;color:var(--dim);font-weight:700;margin-bottom:8px">
+        INTERFACES VPN DETECTADAS EN EL SERVIDOR
+      </div>
+      <div id="vpnDetectedList"></div>
+    </div>
+
+    <div style="height:1px;background:var(--bg4);margin-bottom:14px"></div>
+
     <div class="form-group">
-      <label>Cliente</label>
+      <label>Conectar cliente via VPN</label>
       <select id="vpnSelClient"></select>
     </div>
     <div id="vpnInfo" style="color:var(--dim);font-size:.85rem;margin:8px 0;min-height:22px"></div>
     <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-green btn-sm" onclick="vpnAutodetect()">&#x1F50D; Re-detectar</button>
       <button class="btn btn-orange" onclick="connectVpn()">Conectar VPN</button>
       <button class="btn btn-red"    onclick="disconnectVpn()">Desconectar</button>
       <button class="btn btn-gray"   onclick="closeVpnModal()">Cerrar</button>
@@ -1198,6 +1257,8 @@ let knownDevices = new Set();
 window.onload = async () => {
   await loadProfiles();
   await loadClients();
+  // Auto-detect existing VPN on load (Tailscale, tun0, wg0, etc.)
+  await vpnAutodetect(true);
   pollVpnStatus();
   // Restore engineer name from localStorage
   const saved = localStorage.getItem('engineer');
@@ -1324,8 +1385,45 @@ async function deleteClient(name, e) {
 }
 
 // VPN
-function openVpnModal()  { document.getElementById('vpnModal').classList.add('open'); }
+function openVpnModal()  {
+  document.getElementById('vpnModal').classList.add('open');
+  vpnAutodetect(false);
+}
 function closeVpnModal() { document.getElementById('vpnModal').classList.remove('open'); }
+
+async function vpnAutodetect(silent) {
+  try {
+    const r = await fetch('/api/vpn/autodetect', {method:'POST'});
+    const j = await r.json();
+    updateVpnBadge(j);
+    // Render detected interfaces in modal
+    const block = document.getElementById('vpnDetectedBlock');
+    const list  = document.getElementById('vpnDetectedList');
+    if (j.interfaces && j.interfaces.length > 0) {
+      block.style.display = 'block';
+      list.innerHTML = j.interfaces.map(i => `
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+          <span style="background:#1a3a1a;color:var(--green);border-radius:4px;
+                padding:2px 8px;font-family:'Courier New',monospace;font-size:.82rem;font-weight:700">
+            ● ${i.iface}
+          </span>
+          <span style="color:var(--fg);font-family:'Courier New',monospace;font-size:.82rem">
+            ${i.ip}
+          </span>
+        </div>`).join('');
+      if (!silent)
+        document.getElementById('vpnInfo').textContent =
+          `${j.interfaces.length} interfaz(ces) VPN activa(s) detectada(s).`;
+    } else {
+      block.style.display = 'none';
+      if (!silent)
+        document.getElementById('vpnInfo').textContent = 'No se detectaron interfaces VPN activas.';
+    }
+    if (j.detected && silent) setStatus(`VPN detectada: ${j.iface} (${j.ip || ''})`);
+  } catch(e) {
+    if (!silent) console.error('autodetect error', e);
+  }
+}
 
 async function connectVpn() {
   const client = document.getElementById('vpnSelClient').value;
