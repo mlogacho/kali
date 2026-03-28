@@ -584,7 +584,7 @@ def api_ping():
         yield f"data: {json.dumps({'line': f'PING {host} — {count} paquetes', 'type': 'header'})}\n\n"
         try:
             proc = subprocess.Popen(
-                ["ping", "-c", str(count), "-W", "2", host],
+                ["stdbuf", "-oL", "ping", "-c", str(count), "-W", "2", host],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1
             )
@@ -625,9 +625,13 @@ def api_scan_start():
         return jsonify({"error": "target y command son requeridos"}), 400
 
     cmd     = cmd_tpl.replace("{target}", target)
-    # Inject stats-every into nmap commands so we get periodic ETA updates
-    if re.search(r'\bnmap\b', cmd) and "--stats-every" not in cmd:
-        cmd = cmd.rstrip() + " --stats-every 8s"
+    # Force line-buffered output from nmap (avoids pipe buffering)
+    # and inject --stats-every for periodic ETA updates
+    if re.search(r'\bnmap\b', cmd):
+        if "stdbuf" not in cmd:
+            cmd = "stdbuf -oL " + cmd
+        if "--stats-every" not in cmd:
+            cmd = cmd.rstrip() + " --stats-every 8s"
     scan_id = str(uuid.uuid4())[:8]
     start   = now_str()
 
