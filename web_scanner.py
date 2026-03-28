@@ -26,17 +26,17 @@ active_scans: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
 
 SCAN_PROFILES = {
-    "Descubrimiento (hosts vivos)":     "nmap -sn -T4 {target}",
-    "Puertos top-1000":                  "nmap -sT -T4 --open {target}",
-    "Puertos completos (1-65535)":       "nmap -sT -T4 -p- --open {target}",
-    "Versiones + Sistema Operativo":     "nmap -sT -sV -O -T4 {target}",
-    "Vulnerabilidades NSE (vuln)":       "nmap -sT -sV --script vuln -T4 {target}",
-    "Vuln + SO + Versiones (completo)":  "nmap -sT -sV -O --script vuln -T4 {target}",
-    "CVEs con CVSS (vulners)":           "nmap -sT -sV --script vulners --script-args mincvss=5.0 -T4 {target}",
-    "Web / HTTP (nikto)":                "nikto -h {target}",
-    "SMB vulnerabilidades":              "nmap -sT -p445 --script smb-vuln* -T4 {target}",
-    "SSL/TLS — red/subred (nmap)":       "nmap -sT --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
-    "SSL/TLS — host único (sslscan)":    "sslscan --no-colour {target}",
+    "Descubrimiento (hosts vivos)":      "nmap -sn -T4 {target}",
+    "Puertos top-1000":                   "nmap -sT -Pn -T4 --open {target}",
+    "Puertos completos (1-65535)":        "nmap -sT -Pn -T4 -p- --open {target}",
+    "Info HTTP/SSH/FTP":                  "nmap -sT -Pn -T4 --script http-title,http-headers,ssh-hostkey,ftp-anon {target}",
+    "Vulnerabilidades NSE":               "nmap -sT -Pn -T4 --script 'vuln and not ssl-heartbleed and not ssl-poodle and not sslv2-drown and not ssl-ccs-injection and not ssl-cert-intaddr and not ssl-known-key and not tls-ticketbleed' {target}",
+    "Vuln + Info HTTP/SSH (completo)":    "nmap -sT -Pn -T4 --script 'vuln and not ssl-heartbleed and not ssl-poodle and not sslv2-drown and not ssl-ccs-injection and not ssl-cert-intaddr and not ssl-known-key and not tls-ticketbleed',http-title,http-headers,ssh-hostkey {target}",
+    "CVEs con CVSS (vulners)":            "nmap -sT -Pn -T4 --script vulners --script-args mincvss=5.0 {target}",
+    "Web / HTTP (nikto)":                 "nikto -h {target}",
+    "SMB vulnerabilidades":               "nmap -sT -Pn -p445 --script 'smb-vuln*' -T4 {target}",
+    "SSL/TLS — red/subred (nmap)":        "nmap -sT -Pn --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
+    "SSL/TLS — host único (sslscan)":     "sslscan --no-colour {target}",
 }
 
 SEV_COLORS = {
