@@ -5,8 +5,8 @@ Corre en el servidor Kali en el puerto 8040.
 Acceder desde: http://<kali-ip>:8040
 """
 
-import os, json, re, datetime, subprocess, threading, time, uuid, shutil
-from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context
+import os, json, re, datetime, subprocess, threading, time, uuid, io
+from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context, send_file
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
@@ -21,24 +21,32 @@ if not os.path.exists(CLIENTS_FILE):
     with open(CLIENTS_FILE, "w") as f:
         json.dump({}, f)
 
-# ── State ─────────────────────────────────────────────────────────────────────
-active_scans: dict[str, dict] = {}   # scan_id -> {proc, lines[], done, client, target}
-vpn_state     = {"active": False, "client": "", "iface": ""}
+# ── State ──────────────────────────────────────────────────────────────────────
+active_scans: dict[str, dict] = {}
+vpn_state = {"active": False, "client": "", "iface": ""}
 
 SCAN_PROFILES = {
-    "Descubrimiento (hosts vivos)":    "sudo nmap -sn {target}",
-    "Puertos top-1000":                "sudo nmap -sS -T4 --open {target}",
-    "Puertos completos (1-65535)":     "sudo nmap -sS -T4 -p- --open {target}",
-    "Versiones + Sistema Operativo":   "sudo nmap -sS -sV -O -T4 {target}",
-    "Vulnerabilidades NSE (vuln)":     "sudo nmap -sV --script vuln -T4 {target}",
-    "Vuln + SO + Versiones (completo)":"sudo nmap -sS -sV -O --script vuln -T4 {target}",
-    "CVEs con CVSS (vulners)":         "sudo nmap -sV --script vulners --script-args mincvss=5.0 -T4 {target}",
-    "Web / HTTP (nikto)":              "nikto -h {target}",
-    "SMB vulnerabilidades":            "sudo nmap -p445 --script smb-vuln* -T4 {target}",
-    "SSL/TLS (sslscan)":               "sslscan {target}",
+    "Descubrimiento (hosts vivos)":     "sudo nmap -sn {target}",
+    "Puertos top-1000":                  "sudo nmap -sS -T4 --open {target}",
+    "Puertos completos (1-65535)":       "sudo nmap -sS -T4 -p- --open {target}",
+    "Versiones + Sistema Operativo":     "sudo nmap -sS -sV -O -T4 {target}",
+    "Vulnerabilidades NSE (vuln)":       "sudo nmap -sV --script vuln -T4 {target}",
+    "Vuln + SO + Versiones (completo)":  "sudo nmap -sS -sV -O --script vuln -T4 {target}",
+    "CVEs con CVSS (vulners)":           "sudo nmap -sV --script vulners --script-args mincvss=5.0 -T4 {target}",
+    "Web / HTTP (nikto)":                "nikto -h {target}",
+    "SMB vulnerabilidades":              "sudo nmap -p445 --script smb-vuln* -T4 {target}",
+    "SSL/TLS (sslscan)":                 "sslscan {target}",
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+SEV_COLORS = {
+    "CRITICAL": "#ff4444",
+    "HIGH":     "#ff8800",
+    "MEDIUM":   "#ffcc00",
+    "LOW":      "#44aaff",
+    "INFO":     "#c9d1d9",
+}
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def load_clients():
     with open(CLIENTS_FILE) as f:
@@ -63,7 +71,357 @@ def detect_severity(line):
 def now_str():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ── API: Clients ──────────────────────────────────────────────────────────────
+def now_display():
+    return datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+# ── PDF Generation ─────────────────────────────────────────────────────────────
+
+def generate_pdf_report(scan: dict) -> bytes:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY, TA_RIGHT
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        HRFlowable, KeepTogether
+    )
+
+    W, H = A4
+    C_BG    = colors.HexColor("#0d1117")
+    C_BLUE  = colors.HexColor("#58a6ff")
+    C_GREEN = colors.HexColor("#3fb950")
+    C_GRAY  = colors.HexColor("#30363d")
+    C_DIM   = colors.HexColor("#8b949e")
+    C_FG    = colors.HexColor("#c9d1d9")
+    C_ROW1  = colors.HexColor("#161b22")
+    C_ROW2  = colors.HexColor("#0d1117")
+    C_CRIT  = colors.HexColor("#ff4444")
+    C_HIGH  = colors.HexColor("#ff8800")
+    C_MED   = colors.HexColor("#ffcc00")
+    C_LOW   = colors.HexColor("#44aaff")
+    WHITE   = colors.white
+
+    SEV_C = {"CRITICAL": C_CRIT, "HIGH": C_HIGH,
+              "MEDIUM": C_MED, "LOW": C_LOW, "INFO": C_FG}
+
+    engineer   = scan.get("engineer", "Sin especificar")
+    client     = scan.get("client",   "N/A")
+    target     = scan.get("target",   "N/A")
+    profile    = scan.get("profile",  "N/A")
+    command    = scan.get("command",  "N/A")
+    start_time = scan.get("start",    now_str())
+    end_time   = scan.get("end",      now_str())
+    scan_id    = scan.get("id",       "N/A")
+    lines      = scan.get("lines",    [])
+
+    # Count findings
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for line in lines:
+        sev = detect_severity(line if isinstance(line, str) else "")
+        counts[sev] += 1
+
+    buf = io.BytesIO()
+
+    def on_page(canvas, doc):
+        canvas.saveState()
+        # Header
+        canvas.setFillColor(C_BG)
+        canvas.rect(0, H - 1.5*cm, W, 1.5*cm, fill=1, stroke=0)
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.setFillColor(C_BLUE)
+        canvas.drawString(1.5*cm, H - 0.85*cm,
+                          "INFORME DE ESCANEO DE VULNERABILIDADES — CONFIDENCIAL")
+        canvas.setFillColor(C_DIM)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawRightString(W - 1.5*cm, H - 0.85*cm, f"ID: {scan_id}")
+        # Top line
+        canvas.setStrokeColor(C_BLUE)
+        canvas.setLineWidth(1.5)
+        canvas.line(0, H - 1.5*cm, W, H - 1.5*cm)
+        # Footer
+        canvas.setFillColor(C_BG)
+        canvas.rect(0, 0, W, 1.1*cm, fill=1, stroke=0)
+        canvas.setLineWidth(0.5)
+        canvas.setStrokeColor(C_GRAY)
+        canvas.line(0, 1.1*cm, W, 1.1*cm)
+        canvas.setFillColor(C_DIM)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(1.5*cm, 0.45*cm,
+                          f"Datacom Security  •  Generado: {now_display()}  •  Confidencial")
+        canvas.drawRightString(W - 1.5*cm, 0.45*cm, f"Página {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=1.8*cm, rightMargin=1.8*cm,
+        topMargin=2.2*cm, bottomMargin=1.8*cm,
+    )
+
+    base = getSampleStyleSheet()
+    def S(name, parent="Normal", **kw):
+        return ParagraphStyle(name, parent=base[parent], **kw)
+
+    st = {
+        "title":  S("t", fontSize=20, leading=26, textColor=WHITE,
+                    fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "sub":    S("s", fontSize=10, leading=14, textColor=C_BLUE,
+                    fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "h1":     S("h1", fontSize=13, leading=18, textColor=C_BLUE,
+                    fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=4),
+        "h2":     S("h2", fontSize=10, leading=14, textColor=C_GREEN,
+                    fontName="Helvetica-Bold", spaceBefore=8, spaceAfter=3),
+        "body":   S("b", fontSize=8.5, leading=13, textColor=C_FG,
+                    fontName="Helvetica", alignment=TA_JUSTIFY,
+                    spaceBefore=2, spaceAfter=3),
+        "code":   S("c", fontSize=7.5, leading=11, textColor=colors.HexColor("#e3b341"),
+                    fontName="Courier", backColor=C_ROW1,
+                    leftIndent=8, rightIndent=8, spaceBefore=3, spaceAfter=3),
+        "sign":   S("sg", fontSize=9, leading=14, textColor=C_FG,
+                    fontName="Helvetica", alignment=TA_CENTER),
+        "sign_name": S("sn", fontSize=13, leading=18, textColor=WHITE,
+                       fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "label":  S("l", fontSize=8, leading=12, textColor=C_DIM,
+                    fontName="Helvetica-Bold"),
+    }
+
+    def hr(c=C_BLUE, t=0.5):
+        return HRFlowable(width="100%", thickness=t, color=c,
+                          spaceAfter=5, spaceBefore=5)
+
+    def meta_table(rows):
+        t = Table(rows, colWidths=[4.5*cm, 10.7*cm])
+        t.setStyle(TableStyle([
+            ("FONTNAME",  (0,0), (0,-1), "Helvetica-Bold"),
+            ("FONTNAME",  (1,0), (1,-1), "Helvetica"),
+            ("FONTSIZE",  (0,0), (-1,-1), 8.5),
+            ("TEXTCOLOR", (0,0), (0,-1), C_DIM),
+            ("TEXTCOLOR", (1,0), (1,-1), WHITE),
+            ("VALIGN",    (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING",(0,0), (-1,-1), 5),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+            ("LEFTPADDING",(0,0),(-1,-1), 6),
+            ("ROWBACKGROUNDS",(0,0),(-1,-1), [C_ROW1, C_ROW2]),
+            ("GRID", (0,0), (-1,-1), 0.3, C_GRAY),
+        ]))
+        return t
+
+    story = []
+
+    # ── COVER BLOCK ──────────────────────────────────────────────────────────
+    cover_bg = Table(
+        [[Paragraph("INFORME DE ESCANEO DE VULNERABILIDADES", st["title"]),],
+         [Paragraph("Datacom Security — Ethical Hacking", st["sub"])]],
+        colWidths=[W - 3.6*cm]
+    )
+    cover_bg.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), C_BG),
+        ("TOPPADDING",  (0,0), (-1,-1), 16),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 16),
+        ("LEFTPADDING", (0,0), (-1,-1), 16),
+        ("RIGHTPADDING",(0,0), (-1,-1), 16),
+        ("LINEABOVE",  (0,0), (-1,0), 2, C_BLUE),
+        ("LINEBELOW",  (0,-1),(-1,-1), 2, C_BLUE),
+    ]))
+    story.append(cover_bg)
+    story.append(Spacer(1, 0.5*cm))
+
+    # ── META TABLE ────────────────────────────────────────────────────────────
+    story.append(Paragraph("Información del Test", st["h1"]))
+    story.append(hr())
+    story.append(meta_table([
+        ["Ingeniero responsable", engineer],
+        ["Cliente / Empresa",     client],
+        ["Objetivo escaneado",    target],
+        ["Perfil de escaneo",     profile],
+        ["Fecha y hora de inicio", start_time],
+        ["Fecha y hora de fin",    end_time],
+        ["ID del escaneo",        scan_id],
+        ["VPN activa",            scan.get("vpn_client", "No")],
+    ]))
+
+    # ── SUMMARY ───────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.3*cm))
+    story.append(Paragraph("Resumen de Hallazgos", st["h1"]))
+    story.append(hr())
+
+    sev_rows = [["Severidad", "Cantidad", "Descripción"]]
+    sev_info = [
+        ("CRITICAL", C_CRIT, "Vulnerabilidades críticas explotables remotamente"),
+        ("HIGH",     C_HIGH, "Vulnerabilidades con CVE conocido o alto impacto"),
+        ("MEDIUM",   C_MED,  "Configuraciones débiles o riesgo moderado"),
+        ("LOW",      C_LOW,  "Información de baja criticidad"),
+        ("INFO",     C_FG,   "Líneas informativas sin implicación de riesgo"),
+    ]
+    sev_rows += [[s, str(counts[s]), d] for s, c, d in sev_info]
+
+    sev_style = [
+        ("BACKGROUND", (0,0), (-1,0), C_GRAY),
+        ("TEXTCOLOR",  (0,0), (-1,0), WHITE),
+        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0,0), (-1,-1), 8.5),
+        ("ALIGN",      (1,0), (1,-1), "CENTER"),
+        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 6),
+        ("LEFTPADDING",(0,0), (-1,-1), 8),
+        ("GRID",       (0,0), (-1,-1), 0.3, C_GRAY),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW1, C_ROW2]),
+    ]
+    for i, (sev, col, _) in enumerate(sev_info, 1):
+        sev_style += [
+            ("TEXTCOLOR", (0,i), (0,i), col),
+            ("FONTNAME",  (0,i), (0,i), "Helvetica-Bold"),
+        ]
+        if counts[sev] > 0 and sev in ("CRITICAL","HIGH"):
+            sev_style.append(("TEXTCOLOR", (1,i), (1,i), col))
+            sev_style.append(("FONTNAME",  (1,i), (1,i), "Helvetica-Bold"))
+
+    t = Table(sev_rows, colWidths=[2.8*cm, 2.2*cm, 10.2*cm])
+    t.setStyle(TableStyle(sev_style))
+    story.append(t)
+
+    # ── COMMAND ───────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.3*cm))
+    story.append(Paragraph("Comando ejecutado:", st["h2"]))
+    story.append(Paragraph(command, st["code"]))
+
+    # ── RESULTS ───────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.2*cm))
+    story.append(Paragraph("Resultados del Escaneo", st["h1"]))
+    story.append(hr())
+
+    # Filter critical/high/medium findings separately
+    findings = [(l, detect_severity(l)) for l in lines
+                if detect_severity(l) in ("CRITICAL","HIGH","MEDIUM")]
+
+    if findings:
+        story.append(Paragraph(
+            f"Se detectaron <b>{len(findings)}</b> hallazgos relevantes (CRITICAL/HIGH/MEDIUM):",
+            st["body"]))
+        story.append(Spacer(1, 0.15*cm))
+        find_rows = [["SEV", "Hallazgo"]]
+        for line, sev in findings[:80]:  # max 80 findings
+            find_rows.append([sev, line.strip()])
+        ft = Table(find_rows, colWidths=[2*cm, 13.2*cm])
+        fs = [
+            ("BACKGROUND", (0,0), (-1,0), C_GRAY),
+            ("TEXTCOLOR",  (0,0), (-1,0), WHITE),
+            ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",   (0,0), (-1,-1), 7.5),
+            ("FONTNAME",   (0,1), (-1,-1), "Courier"),
+            ("VALIGN",     (0,0), (-1,-1), "TOP"),
+            ("TOPPADDING", (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+            ("LEFTPADDING",(0,0), (-1,-1), 6),
+            ("GRID",       (0,0), (-1,-1), 0.3, C_GRAY),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW1, C_ROW2]),
+            ("WORDWRAP",   (1,1), (1,-1),  True),
+        ]
+        sev_col = {"CRITICAL": C_CRIT, "HIGH": C_HIGH, "MEDIUM": C_MED}
+        for i, (_, sev) in enumerate(findings[:80], 1):
+            col = sev_col.get(sev, C_FG)
+            fs += [("TEXTCOLOR", (0,i), (0,i), col),
+                   ("FONTNAME",  (0,i), (0,i), "Helvetica-Bold")]
+        ft.setStyle(TableStyle(fs))
+        story.append(ft)
+        story.append(Spacer(1, 0.3*cm))
+
+    # Full output (truncated)
+    story.append(Paragraph("Salida completa del escaneo:", st["h2"]))
+    MAX_LINES = 300
+    output_lines = [l for l in lines if isinstance(l, str)]
+    truncated = len(output_lines) > MAX_LINES
+    for line in output_lines[:MAX_LINES]:
+        clean = line.rstrip()
+        if clean:
+            story.append(Paragraph(
+                clean[:200].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),
+                st["code"]))
+    if truncated:
+        story.append(Paragraph(
+            f"[... salida truncada — {len(output_lines) - MAX_LINES} líneas adicionales "
+            f"disponibles en el servidor en /opt/scanner/scans/ ...]",
+            S("trunc", fontSize=7.5, leading=11, textColor=C_DIM,
+              fontName="Helvetica-Oblique")))
+
+    # ── SIGNATURE BLOCK ───────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.8*cm))
+    story.append(hr(C_BLUE, 1))
+    story.append(Spacer(1, 0.5*cm))
+
+    sig_date = end_time or start_time
+
+    sig_data = [
+        [
+            Table([[Paragraph("Firma del Ingeniero Responsable", st["label"])]],
+                  style=TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER")])),
+            Table([[Paragraph("Fecha y Hora del Test", st["label"])]],
+                  style=TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER")])),
+        ],
+        [
+            # Signature line
+            Table([
+                [Paragraph("_" * 35, S("ul", fontSize=11, textColor=C_DIM,
+                                       fontName="Helvetica", alignment=TA_CENTER))],
+                [Paragraph(engineer, st["sign_name"])],
+                [Paragraph("Ingeniero de Seguridad — Datacom Security",
+                           S("role", fontSize=8, textColor=C_DIM,
+                             fontName="Helvetica-Oblique", alignment=TA_CENTER))],
+            ], style=TableStyle([
+                ("ALIGN",   (0,0),(-1,-1),"CENTER"),
+                ("TOPPADDING",(0,0),(-1,-1), 4),
+                ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+            ])),
+            # Date block
+            Table([
+                [Paragraph(sig_date, S("dt", fontSize=13, textColor=WHITE,
+                                       fontName="Helvetica-Bold", alignment=TA_CENTER))],
+                [Paragraph("Inicio del escaneo",
+                           S("dt2", fontSize=8, textColor=C_DIM,
+                             fontName="Helvetica", alignment=TA_CENTER))],
+                [Paragraph(f"Generado: {now_display()}",
+                           S("dt3", fontSize=8, textColor=C_GREEN,
+                             fontName="Helvetica", alignment=TA_CENTER))],
+            ], style=TableStyle([
+                ("ALIGN",   (0,0),(-1,-1),"CENTER"),
+                ("TOPPADDING",(0,0),(-1,-1), 4),
+                ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+            ])),
+        ],
+    ]
+
+    sig_table = Table(sig_data, colWidths=[8*cm, 7.2*cm])
+    sig_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), C_ROW1),
+        ("BOX",        (0,0), (-1,-1), 0.5, C_GRAY),
+        ("LINEAFTER",  (0,0), (0,-1),  0.5, C_GRAY),
+        ("ALIGN",      (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING", (0,0), (-1,0),  8),
+        ("BOTTOMPADDING",(0,0),(-1,0), 6),
+        ("TOPPADDING", (0,1), (-1,1),  14),
+        ("BOTTOMPADDING",(0,1),(-1,1), 18),
+        ("BACKGROUND", (0,0), (-1,0),  C_GRAY),
+        ("TEXTCOLOR",  (0,0), (-1,0),  C_DIM),
+        ("FONTNAME",   (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",   (0,0), (-1,0),  8),
+    ]))
+    story.append(sig_table)
+    story.append(Spacer(1, 0.3*cm))
+    story.append(Paragraph(
+        "Este informe ha sido generado automáticamente por el sistema Kali VPN Vulnerability Scanner "
+        "de Datacom Security. Su contenido es confidencial y de uso exclusivo del cliente indicado. "
+        "Queda prohibida su reproducción o distribución sin autorización escrita.",
+        S("disc", fontSize=7, leading=10, textColor=C_DIM,
+          fontName="Helvetica-Oblique", alignment=TA_CENTER)))
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    buf.seek(0)
+    return buf.read()
+
+
+# ── API: Clients ───────────────────────────────────────────────────────────────
 
 @app.route("/api/clients", methods=["GET"])
 def api_clients_get():
@@ -76,7 +434,6 @@ def api_clients_save():
     name = data.get("name", "").strip()
     if not name:
         return jsonify({"error": "Nombre requerido"}), 400
-
     vpn_file = request.files.get("vpn_config")
     vpn_path = clients.get(name, {}).get("vpn_path", "")
     if vpn_file and vpn_file.filename:
@@ -84,7 +441,6 @@ def api_clients_save():
         safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
         vpn_path = os.path.join(UPLOAD_DIR, f"{safe_name}{ext}")
         vpn_file.save(vpn_path)
-
     clients[name] = {
         "network":  data.get("network", "").strip(),
         "desc":     data.get("desc", "").strip(),
@@ -104,7 +460,7 @@ def api_clients_delete(name):
         save_clients(clients)
     return jsonify({"ok": True})
 
-# ── API: VPN ──────────────────────────────────────────────────────────────────
+# ── API: VPN ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/vpn/connect", methods=["POST"])
 def api_vpn_connect():
@@ -112,8 +468,7 @@ def api_vpn_connect():
     clients = load_clients()
     if name not in clients:
         return jsonify({"error": "Cliente no encontrado"}), 404
-    c = clients[name]
-    threading.Thread(target=_vpn_connect_bg, args=(name, c), daemon=True).start()
+    threading.Thread(target=_vpn_connect_bg, args=(name, clients[name]), daemon=True).start()
     return jsonify({"ok": True, "msg": f"Conectando VPN para {name}..."})
 
 def _vpn_connect_bg(name, c):
@@ -121,29 +476,26 @@ def _vpn_connect_bg(name, c):
     vpn_path = c.get("vpn_path", "")
     vpn_user = c.get("vpn_user", "")
     vpn_pass = c.get("vpn_pass", "")
-
     if vpn_type == "OpenVPN":
         if vpn_user and vpn_pass:
             cred = "/tmp/vpn_creds.txt"
             with open(cred, "w") as f:
                 f.write(f"{vpn_user}\n{vpn_pass}\n")
-            cmd = ["sudo","openvpn","--config",vpn_path,"--auth-user-pass",cred,"--daemon","--log","/tmp/openvpn_scanner.log"]
+            cmd = ["sudo","openvpn","--config",vpn_path,"--auth-user-pass",cred,
+                   "--daemon","--log","/tmp/openvpn_scanner.log"]
         else:
-            cmd = ["sudo","openvpn","--config",vpn_path,"--daemon","--log","/tmp/openvpn_scanner.log"]
+            cmd = ["sudo","openvpn","--config",vpn_path,"--daemon",
+                   "--log","/tmp/openvpn_scanner.log"]
         iface = "tun0"
     else:
         cmd = ["sudo","wg-quick","up",vpn_path]
         iface = "wg0"
-
     subprocess.run(cmd, capture_output=True)
-
     for _ in range(20):
         time.sleep(2)
         r = subprocess.run(["ip","a","show",iface], capture_output=True, text=True)
         if "inet " in r.stdout:
-            vpn_state["active"] = True
-            vpn_state["client"] = name
-            vpn_state["iface"]  = iface
+            vpn_state.update({"active": True, "client": name, "iface": iface})
             return
     vpn_state["active"] = False
 
@@ -154,24 +506,18 @@ def api_vpn_disconnect():
     else:
         c = load_clients().get(vpn_state["client"], {})
         subprocess.run(["sudo","wg-quick","down", c.get("vpn_path","")], capture_output=True)
-    vpn_state["active"] = False
-    vpn_state["client"] = ""
-    vpn_state["iface"]  = ""
+    vpn_state.update({"active": False, "client": "", "iface": ""})
     return jsonify({"ok": True})
 
 @app.route("/api/vpn/status")
 def api_vpn_status():
     if vpn_state["active"] and vpn_state["iface"]:
         r = subprocess.run(["ip","a","show", vpn_state["iface"]], capture_output=True, text=True)
-        ip = ""
-        for line in r.stdout.splitlines():
-            if "inet " in line:
-                ip = line.strip()
-                break
+        ip = next((l.strip() for l in r.stdout.splitlines() if "inet " in l), "")
         return jsonify({**vpn_state, "ip": ip})
     return jsonify(vpn_state)
 
-# ── API: Scan ─────────────────────────────────────────────────────────────────
+# ── API: Scan ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/scan/profiles")
 def api_profiles():
@@ -179,39 +525,46 @@ def api_profiles():
 
 @app.route("/api/scan/start", methods=["POST"])
 def api_scan_start():
-    data = request.json
-    target  = data.get("target", "").strip()
-    cmd_tpl = data.get("command", "").strip()
-    client  = data.get("client", "")
-    profile = data.get("profile", "")
+    data     = request.json
+    target   = data.get("target",   "").strip()
+    cmd_tpl  = data.get("command",  "").strip()
+    client   = data.get("client",   "")
+    profile  = data.get("profile",  "")
+    engineer = data.get("engineer", "").strip() or "Sin especificar"
 
     if not target or not cmd_tpl:
         return jsonify({"error": "target y command son requeridos"}), 400
 
-    cmd = cmd_tpl.replace("{target}", target)
+    cmd     = cmd_tpl.replace("{target}", target)
     scan_id = str(uuid.uuid4())[:8]
+    start   = now_str()
 
     header = (
         f"{'═'*68}\n"
-        f"[{now_str()}] ESCANEO INICIADO\n"
-        f"  ID       : {scan_id}\n"
-        f"  Cliente  : {client or 'N/A'}\n"
-        f"  Objetivo : {target}\n"
-        f"  Perfil   : {profile}\n"
-        f"  Comando  : {cmd}\n"
-        f"  VPN      : {'Activa ('+vpn_state['client']+')' if vpn_state['active'] else 'Inactiva'}\n"
+        f"[{start}] ESCANEO INICIADO\n"
+        f"  ID         : {scan_id}\n"
+        f"  Ingeniero  : {engineer}\n"
+        f"  Cliente    : {client or 'N/A'}\n"
+        f"  Objetivo   : {target}\n"
+        f"  Perfil     : {profile}\n"
+        f"  Comando    : {cmd}\n"
+        f"  VPN        : {'Activa ('+vpn_state['client']+')' if vpn_state['active'] else 'Inactiva'}\n"
         f"{'═'*68}\n"
     )
 
     active_scans[scan_id] = {
-        "proc":    None,
-        "lines":   [header],
-        "done":    False,
-        "client":  client,
-        "target":  target,
-        "profile": profile,
-        "command": cmd,
-        "start":   now_str(),
+        "id":         scan_id,
+        "proc":       None,
+        "lines":      [header],
+        "done":       False,
+        "client":     client,
+        "target":     target,
+        "profile":    profile,
+        "command":    cmd,
+        "start":      start,
+        "end":        None,
+        "engineer":   engineer,
+        "vpn_client": vpn_state["client"] if vpn_state["active"] else "No",
     }
 
     threading.Thread(target=_run_scan_bg, args=(scan_id, cmd), daemon=True).start()
@@ -229,18 +582,18 @@ def _run_scan_bg(scan_id, cmd):
         for line in proc.stdout:
             state["lines"].append(line)
         proc.wait()
-        elapsed = ""
+        state["end"] = now_str()
         state["lines"].append(
-            f"\n{'═'*68}\n[{now_str()}] ESCANEO COMPLETADO\n{'═'*68}\n"
+            f"\n{'═'*68}\n[{state['end']}] ESCANEO COMPLETADO\n{'═'*68}\n"
         )
-        # Save to disk
-        safe = re.sub(r"[^a-zA-Z0-9._-]","_", state["target"])
-        path = os.path.join(SCANS_DIR, f"scan_{safe}_{scan_id}.txt")
+        path = os.path.join(SCANS_DIR,
+               f"scan_{re.sub(r'[^a-zA-Z0-9._-]','_',state['target'])}_{scan_id}.txt")
         with open(path, "w") as f:
             f.writelines(state["lines"])
         state["report_path"] = path
     except Exception as e:
         state["lines"].append(f"\n[ERROR] {e}\n")
+        state["end"] = now_str()
     finally:
         state["done"] = True
 
@@ -250,11 +603,11 @@ def api_scan_stop(scan_id):
     if s and s["proc"]:
         s["proc"].terminate()
         s["done"] = True
+        s["end"] = now_str()
     return jsonify({"ok": True})
 
 @app.route("/api/scan/stream/<scan_id>")
 def api_scan_stream(scan_id):
-    """SSE stream — envía líneas del escaneo en tiempo real."""
     def generate():
         idx = 0
         while True:
@@ -265,8 +618,7 @@ def api_scan_stream(scan_id):
             while idx < len(s["lines"]):
                 line = s["lines"][idx].rstrip("\n")
                 sev  = detect_severity(line)
-                payload = json.dumps({"line": line, "sev": sev})
-                yield f"data: {payload}\n\n"
+                yield f"data: {json.dumps({'line': line, 'sev': sev})}\n\n"
                 idx += 1
             if s["done"] and idx >= len(s["lines"]):
                 yield f"data: {json.dumps({'done': True})}\n\n"
@@ -274,67 +626,71 @@ def api_scan_stream(scan_id):
             time.sleep(0.08)
     return Response(stream_with_context(generate()),
                     mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache",
-                             "X-Accel-Buffering": "no"})
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.route("/api/scan/list")
 def api_scan_list():
-    out = []
-    for sid, s in active_scans.items():
-        out.append({
-            "id":      sid,
-            "client":  s["client"],
-            "target":  s["target"],
-            "profile": s["profile"],
-            "start":   s["start"],
-            "done":    s["done"],
-        })
+    out = [{"id": sid, "client": s["client"], "target": s["target"],
+            "profile": s["profile"], "start": s["start"],
+            "engineer": s.get("engineer",""), "done": s["done"]}
+           for sid, s in active_scans.items()]
     return jsonify(out[::-1])
 
 @app.route("/api/scan/export/<scan_id>")
 def api_scan_export(scan_id):
-    fmt = request.args.get("fmt", "txt")
-    s = active_scans.get(scan_id)
+    fmt = request.args.get("fmt", "pdf")
+    s   = active_scans.get(scan_id)
     if not s:
         return "Not found", 404
-    lines = s["lines"]
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", s["target"])
-    fname = f"vuln_{safe}_{scan_id}.{fmt}"
 
-    if fmt == "txt":
-        content = "".join(lines)
+    safe  = re.sub(r"[^a-zA-Z0-9._-]", "_", s["target"])
+    fname = f"informe_{safe}_{scan_id}.{fmt}"
+
+    if fmt == "pdf":
+        pdf_bytes = generate_pdf_report(s)
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=fname
+        )
+    elif fmt == "txt":
+        content = "".join(s["lines"])
         return Response(content, mimetype="text/plain",
                         headers={"Content-Disposition": f"attachment; filename={fname}"})
     elif fmt == "json":
-        data = {"scan_id": scan_id, **{k: s[k] for k in ("client","target","profile","command","start")},
-                "lines": lines}
-        return Response(json.dumps(data, indent=2, ensure_ascii=False),
+        d = {k: s[k] for k in ("id","client","target","profile","command","start","end","engineer")}
+        d["lines"] = s["lines"]
+        return Response(json.dumps(d, indent=2, ensure_ascii=False),
                         mimetype="application/json",
                         headers={"Content-Disposition": f"attachment; filename={fname}"})
     elif fmt == "html":
         rows = ""
-        for line in lines:
+        for line in s["lines"]:
             sev   = detect_severity(line)
-            color = {"CRITICAL":"#ff4444","HIGH":"#ff8800","MEDIUM":"#ffcc00","LOW":"#44aaff","INFO":"#c9d1d9"}.get(sev,"#c9d1d9")
+            color = SEV_COLORS.get(sev, "#c9d1d9")
             esc   = line.replace("&","&amp;").replace("<","&lt;")
             rows += f'<tr style="color:{color}"><td class="sev">{sev}</td><td><code>{esc}</code></td></tr>\n'
         html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Vuln Report — {s['target']}</title>
+<title>Informe — {s['target']}</title>
 <style>body{{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:24px}}
-h1{{color:#58a6ff}} .meta{{color:#8b949e;margin-bottom:16px}}
+h1{{color:#58a6ff}} .meta{{color:#8b949e;margin-bottom:16px;font-size:.9rem}}
 table{{width:100%;border-collapse:collapse}}
 td{{padding:3px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
 .sev{{width:80px;font-weight:bold}}</style></head><body>
-<h1>Vulnerability Scan Report</h1>
-<div class="meta">Cliente: <b>{s['client']}</b> &nbsp;|&nbsp; Objetivo: <b>{s['target']}</b><br>
-Perfil: {s['profile']} &nbsp;|&nbsp; {s['start']}</div>
+<h1>Informe de Vulnerabilidades</h1>
+<div class="meta">
+  <b>Ingeniero:</b> {s.get('engineer','N/A')} &nbsp;|&nbsp;
+  <b>Cliente:</b> {s['client']} &nbsp;|&nbsp;
+  <b>Objetivo:</b> {s['target']}<br>
+  <b>Perfil:</b> {s['profile']} &nbsp;|&nbsp; <b>Inicio:</b> {s['start']}
+</div>
 <table>{rows}</table></body></html>"""
         return Response(html, mimetype="text/html",
                         headers={"Content-Disposition": f"attachment; filename={fname}"})
     return "fmt inválido", 400
 
-# ── Main page ─────────────────────────────────────────────────────────────────
+# ── Main page ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -349,182 +705,159 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>Kali VPN Vulnerability Scanner</title>
 <style>
 :root{
-  --bg:#0d1117; --bg2:#161b22; --bg3:#21262d; --bg4:#30363d;
-  --fg:#c9d1d9; --dim:#8b949e;
-  --blue:#58a6ff; --green:#3fb950; --red:#f85149;
-  --yellow:#e3b341; --orange:#f0883e;
-  --c-crit:#ff4444; --c-high:#ff8800; --c-med:#ffcc00;
-  --c-low:#44aaff;  --c-info:#c9d1d9;
+  --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bg4:#30363d;
+  --fg:#c9d1d9;--dim:#8b949e;
+  --blue:#58a6ff;--green:#3fb950;--red:#f85149;
+  --yellow:#e3b341;--orange:#f0883e;
+  --c-crit:#ff4444;--c-high:#ff8800;--c-med:#ffcc00;--c-low:#44aaff;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font-family:'Segoe UI',system-ui,sans-serif;
      font-size:14px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
-
-/* ── Header ── */
 header{background:var(--bg2);border-bottom:1px solid var(--bg4);
        padding:10px 20px;display:flex;align-items:center;gap:14px;flex-shrink:0}
-header h1{font-size:1.25rem;color:var(--blue);font-weight:700}
-header span{color:var(--dim);font-size:.85rem}
-.badge-vpn{padding:3px 10px;border-radius:20px;font-size:.78rem;font-weight:700;
-           background:var(--bg4);cursor:pointer;transition:background .2s}
+header h1{font-size:1.2rem;color:var(--blue);font-weight:700}
+header span{color:var(--dim);font-size:.82rem}
+.badge-vpn{padding:3px 12px;border-radius:20px;font-size:.78rem;font-weight:700;
+           background:var(--bg4);cursor:pointer;transition:.2s}
 .badge-vpn.on{background:#1a3a1a;color:var(--green)}
 .badge-vpn.off{background:#3a1a1a;color:var(--red)}
-
-/* ── Layout ── */
 .layout{display:flex;flex:1;overflow:hidden}
 .sidebar{width:270px;background:var(--bg2);border-right:1px solid var(--bg4);
          display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-
-/* ── Tabs ── */
 .tabs{display:flex;border-bottom:1px solid var(--bg4);flex-shrink:0}
 .tab{padding:10px 22px;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;
-     transition:all .15s;font-weight:600;font-size:.88rem}
+     transition:.15s;font-weight:600;font-size:.88rem}
 .tab.active{color:var(--blue);border-bottom-color:var(--blue)}
 .tab-content{display:none;flex:1;overflow:hidden}
 .tab-content.active{display:flex;flex-direction:column;overflow:hidden}
-
-/* ── Sidebar: clients ── */
-.sidebar-header{padding:10px 12px;font-size:.78rem;color:var(--dim);
-                font-weight:700;border-bottom:1px solid var(--bg4);
-                display:flex;justify-content:space-between;align-items:center}
+.sidebar-header{padding:10px 12px;font-size:.78rem;color:var(--dim);font-weight:700;
+                border-bottom:1px solid var(--bg4);display:flex;
+                justify-content:space-between;align-items:center}
 .client-list{flex:1;overflow-y:auto}
 .client-item{padding:9px 14px;cursor:pointer;border-bottom:1px solid var(--bg4);
-             transition:background .15s;display:flex;justify-content:space-between;align-items:center}
+             transition:.15s;display:flex;justify-content:space-between;align-items:center}
 .client-item:hover{background:var(--bg3)}
 .client-item.active{background:var(--bg3);border-left:3px solid var(--blue)}
-.client-name{font-weight:600}
-.client-net{font-size:.75rem;color:var(--dim)}
-.client-del{color:var(--red);font-size:.8rem;opacity:0;transition:opacity .2s;
-            background:none;border:none;cursor:pointer;padding:2px 6px}
+.client-name{font-weight:600;font-size:.88rem}
+.client-net{font-size:.73rem;color:var(--dim)}
+.client-del{color:var(--red);opacity:0;background:none;border:none;cursor:pointer;padding:2px 6px;font-size:.8rem}
 .client-item:hover .client-del{opacity:1}
-
-/* ── Forms / inputs ── */
 .form-group{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
-label{font-size:.78rem;color:var(--dim);font-weight:600}
+label{font-size:.77rem;color:var(--dim);font-weight:600}
 input,select,textarea{background:var(--bg3);border:1px solid var(--bg4);
        color:var(--fg);padding:7px 10px;border-radius:6px;font-size:.88rem;
-       outline:none;width:100%;transition:border .15s;font-family:inherit}
+       outline:none;width:100%;transition:.15s;font-family:inherit}
 input:focus,select:focus{border-color:var(--blue)}
 select option{background:var(--bg3)}
 .row{display:flex;gap:8px}
 .row .form-group{flex:1}
-
-/* ── Buttons ── */
-btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
-                border-radius:6px;border:none;cursor:pointer;font-size:.88rem;
-                font-weight:600;transition:opacity .15s;font-family:inherit}
-.btn-blue{background:#1f6feb;color:#fff} .btn-blue:hover{opacity:.85}
-.btn-green{background:#238636;color:#fff} .btn-green:hover{opacity:.85}
-.btn-red{background:#da3633;color:#fff} .btn-red:hover{opacity:.85}
-.btn-orange{background:#9a5700;color:#fff} .btn-orange:hover{opacity:.85}
-.btn-gray{background:var(--bg4);color:var(--fg)} .btn-gray:hover{opacity:.85}
-.btn-sm{padding:4px 10px;font-size:.8rem}
-
-/* ── Scanner tab ── */
-.scan-config{padding:14px 16px;border-bottom:1px solid var(--bg4);flex-shrink:0}
-.scan-config h3{font-size:.82rem;color:var(--dim);font-weight:700;
-                margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em}
-.toolbar{display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--bg4);
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
+     border-radius:6px;border:none;cursor:pointer;font-size:.88rem;
+     font-weight:600;transition:opacity .15s;font-family:inherit}
+.btn:hover{opacity:.85}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-blue{background:#1f6feb;color:#fff}
+.btn-green{background:#238636;color:#fff}
+.btn-red{background:#da3633;color:#fff}
+.btn-orange{background:#9a5700;color:#fff}
+.btn-gray{background:var(--bg4);color:var(--fg)}
+.btn-pdf{background:#7c3aed;color:#fff}
+.btn-sm{padding:4px 10px;font-size:.78rem}
+.scan-config{padding:12px 16px;border-bottom:1px solid var(--bg4);flex-shrink:0}
+.toolbar{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid var(--bg4);
          flex-shrink:0;align-items:center;flex-wrap:wrap}
 .progress-bar{height:3px;background:var(--bg4);flex-shrink:0}
-.progress-bar-inner{height:100%;background:var(--blue);width:0%;
-                    transition:width .3s;animation:none}
-.progress-bar-inner.running{animation:progress-anim 1.5s infinite linear}
-@keyframes progress-anim{0%{width:0%;margin-left:0}50%{width:40%}100%{width:0%;margin-left:100%}}
-
-/* ── Output ── */
+.progress-inner{height:100%;background:var(--blue);width:0}
+.progress-inner.running{animation:prog 1.5s infinite linear}
+@keyframes prog{0%{width:0%;margin-left:0}50%{width:40%}100%{width:0%;margin-left:100%}}
 .output-area{display:flex;flex:1;overflow:hidden}
-.terminal{flex:1;background:#090d13;font-family:'Courier New',monospace;font-size:12.5px;
-          padding:12px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.55}
-.findings-panel{width:310px;border-left:1px solid var(--bg4);display:flex;
-                flex-direction:column;flex-shrink:0}
+.terminal{flex:1;background:#090d13;font-family:'Courier New',monospace;font-size:12px;
+          padding:12px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5}
+.findings-panel{width:300px;border-left:1px solid var(--bg4);display:flex;flex-direction:column;flex-shrink:0}
 .findings-header{padding:8px 12px;font-size:.78rem;color:var(--dim);font-weight:700;
-                 border-bottom:1px solid var(--bg4);display:flex;
-                 justify-content:space-between;align-items:center}
+                 border-bottom:1px solid var(--bg4);display:flex;justify-content:space-between;align-items:center}
 .findings-list{flex:1;overflow-y:auto;padding:6px}
-.finding-item{padding:6px 8px;border-radius:6px;margin-bottom:5px;font-size:.8rem;
+.finding-item{padding:5px 8px;border-radius:5px;margin-bottom:4px;font-size:.77rem;
               font-family:'Courier New',monospace;background:var(--bg3);border-left:3px solid}
 .sev-CRITICAL{color:var(--c-crit);border-color:var(--c-crit)!important}
 .sev-HIGH{color:var(--c-high);border-color:var(--c-high)!important}
 .sev-MEDIUM{color:var(--c-med);border-color:var(--c-med)!important}
 .sev-LOW{color:var(--c-low);border-color:var(--c-low)!important}
-.sev-INFO{color:var(--c-info)}
 .line-CRITICAL{color:var(--c-crit);font-weight:700}
 .line-HIGH{color:var(--c-high);font-weight:700}
 .line-MEDIUM{color:var(--c-med)}
 .line-LOW{color:var(--c-low)}
-.line-INFO{color:var(--c-info)}
+.line-INFO{color:var(--fg)}
 .line-HEADER{color:var(--green);font-weight:700}
-
-/* ── History tab ── */
 .history-table{width:100%;border-collapse:collapse}
 .history-table th{background:var(--bg3);padding:8px 12px;text-align:left;
-                   font-size:.8rem;color:var(--dim);border-bottom:1px solid var(--bg4)}
-.history-table td{padding:8px 12px;border-bottom:1px solid var(--bg4);font-size:.85rem}
+                   font-size:.78rem;color:var(--dim);border-bottom:1px solid var(--bg4)}
+.history-table td{padding:7px 12px;border-bottom:1px solid var(--bg4);font-size:.83rem}
 .history-table tr:hover td{background:var(--bg3)}
-.badge{padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:700}
+.badge{padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:700}
 .badge-done{background:#1a3a1a;color:var(--green)}
 .badge-run{background:#1a2a3a;color:var(--blue)}
-
-/* ── VPN modal ── */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;
                display:none;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
 .modal{background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;
        padding:24px;width:440px;max-width:95vw}
 .modal h2{color:var(--blue);margin-bottom:16px;font-size:1rem}
-
-/* ── Client form (sidebar bottom) ── */
 .client-form{border-top:1px solid var(--bg4);padding:12px;flex-shrink:0;
              max-height:52vh;overflow-y:auto;background:var(--bg)}
-.client-form h3{font-size:.8rem;color:var(--dim);font-weight:700;
-                margin-bottom:10px;text-transform:uppercase}
-
-/* ── Scrollbar ── */
-::-webkit-scrollbar{width:6px;height:6px}
+.client-form h3{font-size:.78rem;color:var(--dim);font-weight:700;margin-bottom:10px;text-transform:uppercase}
+::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
-
-/* ── Status bar ── */
 .statusbar{background:var(--bg2);border-top:1px solid var(--bg4);
-           padding:4px 16px;font-size:.78rem;color:var(--dim);
+           padding:4px 16px;font-size:.76rem;color:var(--dim);
            display:flex;justify-content:space-between;flex-shrink:0}
+.engineer-bar{background:var(--bg2);border-bottom:1px solid var(--bg4);
+              padding:7px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+.engineer-bar label{font-size:.8rem;color:var(--dim);font-weight:700;white-space:nowrap}
+.engineer-bar input{max-width:260px;background:var(--bg3);border:1px solid var(--bg4);
+                    color:var(--fg);padding:5px 10px;border-radius:6px;font-size:.88rem}
+.engineer-bar input:focus{border-color:var(--blue);outline:none}
+.eng-hint{font-size:.75rem;color:var(--dim)}
 </style>
 </head>
 <body>
 
-<!-- Header -->
 <header>
   <div>
     <h1>&#x26A1; Kali VPN Vulnerability Scanner</h1>
     <span>nmap &bull; vulners &bull; nikto &bull; OpenVPN &bull; WireGuard</span>
   </div>
   <div style="margin-left:auto;display:flex;gap:10px;align-items:center">
-    <div id="vpnBadge" class="badge-vpn off" onclick="openVpnModal()">
-      &#x25CF; VPN Inactiva
-    </div>
-    <button class="btn btn-gray btn-sm" onclick="loadHistory()">Historial</button>
+    <div id="vpnBadge" class="badge-vpn off" onclick="openVpnModal()">&#x25CF; VPN Inactiva</div>
+    <button class="btn btn-gray btn-sm" onclick="showTab('history',this);loadHistory()">Historial</button>
   </div>
 </header>
 
-<!-- Layout -->
-<div class="layout">
+<!-- Engineer bar -->
+<div class="engineer-bar">
+  <label>&#x1F464; Ingeniero responsable:</label>
+  <input id="engineerInput" type="text" placeholder="Nombre completo del ingeniero que realiza el test"
+         autocomplete="name">
+  <span class="eng-hint">Se incluirá en el informe PDF con firma y fecha/hora</span>
+</div>
 
-  <!-- Sidebar: clients -->
+<div class="layout">
+  <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-header">
       CLIENTES
       <button class="btn btn-green btn-sm" onclick="newClient()">+ Nuevo</button>
     </div>
     <div class="client-list" id="clientList"></div>
-    <!-- Client form -->
-    <div class="client-form" id="clientForm">
+    <div class="client-form">
       <h3 id="clientFormTitle">Nuevo cliente</h3>
       <form id="clientFormEl" onsubmit="saveClient(event)">
         <div class="form-group">
           <label>Nombre / Empresa *</label>
-          <input id="cf_name" name="name" required placeholder="Ej: Empresa ABC">
+          <input id="cf_name" name="name" required placeholder="Empresa ABC">
         </div>
         <div class="form-group">
           <label>Red interna (CIDR)</label>
@@ -532,13 +865,12 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
         </div>
         <div class="form-group">
           <label>Descripción</label>
-          <input id="cf_desc" name="desc" placeholder="Notas del cliente">
+          <input id="cf_desc" name="desc" placeholder="Notas">
         </div>
         <div class="form-group">
           <label>Tipo VPN</label>
           <select id="cf_vpntype" name="vpn_type">
-            <option>OpenVPN</option>
-            <option>WireGuard</option>
+            <option>OpenVPN</option><option>WireGuard</option>
           </select>
         </div>
         <div class="form-group">
@@ -552,7 +884,7 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
           </div>
           <div class="form-group">
             <label>Contraseña VPN</label>
-            <input id="cf_vpnpass" name="vpn_pass" type="password" placeholder="(opcional)">
+            <input id="cf_vpnpass" name="vpn_pass" type="password">
           </div>
         </div>
         <div style="display:flex;gap:8px;margin-top:4px">
@@ -563,19 +895,18 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
     </div>
   </aside>
 
-  <!-- Main content -->
   <div class="main">
     <div class="tabs">
-      <div class="tab active" onclick="showTab('scanner',this)">&#x1F50D; Escaneo</div>
-      <div class="tab" onclick="showTab('history',this);loadHistory()">&#x1F4CB; Historial</div>
+      <div class="tab active" id="tab-btn-scanner" onclick="showTab('scanner',this)">&#x1F50D; Escaneo</div>
+      <div class="tab" id="tab-btn-history"  onclick="showTab('history',this);loadHistory()">&#x1F4CB; Historial</div>
     </div>
 
-    <!-- ── SCANNER TAB ── -->
+    <!-- SCANNER TAB -->
     <div class="tab-content active" id="tab-scanner">
-      <!-- VPN + target config -->
       <div class="scan-config">
-        <div class="row" style="align-items:flex-end;gap:12px;flex-wrap:wrap">
-          <div class="form-group" style="min-width:180px">
+        <!-- VPN row -->
+        <div class="row" style="align-items:flex-end;margin-bottom:8px;flex-wrap:wrap;gap:10px">
+          <div class="form-group" style="min-width:170px">
             <label>Cliente</label>
             <select id="selClient" onchange="onClientSelect()">
               <option value="">— Seleccionar —</option>
@@ -589,11 +920,16 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
             <label>Perfil de escaneo</label>
             <select id="selProfile" onchange="onProfileSelect()"></select>
           </div>
+          <div style="display:flex;align-items:flex-end;gap:6px">
+            <button class="btn btn-orange btn-sm" onclick="openVpnModal()">
+              &#x1F512; VPN
+            </button>
+          </div>
         </div>
         <div class="form-group">
           <label>Comando (editable)</label>
           <input id="inCommand" style="font-family:'Courier New',monospace;color:var(--yellow)"
-                 placeholder="sudo nmap -sV --script vuln -T4 192.168.1.0/24">
+                 placeholder="sudo nmap ...">
         </div>
       </div>
 
@@ -602,19 +938,20 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
         <button class="btn btn-blue" id="btnScan" onclick="startScan()">&#x25B6; Iniciar Escaneo</button>
         <button class="btn btn-red"  id="btnStop" onclick="stopScan()" disabled>&#x25A0; Detener</button>
         <button class="btn btn-gray" onclick="clearOutput()">Limpiar</button>
-        <div style="margin-left:auto;display:flex;gap:8px" id="exportBtns" style="display:none">
-          <button class="btn btn-gray btn-sm" onclick="exportScan('txt')">&#x2B07; TXT</button>
-          <button class="btn btn-gray btn-sm" onclick="exportScan('json')">&#x2B07; JSON</button>
-          <button class="btn btn-gray btn-sm" onclick="exportScan('html')">&#x2B07; HTML</button>
-        </div>
-        <span id="scanStatus" style="color:var(--dim);font-size:.82rem"></span>
+        <div style="width:1px;height:24px;background:var(--bg4);margin:0 4px"></div>
+        <button class="btn btn-pdf"  id="btnPdf"  onclick="exportScan('pdf')"  style="display:none">
+          &#x1F4C4; Descargar PDF
+        </button>
+        <button class="btn btn-gray btn-sm" id="btnTxt"  onclick="exportScan('txt')"  style="display:none">&#x2B07; TXT</button>
+        <button class="btn btn-gray btn-sm" id="btnJson" onclick="exportScan('json')" style="display:none">&#x2B07; JSON</button>
+        <button class="btn btn-gray btn-sm" id="btnHtml" onclick="exportScan('html')" style="display:none">&#x2B07; HTML</button>
+        <span id="scanStatus" style="color:var(--dim);font-size:.82rem;margin-left:auto"></span>
       </div>
-      <div class="progress-bar"><div class="progress-bar-inner" id="progressBar"></div></div>
+      <div class="progress-bar"><div class="progress-inner" id="progressBar"></div></div>
 
-      <!-- Output + findings -->
       <div class="output-area">
         <div class="terminal" id="terminal">
-          <span style="color:var(--dim)">Listo. Configura un cliente, objetivo y perfil para comenzar.
+          <span style="color:var(--dim)">Listo. Ingresa tu nombre, configura el cliente y objetivo para comenzar.
 </span>
         </div>
         <div class="findings-panel">
@@ -627,21 +964,19 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
       </div>
     </div>
 
-    <!-- ── HISTORY TAB ── -->
+    <!-- HISTORY TAB -->
     <div class="tab-content" id="tab-history" style="overflow:auto;padding:16px">
       <table class="history-table" id="historyTable">
         <thead><tr>
-          <th>ID</th><th>Cliente</th><th>Objetivo</th><th>Perfil</th>
-          <th>Inicio</th><th>Estado</th><th>Acciones</th>
+          <th>ID</th><th>Ingeniero</th><th>Cliente</th><th>Objetivo</th>
+          <th>Perfil</th><th>Inicio</th><th>Estado</th><th>Descargar</th>
         </tr></thead>
         <tbody id="historyBody"></tbody>
       </table>
     </div>
+  </div>
+</div>
 
-  </div><!-- /main -->
-</div><!-- /layout -->
-
-<!-- Status bar -->
 <div class="statusbar">
   <span id="statusText">Listo.</span>
   <span id="elapsedText"></span>
@@ -651,38 +986,36 @@ btn,button,.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 16px;
 <div class="modal-overlay" id="vpnModal">
   <div class="modal">
     <h2>&#x1F512; Gestión VPN</h2>
-    <div id="vpnModalBody">
-      <div class="form-group">
-        <label>Cliente</label>
-        <select id="vpnSelClient"></select>
-      </div>
-      <div id="vpnInfo" style="color:var(--dim);font-size:.85rem;margin:8px 0;min-height:24px"></div>
-      <div style="display:flex;gap:8px;margin-top:12px">
-        <button class="btn btn-orange" id="btnVpnConnect" onclick="connectVpn()">Conectar VPN</button>
-        <button class="btn btn-red"    id="btnVpnDisconnect" onclick="disconnectVpn()">Desconectar</button>
-        <button class="btn btn-gray"   onclick="closeVpnModal()">Cerrar</button>
-      </div>
+    <div class="form-group">
+      <label>Cliente</label>
+      <select id="vpnSelClient"></select>
+    </div>
+    <div id="vpnInfo" style="color:var(--dim);font-size:.85rem;margin:8px 0;min-height:22px"></div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-orange" onclick="connectVpn()">Conectar VPN</button>
+      <button class="btn btn-red"    onclick="disconnectVpn()">Desconectar</button>
+      <button class="btn btn-gray"   onclick="closeVpnModal()">Cerrar</button>
     </div>
   </div>
 </div>
 
 <script>
-// ── State ────────────────────────────────────────────────────────────────────
-let currentScanId = null;
-let sseSource = null;
-let scanRunning = false;
-let startTime = null;
-let timerInterval = null;
+let currentScanId = null, sseSource = null;
+let scanRunning = false, startTime = null, timerInterval = null;
 let profiles = {};
 
-// ── Init ─────────────────────────────────────────────────────────────────────
 window.onload = async () => {
   await loadProfiles();
   await loadClients();
   pollVpnStatus();
+  // Restore engineer name from localStorage
+  const saved = localStorage.getItem('engineer');
+  if (saved) document.getElementById('engineerInput').value = saved;
+  document.getElementById('engineerInput').addEventListener('input', e => {
+    localStorage.setItem('engineer', e.target.value);
+  });
 };
 
-// ── Tabs ─────────────────────────────────────────────────────────────────────
 function showTab(name, el) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -690,28 +1023,25 @@ function showTab(name, el) {
   el.classList.add('active');
 }
 
-// ── Profiles ─────────────────────────────────────────────────────────────────
 async function loadProfiles() {
   const r = await fetch('/api/scan/profiles');
   profiles = await r.json();
   const sel = document.getElementById('selProfile');
   sel.innerHTML = '';
-  for (const [name, cmd] of Object.entries(profiles)) {
+  Object.entries(profiles).forEach(([name, cmd]) => {
     const o = document.createElement('option');
     o.value = cmd; o.textContent = name;
     sel.appendChild(o);
-  }
-  // default to vuln+SO+versions
+  });
   sel.selectedIndex = 5;
   onProfileSelect();
 }
 
 function onProfileSelect() {
-  const sel = document.getElementById('selProfile');
-  document.getElementById('inCommand').value = sel.value;
+  document.getElementById('inCommand').value =
+    document.getElementById('selProfile').value;
 }
 
-// ── Clients ───────────────────────────────────────────────────────────────────
 async function loadClients() {
   const r = await fetch('/api/clients');
   const clients = await r.json();
@@ -723,64 +1053,60 @@ async function loadClients() {
 function renderClientList(clients) {
   const el = document.getElementById('clientList');
   el.innerHTML = '';
-  for (const [name, c] of Object.entries(clients)) {
+  Object.entries(clients).forEach(([name, c]) => {
     const item = document.createElement('div');
     item.className = 'client-item';
     item.dataset.name = name;
-    item.innerHTML = `
-      <div>
-        <div class="client-name">${escHtml(name)}</div>
-        <div class="client-net">${escHtml(c.network || 'Sin red definida')}</div>
-      </div>
-      <button class="client-del" onclick="deleteClient('${escHtml(name)}',event)">✕</button>`;
+    item.innerHTML = `<div>
+      <div class="client-name">${esc(name)}</div>
+      <div class="client-net">${esc(c.network||'Sin red')}</div>
+    </div>
+    <button class="client-del" onclick="deleteClient('${esc(name)}',event)">✕</button>`;
     item.addEventListener('click', () => selectClient(name, c, item));
     el.appendChild(item);
-  }
+  });
 }
 
 function renderClientCombo(clients) {
   const sel = document.getElementById('selClient');
   const cur = sel.value;
   sel.innerHTML = '<option value="">— Seleccionar —</option>';
-  for (const name of Object.keys(clients)) {
+  Object.keys(clients).forEach(name => {
     const o = document.createElement('option');
     o.value = name; o.textContent = name;
     sel.appendChild(o);
-  }
+  });
   if (cur) sel.value = cur;
 }
 
 function renderVpnCombo(clients) {
   const sel = document.getElementById('vpnSelClient');
   sel.innerHTML = '';
-  for (const name of Object.keys(clients)) {
+  Object.keys(clients).forEach(name => {
     const o = document.createElement('option');
     o.value = name; o.textContent = name;
     sel.appendChild(o);
-  }
+  });
 }
 
 function selectClient(name, c, item) {
   document.querySelectorAll('.client-item').forEach(i => i.classList.remove('active'));
   item.classList.add('active');
   document.getElementById('cf_name').value    = name;
-  document.getElementById('cf_network').value = c.network || '';
-  document.getElementById('cf_desc').value    = c.desc    || '';
+  document.getElementById('cf_network').value = c.network  || '';
+  document.getElementById('cf_desc').value    = c.desc     || '';
   document.getElementById('cf_vpntype').value = c.vpn_type || 'OpenVPN';
   document.getElementById('cf_vpnuser').value = c.vpn_user || '';
   document.getElementById('cf_vpnpass').value = c.vpn_pass || '';
   document.getElementById('clientFormTitle').textContent = 'Editar: ' + name;
-  // prefill scan target
   document.getElementById('selClient').value  = name;
-  document.getElementById('inTarget').value   = c.network || '';
+  document.getElementById('inTarget').value   = c.network  || '';
 }
 
 function onClientSelect() {
   const name = document.getElementById('selClient').value;
   fetch('/api/clients').then(r => r.json()).then(clients => {
-    if (clients[name]) {
-      document.getElementById('inTarget').value = clients[name].network || '';
-    }
+    if (clients[name]) document.getElementById('inTarget').value = clients[name].network || '';
   });
 }
 
@@ -792,9 +1118,7 @@ function newClient() {
 
 async function saveClient(e) {
   e.preventDefault();
-  const form = document.getElementById('clientFormEl');
-  const fd = new FormData(form);
-  const r = await fetch('/api/clients', {method:'POST', body: fd});
+  const r = await fetch('/api/clients', {method:'POST', body: new FormData(document.getElementById('clientFormEl'))});
   const j = await r.json();
   if (j.error) { alert(j.error); return; }
   setStatus('Cliente guardado.');
@@ -804,30 +1128,24 @@ async function saveClient(e) {
 async function deleteClient(name, e) {
   e.stopPropagation();
   if (!confirm(`¿Eliminar cliente "${name}"?`)) return;
-  await fetch('/api/clients/'+encodeURIComponent(name), {method:'DELETE'});
+  await fetch('/api/clients/' + encodeURIComponent(name), {method:'DELETE'});
   await loadClients();
 }
 
-// ── VPN ───────────────────────────────────────────────────────────────────────
-function openVpnModal() {
-  document.getElementById('vpnModal').classList.add('open');
-}
-function closeVpnModal() {
-  document.getElementById('vpnModal').classList.remove('open');
-}
+// VPN
+function openVpnModal()  { document.getElementById('vpnModal').classList.add('open'); }
+function closeVpnModal() { document.getElementById('vpnModal').classList.remove('open'); }
 
 async function connectVpn() {
   const client = document.getElementById('vpnSelClient').value;
   if (!client) { alert('Selecciona un cliente'); return; }
-  document.getElementById('vpnInfo').textContent = 'Conectando VPN, espera...';
+  document.getElementById('vpnInfo').textContent = 'Conectando VPN...';
   const r = await fetch('/api/vpn/connect', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({client})
   });
   const j = await r.json();
   document.getElementById('vpnInfo').textContent = j.msg || j.error || '';
-  setStatus('Conectando VPN...');
-  // poll until active
   let tries = 0;
   const poll = setInterval(async () => {
     const s = await (await fetch('/api/vpn/status')).json();
@@ -835,7 +1153,7 @@ async function connectVpn() {
       clearInterval(poll);
       updateVpnBadge(s);
       document.getElementById('vpnInfo').textContent = 'VPN activa — ' + s.ip;
-      setStatus('VPN activa.');
+      setStatus('VPN activa: ' + s.client);
     } else if (++tries > 25) {
       clearInterval(poll);
       document.getElementById('vpnInfo').textContent = 'Tiempo agotado — verifica la config VPN.';
@@ -851,38 +1169,34 @@ async function disconnectVpn() {
 }
 
 async function pollVpnStatus() {
-  try {
-    const s = await (await fetch('/api/vpn/status')).json();
-    updateVpnBadge(s);
-  } catch {}
+  try { updateVpnBadge(await (await fetch('/api/vpn/status')).json()); } catch {}
   setTimeout(pollVpnStatus, 5000);
 }
 
 function updateVpnBadge(s) {
   const b = document.getElementById('vpnBadge');
-  if (s.active) {
-    b.className = 'badge-vpn on';
-    b.textContent = '● VPN: ' + (s.client || 'Activa');
-  } else {
-    b.className = 'badge-vpn off';
-    b.textContent = '● VPN Inactiva';
-  }
+  b.className = 'badge-vpn ' + (s.active ? 'on' : 'off');
+  b.textContent = s.active ? '● VPN: ' + (s.client || 'Activa') : '● VPN Inactiva';
 }
 
-// ── Scanner ───────────────────────────────────────────────────────────────────
+// Scanner
 async function startScan() {
-  const target  = document.getElementById('inTarget').value.trim();
-  const command = document.getElementById('inCommand').value.trim();
-  const client  = document.getElementById('selClient').value;
-  const profile = document.getElementById('selProfile').selectedOptions[0]?.textContent || '';
+  const target   = document.getElementById('inTarget').value.trim();
+  const command  = document.getElementById('inCommand').value.trim();
+  const client   = document.getElementById('selClient').value;
+  const profile  = document.getElementById('selProfile').selectedOptions[0]?.textContent || '';
+  const engineer = document.getElementById('engineerInput').value.trim();
 
-  if (!target)  { alert('Ingresa un objetivo (IP, CIDR o hostname).'); return; }
-  if (!command) { alert('Selecciona un perfil o escribe un comando.'); return; }
+  if (!target)   { alert('Ingresa un objetivo.'); return; }
+  if (!command)  { alert('Selecciona un perfil o escribe un comando.'); return; }
+  if (!engineer) {
+    if (!confirm('No has ingresado el nombre del ingeniero.\n¿Continuar de todas formas?')) return;
+  }
 
   clearOutput();
   const r = await fetch('/api/scan/start', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({target, command, client, profile})
+    body: JSON.stringify({target, command, client, profile, engineer})
   });
   const j = await r.json();
   if (j.error) { alert(j.error); return; }
@@ -893,7 +1207,9 @@ async function startScan() {
   document.getElementById('btnScan').disabled = true;
   document.getElementById('btnStop').disabled = false;
   document.getElementById('progressBar').classList.add('running');
-  document.getElementById('exportBtns').style.display = 'flex';
+  // Hide export buttons during scan
+  ['btnPdf','btnTxt','btnJson','btnHtml'].forEach(id =>
+    document.getElementById(id).style.display = 'none');
   startTimer();
   streamScan(currentScanId);
 }
@@ -901,16 +1217,11 @@ async function startScan() {
 function streamScan(scanId) {
   if (sseSource) sseSource.close();
   sseSource = new EventSource('/api/scan/stream/' + scanId);
-  sseSource.onmessage = (e) => {
+  sseSource.onmessage = e => {
     const data = JSON.parse(e.data);
-    if (data.done) {
-      scanDone();
-      return;
-    }
+    if (data.done) { scanDone(); return; }
     appendLine(data.line, data.sev);
-    if (['CRITICAL','HIGH','MEDIUM'].includes(data.sev)) {
-      appendFinding(data.line, data.sev);
-    }
+    if (['CRITICAL','HIGH','MEDIUM'].includes(data.sev)) appendFinding(data.line, data.sev);
   };
   sseSource.onerror = () => { sseSource.close(); scanDone(); };
 }
@@ -930,24 +1241,28 @@ function scanDone() {
   document.getElementById('progressBar').classList.remove('running');
   clearInterval(timerInterval);
   setStatus('Escaneo finalizado.');
+  // Show export buttons
+  document.getElementById('btnPdf').style.display  = 'inline-flex';
+  document.getElementById('btnTxt').style.display  = 'inline-flex';
+  document.getElementById('btnJson').style.display = 'inline-flex';
+  document.getElementById('btnHtml').style.display = 'inline-flex';
 }
 
 function startTimer() {
   clearInterval(timerInterval);
   timerInterval = setInterval(() => {
-    const s = Math.floor((Date.now() - startTime) / 1000);
-    const m = Math.floor(s / 60).toString().padStart(2,'0');
-    const ss = (s % 60).toString().padStart(2,'0');
+    const s  = Math.floor((Date.now() - startTime) / 1000);
+    const m  = String(Math.floor(s/60)).padStart(2,'0');
+    const ss = String(s%60).padStart(2,'0');
     document.getElementById('elapsedText').textContent = `Duración: ${m}:${ss}`;
     document.getElementById('scanStatus').textContent  = `Escaneando... ${m}:${ss}`;
   }, 1000);
 }
 
-// ── Terminal output ───────────────────────────────────────────────────────────
 function appendLine(line, sev) {
   const term = document.getElementById('terminal');
   const span = document.createElement('span');
-  span.className = sev === 'HEADER' ? 'line-HEADER' : 'line-' + (sev || 'INFO');
+  span.className = sev === 'HEADER' ? 'line-HEADER' : 'line-' + (sev||'INFO');
   span.textContent = line + '\n';
   term.appendChild(span);
   term.scrollTop = term.scrollHeight;
@@ -957,7 +1272,7 @@ function appendFinding(line, sev) {
   const fl = document.getElementById('findingsList');
   const item = document.createElement('div');
   item.className = 'finding-item sev-' + sev;
-  item.innerHTML = `<strong>${sev}</strong><br>${escHtml(line.trim())}`;
+  item.innerHTML = `<strong>${sev}</strong><br>${esc(line.trim())}`;
   fl.appendChild(item);
   fl.scrollTop = fl.scrollHeight;
 }
@@ -968,54 +1283,56 @@ function clearOutput() {
   clearFindings();
   document.getElementById('elapsedText').textContent = '';
   document.getElementById('scanStatus').textContent  = '';
+  ['btnPdf','btnTxt','btnJson','btnHtml'].forEach(id =>
+    document.getElementById(id).style.display = 'none');
   setStatus('Listo.');
 }
 
-function clearFindings() {
-  document.getElementById('findingsList').innerHTML = '';
-}
+function clearFindings() { document.getElementById('findingsList').innerHTML = ''; }
 
-// ── History ───────────────────────────────────────────────────────────────────
+// History
 async function loadHistory() {
-  const r = await fetch('/api/scan/list');
-  const scans = await r.json();
+  const scans = await (await fetch('/api/scan/list')).json();
   const tbody = document.getElementById('historyBody');
   tbody.innerHTML = '';
-  for (const s of scans) {
+  scans.forEach(s => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td><code>${s.id}</code></td>
-      <td>${escHtml(s.client||'—')}</td>
-      <td>${escHtml(s.target)}</td>
-      <td>${escHtml(s.profile)}</td>
-      <td>${s.start}</td>
+      <td>${esc(s.engineer||'—')}</td>
+      <td>${esc(s.client||'—')}</td>
+      <td>${esc(s.target)}</td>
+      <td style="font-size:.78rem">${esc(s.profile)}</td>
+      <td style="font-size:.78rem">${s.start}</td>
       <td><span class="badge ${s.done?'badge-done':'badge-run'}">${s.done?'Completado':'En curso'}</span></td>
-      <td style="display:flex;gap:6px">
+      <td style="display:flex;gap:5px;flex-wrap:wrap">
+        <button class="btn btn-pdf btn-sm" onclick="exportById('${s.id}','pdf')">&#x1F4C4; PDF</button>
+        <button class="btn btn-gray btn-sm" onclick="exportById('${s.id}','txt')">TXT</button>
         <button class="btn btn-gray btn-sm" onclick="replayScan('${s.id}')">Ver</button>
-        <button class="btn btn-gray btn-sm" onclick="exportScanById('${s.id}','txt')">TXT</button>
-        <button class="btn btn-gray btn-sm" onclick="exportScanById('${s.id}','html')">HTML</button>
       </td>`;
     tbody.appendChild(tr);
-  }
+  });
 }
 
 function replayScan(id) {
   currentScanId = id;
   clearOutput();
-  showTab('scanner', document.querySelectorAll('.tab')[0]);
+  showTab('scanner', document.getElementById('tab-btn-scanner'));
   streamScan(id);
+  document.getElementById('btnPdf').style.display  = 'inline-flex';
+  document.getElementById('btnTxt').style.display  = 'inline-flex';
+  document.getElementById('btnJson').style.display = 'inline-flex';
+  document.getElementById('btnHtml').style.display = 'inline-flex';
 }
 
-// ── Export ────────────────────────────────────────────────────────────────────
-function exportScan(fmt) { exportScanById(currentScanId, fmt); }
-function exportScanById(id, fmt) {
-  if (!id) { alert('No hay escaneo activo.'); return; }
+function exportScan(fmt)      { exportById(currentScanId, fmt); }
+function exportById(id, fmt)  {
+  if (!id) { alert('No hay escaneo seleccionado.'); return; }
   window.open('/api/scan/export/' + id + '?fmt=' + fmt);
 }
 
-// ── Utils ─────────────────────────────────────────────────────────────────────
 function setStatus(msg) { document.getElementById('statusText').textContent = msg; }
-function escHtml(s) {
+function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 </script>
@@ -1023,11 +1340,9 @@ function escHtml(s) {
 </html>
 """
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 56)
     print("  Kali VPN Vulnerability Scanner")
-    print(f"  URL: http://0.0.0.0:8040")
-    print("  Ctrl+C para detener")
+    print("  URL: http://0.0.0.0:8040")
     print("=" * 56)
     app.run(host="0.0.0.0", port=8040, debug=False, threaded=True)
