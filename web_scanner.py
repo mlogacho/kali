@@ -26,16 +26,16 @@ active_scans: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
 
 SCAN_PROFILES = {
-    "Descubrimiento (hosts vivos)":     "sudo nmap -sn {target}",
-    "Puertos top-1000":                  "sudo nmap -sS -T4 --open {target}",
-    "Puertos completos (1-65535)":       "sudo nmap -sS -T4 -p- --open {target}",
-    "Versiones + Sistema Operativo":     "sudo nmap -sS -sV -O -T4 {target}",
-    "Vulnerabilidades NSE (vuln)":       "sudo nmap -sV --script vuln -T4 {target}",
-    "Vuln + SO + Versiones (completo)":  "sudo nmap -sS -sV -O --script vuln -T4 {target}",
-    "CVEs con CVSS (vulners)":           "sudo nmap -sV --script vulners --script-args mincvss=5.0 -T4 {target}",
+    "Descubrimiento (hosts vivos)":     "nmap -sn -T4 {target}",
+    "Puertos top-1000":                  "nmap -sT -T4 --open {target}",
+    "Puertos completos (1-65535)":       "nmap -sT -T4 -p- --open {target}",
+    "Versiones + Sistema Operativo":     "nmap -sT -sV -O -T4 {target}",
+    "Vulnerabilidades NSE (vuln)":       "nmap -sT -sV --script vuln -T4 {target}",
+    "Vuln + SO + Versiones (completo)":  "nmap -sT -sV -O --script vuln -T4 {target}",
+    "CVEs con CVSS (vulners)":           "nmap -sT -sV --script vulners --script-args mincvss=5.0 -T4 {target}",
     "Web / HTTP (nikto)":                "nikto -h {target}",
-    "SMB vulnerabilidades":              "sudo nmap -p445 --script smb-vuln* -T4 {target}",
-    "SSL/TLS — red/subred (nmap)":       "sudo nmap -sV --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
+    "SMB vulnerabilidades":              "nmap -sT -p445 --script smb-vuln* -T4 {target}",
+    "SSL/TLS — red/subred (nmap)":       "nmap -sT --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
     "SSL/TLS — host único (sslscan)":    "sslscan --no-colour {target}",
 }
 
@@ -626,7 +626,7 @@ def api_scan_start():
 
     cmd     = cmd_tpl.replace("{target}", target)
     # Inject stats-every into nmap commands so we get periodic ETA updates
-    if cmd.lstrip().startswith(("nmap", "sudo nmap")) and "--stats-every" not in cmd:
+    if re.search(r'\bnmap\b', cmd) and "--stats-every" not in cmd:
         cmd = cmd.rstrip() + " --stats-every 8s"
     scan_id = str(uuid.uuid4())[:8]
     start   = now_str()
