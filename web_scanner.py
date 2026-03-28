@@ -35,7 +35,8 @@ SCAN_PROFILES = {
     "CVEs con CVSS (vulners)":           "sudo nmap -sV --script vulners --script-args mincvss=5.0 -T4 {target}",
     "Web / HTTP (nikto)":                "nikto -h {target}",
     "SMB vulnerabilidades":              "sudo nmap -p445 --script smb-vuln* -T4 {target}",
-    "SSL/TLS (sslscan)":                 "sslscan {target}",
+    "SSL/TLS — red/subred (nmap)":       "sudo nmap -sV --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
+    "SSL/TLS — host único (sslscan)":    "sslscan --no-colour {target}",
 }
 
 SEV_COLORS = {
@@ -73,6 +74,11 @@ def now_str():
 
 def now_display():
     return datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+# Elimina códigos de escape ANSI del output de los comandos
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mABCDEFGHJKLMSTfhin]|\x1b\(B|\x1b=|\x1b>')
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub('', text)
 
 # ── PDF Generation ─────────────────────────────────────────────────────────────
 
@@ -539,7 +545,7 @@ def api_ping():
                 text=True, bufsize=1
             )
             for line in proc.stdout:
-                line = line.rstrip()
+                line = strip_ansi(line).rstrip()
                 if line:
                     t = "success" if ("bytes from" in line or "ttl=" in line.lower()) \
                         else "error" if ("unreachable" in line or "100%" in line) \
@@ -619,7 +625,7 @@ def _run_scan_bg(scan_id, cmd):
         )
         state["proc"] = proc
         for line in proc.stdout:
-            state["lines"].append(line)
+            state["lines"].append(strip_ansi(line))
         proc.wait()
         state["end"] = now_str()
         state["lines"].append(
