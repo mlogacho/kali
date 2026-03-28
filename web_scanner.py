@@ -517,6 +517,45 @@ def api_vpn_status():
         return jsonify({**vpn_state, "ip": ip})
     return jsonify(vpn_state)
 
+# ── API: Ping ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/ping", methods=["POST"])
+def api_ping():
+    data   = request.json or {}
+    host   = data.get("host", "").strip()
+    count  = min(int(data.get("count", 4)), 10)
+    if not host:
+        return jsonify({"error": "Host requerido"}), 400
+    # Basic validation — allow IPs and hostnames only
+    if not re.match(r'^[a-zA-Z0-9._\-]+$', host):
+        return jsonify({"error": "Host inválido"}), 400
+
+    def generate():
+        yield f"data: {json.dumps({'line': f'PING {host} — {count} paquetes', 'type': 'header'})}\n\n"
+        try:
+            proc = subprocess.Popen(
+                ["ping", "-c", str(count), "-W", "2", host],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    t = "success" if ("bytes from" in line or "ttl=" in line.lower()) \
+                        else "error" if ("unreachable" in line or "100%" in line) \
+                        else "info"
+                    yield f"data: {json.dumps({'line': line, 'type': t})}\n\n"
+            proc.wait()
+            status = "HOST ALCANZABLE ✓" if proc.returncode == 0 else "HOST NO RESPONDE ✗"
+            t = "success" if proc.returncode == 0 else "error"
+            yield f"data: {json.dumps({'line': f'--- {status} ---', 'type': t, 'done': True})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'line': f'Error: {e}', 'type': 'error', 'done': True})}\n\n"
+
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 # ── API: Scan ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/scan/profiles")
@@ -811,6 +850,31 @@ select option{background:var(--bg3)}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+.ping-bar{display:flex;align-items:center;gap:8px;padding:7px 16px;
+          border-bottom:1px solid var(--bg4);flex-shrink:0;flex-wrap:wrap;
+          background:var(--bg2)}
+.ping-label{font-size:.78rem;font-weight:700;color:var(--green);white-space:nowrap}
+.ping-bar input{max-width:220px;padding:5px 10px;font-size:.85rem;
+                background:var(--bg3);border:1px solid var(--bg4);
+                color:var(--fg);border-radius:6px;outline:none}
+.ping-bar input:focus{border-color:var(--green)}
+.ping-bar select{width:120px;padding:5px 8px;font-size:.83rem;
+                 background:var(--bg3);border:1px solid var(--bg4);
+                 color:var(--fg);border-radius:6px;outline:none}
+.btn-ping{background:#1a5c2a;color:var(--green);border:1px solid var(--green);padding:5px 14px;font-size:.83rem}
+.btn-ping:hover{background:var(--green);color:#000}
+.btn-ping.running{background:#0d3318;color:var(--dim);border-color:var(--dim);cursor:not-allowed}
+.ping-output{display:flex;align-items:center;gap:12px;font-family:'Courier New',monospace;
+             font-size:.8rem;flex:1;min-width:0;overflow:hidden;white-space:nowrap;
+             background:var(--bg3);border-radius:6px;padding:5px 10px;border:1px solid var(--bg4)}
+.ping-line-success{color:var(--green);font-weight:600}
+.ping-line-error{color:var(--red);font-weight:600}
+.ping-line-header{color:var(--blue);font-weight:700}
+.ping-line-info{color:var(--dim)}
+.ping-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;display:inline-block}
+.ping-dot.ok{background:var(--green)}
+.ping-dot.fail{background:var(--red)}
+.ping-dot.waiting{background:var(--dim)}
 .statusbar{background:var(--bg2);border-top:1px solid var(--bg4);
            padding:4px 16px;font-size:.76rem;color:var(--dim);
            display:flex;justify-content:space-between;flex-shrink:0}
@@ -931,6 +995,21 @@ select option{background:var(--bg3)}
           <input id="inCommand" style="font-family:'Courier New',monospace;color:var(--yellow)"
                  placeholder="sudo nmap ...">
         </div>
+      </div>
+
+      <!-- Ping Tool -->
+      <div class="ping-bar">
+        <span class="ping-label">&#x1F4E1; PING</span>
+        <input id="pingHost" type="text" placeholder="IP o hostname (ej: 192.168.1.1)"
+               onkeydown="if(event.key==='Enter')doPing()" autocomplete="off">
+        <select id="pingCount">
+          <option value="4">4 paquetes</option>
+          <option value="8">8 paquetes</option>
+          <option value="10">10 paquetes</option>
+        </select>
+        <button class="btn btn-ping" id="btnPing" onclick="doPing()">&#x25B6; Ping</button>
+        <button class="btn btn-gray btn-sm" onclick="clearPing()" title="Limpiar">&#x2715;</button>
+        <div class="ping-output" id="pingOutput"><span style="color:var(--dim)">Introduce una IP o hostname y pulsa Ping.</span></div>
       </div>
 
       <!-- Toolbar -->
@@ -1329,6 +1408,112 @@ function exportScan(fmt)      { exportById(currentScanId, fmt); }
 function exportById(id, fmt)  {
   if (!id) { alert('No hay escaneo seleccionado.'); return; }
   window.open('/api/scan/export/' + id + '?fmt=' + fmt);
+}
+
+// ── Ping ──────────────────────────────────────────────────────────────────────
+let pingSse = null;
+
+function doPing() {
+  const host  = document.getElementById('pingHost').value.trim();
+  const count = document.getElementById('pingCount').value;
+  if (!host) { document.getElementById('pingHost').focus(); return; }
+
+  if (pingSse) { pingSse.close(); pingSse = null; }
+
+  const out = document.getElementById('pingOutput');
+  const btn = document.getElementById('btnPing');
+  out.innerHTML = `<span class="ping-dot waiting"></span><span style="color:var(--dim)">Enviando ping a ${esc(host)}...</span>`;
+  btn.classList.add('running');
+  btn.disabled = true;
+
+  // Pre-fill target field with pinged host
+  const targetField = document.getElementById('inTarget');
+  if (!targetField.value) targetField.value = host;
+
+  // Use fetch + SSE
+  pingSse = new EventSource(`/api/ping?_=${Date.now()}`);
+
+  // We trigger via fetch POST then open SSE — instead do both in one request via EventSource workaround
+  // Actually send POST first, then read stream
+  pingSse.close();
+
+  fetch('/api/ping', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({host, count: parseInt(count)})
+  }).then(res => {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let lastLine = null;
+    let success = null;
+
+    out.innerHTML = '';
+
+    function readChunk() {
+      reader.read().then(({done, value}) => {
+        if (done) {
+          btn.classList.remove('running');
+          btn.disabled = false;
+          return;
+        }
+        buf += decoder.decode(value, {stream: true});
+        const parts = buf.split('\n\n');
+        buf = parts.pop();
+        parts.forEach(part => {
+          const m = part.match(/^data: (.+)$/m);
+          if (!m) return;
+          try {
+            const d = JSON.parse(m[1]);
+            lastLine = d;
+            if (d.done) {
+              success = d.type === 'success';
+              // Show final status badge
+              const dot = document.createElement('span');
+              dot.className = 'ping-dot ' + (success ? 'ok' : 'fail');
+              const msg = document.createElement('span');
+              msg.className = success ? 'ping-line-success' : 'ping-line-error';
+              msg.textContent = d.line;
+              out.innerHTML = '';
+              out.appendChild(dot);
+              out.appendChild(msg);
+              // Show full log in tooltip / title
+              btn.classList.remove('running');
+              btn.disabled = false;
+              setStatus(success
+                ? `✓ ${host} responde al ping`
+                : `✗ ${host} no responde`);
+            } else {
+              // Accumulate last meaningful line
+              const span = document.createElement('span');
+              const cls = {success:'ping-line-success',error:'ping-line-error',
+                           header:'ping-line-header',info:'ping-line-info'}[d.type] || 'ping-line-info';
+              span.className = cls;
+              span.textContent = d.line;
+              // Only show last line in the bar (space limited)
+              out.innerHTML = '';
+              const dot = document.createElement('span');
+              dot.className = 'ping-dot waiting';
+              out.appendChild(dot);
+              out.appendChild(span);
+            }
+          } catch {}
+        });
+        readChunk();
+      });
+    }
+    readChunk();
+  }).catch(e => {
+    out.innerHTML = `<span class="ping-dot fail"></span><span class="ping-line-error">Error: ${esc(String(e))}</span>`;
+    btn.classList.remove('running');
+    btn.disabled = false;
+  });
+}
+
+function clearPing() {
+  document.getElementById('pingOutput').innerHTML =
+    '<span style="color:var(--dim)">Introduce una IP o hostname y pulsa Ping.</span>';
+  document.getElementById('pingHost').value = '';
 }
 
 function setStatus(msg) { document.getElementById('statusText').textContent = msg; }
