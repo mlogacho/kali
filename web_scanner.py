@@ -581,6 +581,9 @@ def api_scan_start():
         return jsonify({"error": "target y command son requeridos"}), 400
 
     cmd     = cmd_tpl.replace("{target}", target)
+    # Inject stats-every into nmap commands so we get periodic ETA updates
+    if cmd.lstrip().startswith(("nmap", "sudo nmap")) and "--stats-every" not in cmd:
+        cmd = cmd.rstrip() + " --stats-every 8s"
     scan_id = str(uuid.uuid4())[:8]
     start   = now_str()
 
@@ -610,6 +613,10 @@ def api_scan_start():
         "end":        None,
         "engineer":   engineer,
         "vpn_client": vpn_state["client"] if vpn_state["active"] else "No",
+        # Live counters
+        "devices":    [],   # list of discovered host strings
+        "eta":        None, # "0:01:30" string from nmap stats
+        "percent":    0.0,  # 0-100 float
     }
 
     threading.Thread(target=_run_scan_bg, args=(scan_id, cmd), daemon=True).start()
@@ -624,8 +631,38 @@ def _run_scan_bg(scan_id, cmd):
             text=True, bufsize=1
         )
         state["proc"] = proc
-        for line in proc.stdout:
-            state["lines"].append(strip_ansi(line))
+        _re_device = re.compile(
+            r'Nmap scan report for (.+)|'       # nmap host header
+            r'\+ Target IP:\s*(\S+)|'           # nikto
+            r'Host:\s*(\S+)\s*\(\)'             # nmap -oG style
+        )
+        _re_nmap_done = re.compile(
+            r'Nmap done.*?(\d+) hosts? up'
+        )
+        _re_stats = re.compile(
+            r'About\s+([\d.]+)%\s+done.*?ETA:\s*([\d:]+)',
+            re.IGNORECASE
+        )
+        for raw in proc.stdout:
+            line = strip_ansi(raw)
+            state["lines"].append(line)
+            stripped = line.strip()
+            # Device discovery
+            m = _re_device.search(stripped)
+            if m:
+                host = next((g for g in m.groups() if g), None)
+                if host and host not in state["devices"]:
+                    state["devices"].append(host.strip())
+            # nmap done line — final host count
+            m2 = _re_nmap_done.search(stripped)
+            if m2:
+                # Ensure we at least have that many entries marked
+                pass
+            # nmap stats line — ETA + percent
+            m3 = _re_stats.search(stripped)
+            if m3:
+                state["percent"] = float(m3.group(1))
+                state["eta"]     = m3.group(2)
         proc.wait()
         state["end"] = now_str()
         state["lines"].append(
@@ -663,10 +700,17 @@ def api_scan_stream(scan_id):
             while idx < len(s["lines"]):
                 line = s["lines"][idx].rstrip("\n")
                 sev  = detect_severity(line)
-                yield f"data: {json.dumps({'line': line, 'sev': sev})}\n\n"
+                payload = {
+                    "line":    line,
+                    "sev":     sev,
+                    "devices": len(s["devices"]),
+                    "eta":     s["eta"],
+                    "percent": s["percent"],
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
                 idx += 1
             if s["done"] and idx >= len(s["lines"]):
-                yield f"data: {json.dumps({'done': True})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'devices': len(s['devices']), 'device_list': s['devices']})}\n\n"
                 break
             time.sleep(0.08)
     return Response(stream_with_context(generate()),
@@ -856,6 +900,35 @@ select option{background:var(--bg3)}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--bg4);border-radius:3px}
+.stats-bar{display:flex;align-items:center;gap:0;flex-shrink:0;
+           background:var(--bg2);border-bottom:1px solid var(--bg4);overflow:hidden}
+.stat-block{display:flex;flex-direction:column;align-items:center;justify-content:center;
+            padding:6px 20px;border-right:1px solid var(--bg4);min-width:130px}
+.stat-block:last-child{border-right:none}
+.stat-label{font-size:.68rem;color:var(--dim);font-weight:700;text-transform:uppercase;
+            letter-spacing:.06em;margin-bottom:2px}
+.stat-value{font-size:1.2rem;font-weight:800;font-family:'Courier New',monospace;
+            line-height:1;transition:color .3s}
+.stat-value.devices{color:var(--blue)}
+.stat-value.elapsed{color:var(--fg)}
+.stat-value.eta{color:var(--green)}
+.stat-value.eta.unknown{color:var(--dim)}
+.stat-value.percent{color:var(--yellow)}
+.stat-progress{flex:1;padding:0 16px;display:flex;flex-direction:column;
+               justify-content:center;gap:4px}
+.stat-progress-label{display:flex;justify-content:space-between;
+                      font-size:.72rem;color:var(--dim);font-weight:600}
+.stat-progress-track{height:6px;background:var(--bg4);border-radius:3px;overflow:hidden}
+.stat-progress-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--green));
+                    border-radius:3px;width:0%;transition:width .8s ease}
+.stat-devices-list{flex:1;padding:0 14px;overflow:hidden}
+.stat-devices-scroll{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}
+.stat-devices-scroll::-webkit-scrollbar{height:3px}
+.stat-devices-scroll::-webkit-scrollbar-thumb{background:var(--bg4)}
+.device-chip{background:var(--bg3);border:1px solid var(--blue);color:var(--blue);
+             border-radius:4px;padding:2px 8px;font-size:.72rem;white-space:nowrap;
+             font-family:'Courier New',monospace;animation:chipIn .3s ease}
+@keyframes chipIn{from{opacity:0;transform:scale(.8)}to{opacity:1;transform:scale(1)}}
 .ping-bar{display:flex;align-items:center;gap:8px;padding:7px 16px;
           border-bottom:1px solid var(--bg4);flex-shrink:0;flex-wrap:wrap;
           background:var(--bg2)}
@@ -1018,6 +1091,38 @@ select option{background:var(--bg3)}
         <div class="ping-output" id="pingOutput"><span style="color:var(--dim)">Introduce una IP o hostname y pulsa Ping.</span></div>
       </div>
 
+      <!-- Stats bar -->
+      <div class="stats-bar" id="statsBar">
+        <div class="stat-block">
+          <div class="stat-label">Dispositivos</div>
+          <div class="stat-value devices" id="statDevices">—</div>
+        </div>
+        <div class="stat-block">
+          <div class="stat-label">Transcurrido</div>
+          <div class="stat-value elapsed" id="statElapsed">00:00</div>
+        </div>
+        <div class="stat-block">
+          <div class="stat-label">Tiempo restante</div>
+          <div class="stat-value eta unknown" id="statEta">—</div>
+        </div>
+        <div class="stat-block">
+          <div class="stat-label">Progreso</div>
+          <div class="stat-value percent" id="statPercent">—</div>
+        </div>
+        <div class="stat-progress">
+          <div class="stat-progress-label">
+            <span id="progLabel">En espera</span>
+            <span id="progPct">0%</span>
+          </div>
+          <div class="stat-progress-track">
+            <div class="stat-progress-fill" id="progFill"></div>
+          </div>
+        </div>
+        <div class="stat-devices-list">
+          <div class="stat-devices-scroll" id="deviceChips"></div>
+        </div>
+      </div>
+
       <!-- Toolbar -->
       <div class="toolbar">
         <button class="btn btn-blue" id="btnScan" onclick="startScan()">&#x25B6; Iniciar Escaneo</button>
@@ -1088,6 +1193,7 @@ select option{background:var(--bg3)}
 let currentScanId = null, sseSource = null;
 let scanRunning = false, startTime = null, timerInterval = null;
 let profiles = {};
+let knownDevices = new Set();
 
 window.onload = async () => {
   await loadProfiles();
@@ -1279,6 +1385,7 @@ async function startScan() {
   }
 
   clearOutput();
+  resetStats();
   const r = await fetch('/api/scan/start', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({target, command, client, profile, engineer})
@@ -1304,9 +1411,18 @@ function streamScan(scanId) {
   sseSource = new EventSource('/api/scan/stream/' + scanId);
   sseSource.onmessage = e => {
     const data = JSON.parse(e.data);
-    if (data.done) { scanDone(); return; }
+    if (data.done) {
+      if (data.device_list) renderDeviceChips(data.device_list);
+      updateStats(data.devices ?? knownDevices.size, null, 100);
+      scanDone();
+      return;
+    }
     appendLine(data.line, data.sev);
     if (['CRITICAL','HIGH','MEDIUM'].includes(data.sev)) appendFinding(data.line, data.sev);
+    // Update live counters
+    if (data.devices !== undefined) updateStats(data.devices, data.eta, data.percent);
+    // Device chip — detect new host from line text too
+    detectDeviceChip(data.line);
   };
   sseSource.onerror = () => { sseSource.close(); scanDone(); };
 }
@@ -1339,9 +1455,94 @@ function startTimer() {
     const s  = Math.floor((Date.now() - startTime) / 1000);
     const m  = String(Math.floor(s/60)).padStart(2,'0');
     const ss = String(s%60).padStart(2,'0');
-    document.getElementById('elapsedText').textContent = `Duración: ${m}:${ss}`;
-    document.getElementById('scanStatus').textContent  = `Escaneando... ${m}:${ss}`;
+    const fmt = `${m}:${ss}`;
+    document.getElementById('elapsedText').textContent  = `Duración: ${fmt}`;
+    document.getElementById('scanStatus').textContent   = `Escaneando... ${fmt}`;
+    document.getElementById('statElapsed').textContent  = fmt;
   }, 1000);
+}
+
+// ── Stats counters ────────────────────────────────────────────────────────────
+function resetStats() {
+  knownDevices.clear();
+  document.getElementById('statDevices').textContent = '0';
+  document.getElementById('statEta').textContent     = '—';
+  document.getElementById('statEta').className       = 'stat-value eta unknown';
+  document.getElementById('statPercent').textContent = '—';
+  document.getElementById('statElapsed').textContent = '00:00';
+  document.getElementById('progFill').style.width    = '0%';
+  document.getElementById('progPct').textContent     = '0%';
+  document.getElementById('progLabel').textContent   = 'Escaneando...';
+  document.getElementById('deviceChips').innerHTML   = '';
+}
+
+function updateStats(deviceCount, eta, percent) {
+  // Devices
+  const dEl = document.getElementById('statDevices');
+  if (deviceCount !== undefined && deviceCount !== null) {
+    const prev = parseInt(dEl.textContent) || 0;
+    dEl.textContent = deviceCount;
+    if (deviceCount > prev) {
+      dEl.style.transform = 'scale(1.4)';
+      setTimeout(() => dEl.style.transform = '', 300);
+    }
+  }
+  // ETA
+  if (eta) {
+    const etaEl = document.getElementById('statEta');
+    etaEl.textContent = eta;
+    etaEl.className   = 'stat-value eta';
+  }
+  // Percent
+  if (percent !== undefined && percent !== null && percent > 0) {
+    const pct = Math.min(100, parseFloat(percent)).toFixed(1);
+    document.getElementById('statPercent').textContent = pct + '%';
+    document.getElementById('progFill').style.width    = pct + '%';
+    document.getElementById('progPct').textContent     = pct + '%';
+    document.getElementById('progLabel').textContent   =
+      percent >= 100 ? 'Completado' : 'Progreso del escaneo';
+  }
+}
+
+function detectDeviceChip(line) {
+  // Parse host from nmap / nikto output lines
+  const patterns = [
+    /Nmap scan report for (.+)/,
+    /\+ Target IP:\s*(\S+)/,
+    /Host:\s*(\S+)\s*\(\)/,
+  ];
+  for (const re of patterns) {
+    const m = line.match(re);
+    if (m) {
+      const host = m[1].trim();
+      if (!knownDevices.has(host)) {
+        knownDevices.add(host);
+        addDeviceChip(host);
+        // Pulse the counter
+        document.getElementById('statDevices').textContent = knownDevices.size;
+      }
+      break;
+    }
+  }
+}
+
+function addDeviceChip(host) {
+  const chips = document.getElementById('deviceChips');
+  const chip  = document.createElement('span');
+  chip.className   = 'device-chip';
+  chip.textContent = host;
+  chip.title       = 'Click para usar como objetivo';
+  chip.onclick     = () => { document.getElementById('inTarget').value = host; };
+  chips.appendChild(chip);
+  chips.scrollLeft = chips.scrollWidth;
+}
+
+function renderDeviceChips(list) {
+  const chips = document.getElementById('deviceChips');
+  chips.innerHTML = '';
+  knownDevices.clear();
+  list.forEach(h => { knownDevices.add(h); addDeviceChip(h); });
+  document.getElementById('statDevices').textContent = list.length;
 }
 
 function appendLine(line, sev) {
