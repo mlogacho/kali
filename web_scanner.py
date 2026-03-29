@@ -23,6 +23,7 @@ if not os.path.exists(CLIENTS_FILE):
 
 # ── State ──────────────────────────────────────────────────────────────────────
 active_scans: dict[str, dict] = {}
+network_maps: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
 
 SCAN_PROFILES = {
@@ -425,6 +426,150 @@ def generate_pdf_report(scan: dict) -> bytes:
     doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
     buf.seek(0)
     return buf.read()
+
+
+# ── Network Map ────────────────────────────────────────────────────────────────
+
+def _parse_discovery(output: str) -> list:
+    """Parse `nmap -sn` output → list of host dicts."""
+    hosts, cur = [], None
+    for line in output.splitlines():
+        m = re.match(r'Nmap scan report for (.+)', line)
+        if m:
+            if cur: hosts.append(cur)
+            s = m.group(1).strip()
+            ip_m = re.search(r'\((\d+\.\d+\.\d+\.\d+)\)', s)
+            if ip_m:
+                ip = ip_m.group(1)
+                hn = s[:s.rfind('(')].strip()
+            else:
+                ip = s; hn = ""
+            if "compute.internal" in hn or "ec2.internal" in hn:
+                hn = ""
+            cur = {"ip": ip, "hostname": hn, "mac": "", "vendor": "", "ports": []}
+        elif cur:
+            mac_m = re.match(r'\s*MAC Address: ([0-9A-Fa-f:]+)\s*(?:\(([^)]*)\))?', line)
+            if mac_m:
+                cur["mac"]    = mac_m.group(1)
+                cur["vendor"] = mac_m.group(2) or ""
+    if cur: hosts.append(cur)
+    return hosts
+
+
+def _parse_ports(output: str, by_ip: dict):
+    """Append open ports to existing host dicts from nmap -sT output."""
+    cur = None
+    for line in output.splitlines():
+        m = re.match(r'Nmap scan report for (.+)', line)
+        if m:
+            s = m.group(1).strip()
+            ip_m = re.search(r'\((\d+\.\d+\.\d+\.\d+)\)', s)
+            cur = ip_m.group(1) if ip_m else s
+        elif cur and cur in by_ip:
+            pm = re.match(r'\s*(\d+)/tcp\s+open\s+(\S+)', line)
+            if pm:
+                by_ip[cur]["ports"].append({"port": int(pm.group(1)), "service": pm.group(2)})
+
+
+def _classify_node(h: dict) -> str:
+    ports = [p["port"] for p in h.get("ports", [])]
+    last  = h["ip"].split(".")[-1]
+    hn    = h.get("hostname", "").lower()
+    vn    = h.get("vendor",   "").lower()
+    if last in ("1", "254") \
+       or any(k in hn for k in ("router","gateway","fw","firewall","fortigate","edge","pfsense")) \
+       or any(k in vn for k in ("fortinet","cisco","juniper","mikrotik","ubiquiti","palo alto","sonicwall")):
+        return "gateway"
+    if 3389 in ports or (445 in ports and 80 not in ports and 443 not in ports):
+        return "windows"
+    if 443 in ports or 80 in ports or 8080 in ports or 8443 in ports:
+        return "web"
+    if 22 in ports:
+        return "linux"
+    if any(p in ports for p in (3306, 5432, 1521, 27017)):
+        return "database"
+    return "unknown"
+
+
+def _run_network_map(map_id: str, target: str):
+    state = network_maps[map_id]
+    try:
+        state["status"] = "Descubriendo hosts activos..."
+        disc = subprocess.run(
+            f"nmap -sn -T4 {target}",
+            shell=True, capture_output=True, text=True, timeout=120
+        )
+        hosts = _parse_discovery(disc.stdout)
+        state["status"] = f"Escaneando puertos en {len(hosts)} host(s)..."
+
+        by_ip = {h["ip"]: h for h in hosts}
+        if hosts:
+            ips_str = " ".join(h["ip"] for h in hosts)
+            port_out = subprocess.run(
+                f"nmap -sT -Pn -T4 --open -p 21,22,25,80,110,443,445,3306,3389,5432,8080,8443 {ips_str}",
+                shell=True, capture_output=True, text=True, timeout=180
+            )
+            _parse_ports(port_out.stdout, by_ip)
+
+        for h in hosts:
+            h["type"] = _classify_node(h)
+
+        gateways = [h["ip"] for h in hosts if h["type"] == "gateway"]
+        if not gateways and hosts:
+            hosts[0]["type"] = "gateway"
+            gateways = [hosts[0]["ip"]]
+
+        edges = []
+        if gateways:
+            for h in hosts:
+                if h["ip"] not in gateways:
+                    edges.append({"source": gateways[0], "target": h["ip"]})
+        for i in range(len(gateways) - 1):
+            edges.append({"source": gateways[i], "target": gateways[i + 1]})
+
+        state["nodes"]  = hosts
+        state["edges"]  = edges
+        state["status"] = "done"
+    except Exception as e:
+        state["status"] = f"error: {e}"
+    finally:
+        state["done"] = True
+
+
+@app.route("/api/network/scan", methods=["POST"])
+def api_network_scan():
+    target = (request.json or {}).get("target", "").strip()
+    if not target:
+        return jsonify({"error": "target requerido"}), 400
+    if not re.match(r'^[\w./:@\-]+$', target):
+        return jsonify({"error": "target inválido"}), 400
+    map_id = str(uuid.uuid4())[:8]
+    network_maps[map_id] = {
+        "done": False, "status": "Iniciando...",
+        "nodes": [], "edges": [], "target": target,
+    }
+    threading.Thread(target=_run_network_map, args=(map_id, target), daemon=True).start()
+    return jsonify({"map_id": map_id})
+
+
+@app.route("/api/network/stream/<map_id>")
+def api_network_stream(map_id):
+    def generate():
+        last = None
+        while True:
+            m = network_maps.get(map_id)
+            if not m:
+                yield f"data: {json.dumps({'error': 'id inválido'})}\n\n"; break
+            if m["status"] != last:
+                last = m["status"]
+                yield f"data: {json.dumps({'type': 'status', 'msg': m['status']})}\n\n"
+            if m["done"]:
+                yield f"data: {json.dumps({'type': 'result', 'nodes': m['nodes'], 'edges': m['edges']})}\n\n"
+                break
+            time.sleep(0.5)
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── API: Clients ───────────────────────────────────────────────────────────────
@@ -840,6 +985,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kali VPN Vulnerability Scanner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
 <style>
 :root{
   --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bg4:#30363d;
@@ -1012,6 +1158,28 @@ select option{background:var(--bg3)}
                     color:var(--fg);padding:5px 10px;border-radius:6px;font-size:.88rem}
 .engineer-bar input:focus{border-color:var(--blue);outline:none}
 .eng-hint{font-size:.75rem;color:var(--dim)}
+/* ── Network Map ── */
+.map-toolbar{display:flex;align-items:center;gap:8px;padding:8px 16px;
+             border-bottom:1px solid var(--bg4);flex-shrink:0;flex-wrap:wrap;
+             background:var(--bg2)}
+.map-legend{display:flex;gap:12px;align-items:center;margin-left:auto;flex-wrap:wrap}
+.leg-item{display:flex;align-items:center;gap:4px;font-size:.73rem;color:var(--dim);white-space:nowrap}
+.leg-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;border:2px solid}
+#mapContainer{flex:1;background:#090d13;position:relative;overflow:hidden;min-height:200px}
+.node-tooltip{position:absolute;background:var(--bg2);border:1px solid var(--bg4);
+              border-radius:8px;padding:10px 14px;min-width:220px;max-width:300px;
+              z-index:50;pointer-events:none;box-shadow:0 4px 24px rgba(0,0,0,.7)}
+.node-tooltip #ttTitle{font-size:.95rem;font-weight:700;margin-bottom:7px;
+                        font-family:'Courier New',monospace}
+.tt-row{font-size:.78rem;margin:3px 0;color:var(--fg);line-height:1.5}
+.tt-row b{color:var(--dim);margin-right:4px}
+.tt-port{display:inline-block;padding:1px 6px;border-radius:4px;font-size:.72rem;
+         font-family:'Courier New',monospace;margin:2px 1px;border:1px solid currentColor}
+#mapEmpty{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+          text-align:center;color:var(--dim);pointer-events:none;user-select:none}
+#mapEmpty .em-icon{font-size:3rem;margin-bottom:10px}
+#mapEmpty .em-text{font-size:1rem;color:var(--fg);margin-bottom:6px}
+#mapEmpty .em-sub{font-size:.82rem}
 </style>
 </head>
 <body>
@@ -1092,6 +1260,7 @@ select option{background:var(--bg3)}
     <div class="tabs">
       <div class="tab active" id="tab-btn-scanner" onclick="showTab('scanner',this)">&#x1F50D; Escaneo</div>
       <div class="tab" id="tab-btn-history"  onclick="showTab('history',this);loadHistory()">&#x1F4CB; Historial</div>
+      <div class="tab" id="tab-btn-map"      onclick="showTab('map',this);onMapTabOpen()">&#x1F5A7; Mapa de Red</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -1204,6 +1373,45 @@ select option{background:var(--bg3)}
       </div>
     </div>
 
+    <!-- MAP TAB -->
+    <div class="tab-content" id="tab-map">
+      <div class="map-toolbar">
+        <span style="font-weight:700;color:var(--blue);white-space:nowrap;font-size:.9rem">&#x1F5A7; Mapa de Red</span>
+        <input id="mapTarget" placeholder="Subnet (ej: 10.11.121.0/24)"
+               style="max-width:240px;padding:5px 10px;background:var(--bg3);
+                      border:1px solid var(--bg4);color:var(--fg);border-radius:6px;
+                      outline:none;font-size:.88rem;font-family:inherit"
+               onkeydown="if(event.key==='Enter')startNetworkMap()"
+               onfocus="this.style.borderColor='var(--blue)'"
+               onblur="this.style.borderColor='var(--bg4)'">
+        <button class="btn btn-blue btn-sm" id="btnMapScan" onclick="startNetworkMap()">&#x25B6; Escanear</button>
+        <button class="btn btn-gray btn-sm" id="btnMapReset" onclick="resetMapView()">&#x21BA; Reset</button>
+        <span id="mapStatus" style="color:var(--dim);font-size:.8rem"></span>
+        <div class="map-legend">
+          <div class="leg-item"><div class="leg-dot" style="background:#8b1a1a;border-color:#f85149"></div>Gateway/FW</div>
+          <div class="leg-item"><div class="leg-dot" style="background:#1a3a6b;border-color:#58a6ff"></div>Web Server</div>
+          <div class="leg-item"><div class="leg-dot" style="background:#5a3200;border-color:#f0883e"></div>Windows</div>
+          <div class="leg-item"><div class="leg-dot" style="background:#0e3a1a;border-color:#3fb950"></div>Linux/SSH</div>
+          <div class="leg-item"><div class="leg-dot" style="background:#2e1a5a;border-color:#bc8cff"></div>Base de Datos</div>
+          <div class="leg-item"><div class="leg-dot" style="background:#161b22;border-color:#6e7681"></div>Desconocido</div>
+        </div>
+      </div>
+      <div id="mapContainer">
+        <svg id="networkSvg" style="width:100%;height:100%"></svg>
+        <div id="nodeTooltip" class="node-tooltip" style="display:none">
+          <div id="ttTitle"></div>
+          <div id="ttContent"></div>
+        </div>
+        <div id="mapEmpty">
+          <div class="em-icon">&#x1F5A7;</div>
+          <div class="em-text">Sin datos de red</div>
+          <div class="em-sub">Introduce una subnet y pulsa Escanear<br>
+            <span style="color:var(--blue);font-size:.78rem">Tip: arrastra nodos · scroll = zoom · doble-click = reset</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- HISTORY TAB -->
     <div class="tab-content" id="tab-history" style="overflow:auto;padding:16px">
       <table class="history-table" id="historyTable">
@@ -1277,6 +1485,18 @@ function showTab(name, el) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
   el.classList.add('active');
+}
+
+function onMapTabOpen() {
+  // Auto-populate mapTarget from current scan target if empty
+  const cur = document.getElementById('inTarget').value.trim();
+  const mt  = document.getElementById('mapTarget');
+  if (cur && !mt.value) mt.value = cur;
+  // Resize SVG to container
+  const c = document.getElementById('mapContainer');
+  const s = document.getElementById('networkSvg');
+  s.setAttribute('width',  c.clientWidth);
+  s.setAttribute('height', c.clientHeight);
 }
 
 async function loadProfiles() {
@@ -1828,6 +2048,244 @@ function clearPing() {
 function setStatus(msg) { document.getElementById('statusText').textContent = msg; }
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Network Map (D3.js v7) ────────────────────────────────────────────────────
+const NODE_CFG = {
+  gateway:  {fill:'#8b1a1a', stroke:'#f85149', r:30, label:'Gateway / Firewall', icon:'⬡'},
+  web:      {fill:'#1a3a6b', stroke:'#58a6ff', r:22, label:'Web Server',          icon:'⊛'},
+  windows:  {fill:'#5a3200', stroke:'#f0883e', r:22, label:'Windows / SMB',       icon:'⊞'},
+  linux:    {fill:'#0e3a1a', stroke:'#3fb950', r:22, label:'Linux / SSH',         icon:'$'},
+  database: {fill:'#2e1a5a', stroke:'#bc8cff', r:22, label:'Base de Datos',       icon:'◈'},
+  unknown:  {fill:'#161b22', stroke:'#6e7681', r:16, label:'Desconocido',         icon:'?'},
+};
+let _mapSim = null, _mapZoom = null;
+
+async function startNetworkMap() {
+  const target = document.getElementById('mapTarget').value.trim();
+  if (!target) { document.getElementById('mapTarget').focus(); return; }
+  const btn = document.getElementById('btnMapScan');
+  btn.disabled = true;
+  document.getElementById('mapEmpty').style.display = 'none';
+  setMapStatus('Iniciando escaneo...', true);
+  let r, j;
+  try {
+    r = await fetch('/api/network/scan', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({target})
+    });
+    j = await r.json();
+  } catch(e) { setMapStatus('Error de red', false); btn.disabled=false; return; }
+  if (j.error) { setMapStatus('Error: '+j.error, false); btn.disabled=false; return; }
+  const sse = new EventSource('/api/network/stream/'+j.map_id);
+  sse.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'status') {
+      setMapStatus(d.msg, true);
+    } else if (d.type === 'result') {
+      sse.close(); btn.disabled = false;
+      const n = d.nodes.length;
+      setMapStatus(n + ' host' + (n!==1?'s':'') + ' encontrado' + (n!==1?'s':''), false);
+      renderNetworkGraph(d.nodes, d.edges);
+    } else if (d.error) {
+      sse.close(); btn.disabled = false;
+      setMapStatus('Error: '+d.error, false);
+    }
+  };
+  sse.onerror = () => { sse.close(); btn.disabled=false; setMapStatus('Error SSE', false); };
+}
+
+function renderNetworkGraph(nodes, edges) {
+  if (_mapSim) { _mapSim.stop(); _mapSim = null; }
+  const container = document.getElementById('mapContainer');
+  const W = container.clientWidth  || 900;
+  const H = container.clientHeight || 600;
+  const svg = d3.select('#networkSvg').attr('width',W).attr('height',H);
+  svg.selectAll('*').remove();
+  svg.append('rect').attr('width',W).attr('height',H).attr('fill','#090d13');
+  if (!nodes.length) {
+    document.getElementById('mapEmpty').style.display = 'block';
+    document.getElementById('mapEmpty').querySelector('.em-text').textContent = 'Sin hosts activos';
+    return;
+  }
+  // ── Defs ──
+  const defs = svg.append('defs');
+  Object.entries(NODE_CFG).forEach(([t,c]) => {
+    if (t==='unknown') return;
+    const f = defs.append('filter').attr('id','glow-'+t).attr('x','-40%').attr('y','-40%').attr('width','180%').attr('height','180%');
+    f.append('feGaussianBlur').attr('stdDeviation',5).attr('result','blur');
+    const m = f.append('feMerge');
+    m.append('feMergeNode').attr('in','blur');
+    m.append('feMergeNode').attr('in','SourceGraphic');
+  });
+  // Gradient for gateway
+  const gwg = defs.append('radialGradient').attr('id','gwGrad').attr('cx','35%').attr('cy','35%').attr('r','65%');
+  gwg.append('stop').attr('offset','0%').attr('stop-color','#c03030');
+  gwg.append('stop').attr('offset','100%').attr('stop-color','#5a0a0a');
+  // ── Zoom ──
+  const g = svg.append('g');
+  _mapZoom = d3.zoom().scaleExtent([0.1, 6])
+    .on('zoom', ev => g.attr('transform', ev.transform));
+  svg.call(_mapZoom);
+  svg.on('dblclick.zoom', () => fitGraph(svg, g, W, H));
+  // ── Build node lookup ──
+  const byIp = {};
+  nodes.forEach(n => {
+    byIp[n.ip] = n;
+    n.x = W/2 + (Math.random()-.5)*280;
+    n.y = H/2 + (Math.random()-.5)*280;
+  });
+  // ── Links ──
+  const linkSel = g.append('g')
+    .selectAll('line').data(edges).join('line')
+    .attr('stroke','#2a3140').attr('stroke-width',2).attr('opacity',.9);
+  // ── Node groups ──
+  const nodeSel = g.append('g')
+    .selectAll('g').data(nodes).join('g')
+    .style('cursor','pointer')
+    .call(d3.drag()
+      .on('start',(ev,d)=>{ if(!ev.active)sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; })
+      .on('drag', (ev,d)=>{ d.fx=ev.x; d.fy=ev.y; })
+      .on('end',  (ev,d)=>{ if(!ev.active)sim.alphaTarget(0); d.fx=null; d.fy=null; })
+    );
+  // Outer pulse ring (gateway only)
+  nodeSel.filter(d=>d.type==='gateway').append('circle')
+    .attr('r', d=>NODE_CFG[d.type].r+10)
+    .attr('fill','none').attr('stroke','#f85149').attr('stroke-width',1.5).attr('opacity',.25);
+  // Main circle
+  nodeSel.append('circle')
+    .attr('r', d=>(NODE_CFG[d.type]||NODE_CFG.unknown).r)
+    .attr('fill', d=>d.type==='gateway'?'url(#gwGrad)':(NODE_CFG[d.type]||NODE_CFG.unknown).fill)
+    .attr('stroke', d=>(NODE_CFG[d.type]||NODE_CFG.unknown).stroke)
+    .attr('stroke-width', 2.2)
+    .attr('filter', d=>d.type!=='unknown'?'url(#glow-'+d.type+')':null);
+  // Port indicator dots (satellite dots)
+  nodeSel.each(function(d) {
+    const cr = (NODE_CFG[d.type]||NODE_CFG.unknown).r;
+    (d.ports||[]).slice(0,8).forEach((p,i,arr) => {
+      const angle = (i/arr.length)*2*Math.PI - Math.PI/2;
+      const or = cr + 13;
+      d3.select(this).append('circle')
+        .attr('cx', Math.cos(angle)*or).attr('cy', Math.sin(angle)*or)
+        .attr('r',4).attr('fill',portColor(p.port))
+        .attr('stroke','#090d13').attr('stroke-width',1.2)
+        .append('title').text(p.port+'/'+p.service);
+    });
+  });
+  // Type icon
+  nodeSel.append('text')
+    .attr('text-anchor','middle').attr('dominant-baseline','central')
+    .attr('font-size', d=>d.type==='gateway'?'15px':'13px')
+    .attr('fill','rgba(255,255,255,.85)').attr('pointer-events','none')
+    .attr('font-weight','bold')
+    .text(d=>(NODE_CFG[d.type]||NODE_CFG.unknown).icon);
+  // IP label
+  nodeSel.append('text')
+    .attr('y', d=>(NODE_CFG[d.type]||NODE_CFG.unknown).r+16)
+    .attr('text-anchor','middle').attr('font-size','11px')
+    .attr('fill','#8b949e').attr('pointer-events','none')
+    .attr('font-family',"'Courier New',monospace")
+    .text(d=>d.ip);
+  // Hostname label (if available)
+  nodeSel.filter(d=>!!d.hostname).append('text')
+    .attr('y', d=>(NODE_CFG[d.type]||NODE_CFG.unknown).r+28)
+    .attr('text-anchor','middle').attr('font-size','10px')
+    .attr('fill','#6e7681').attr('pointer-events','none')
+    .text(d=>d.hostname.length>22?d.hostname.slice(0,22)+'…':d.hostname);
+  // ── Tooltip ──
+  nodeSel
+    .on('mouseenter', (ev,d)=>{ showNodeTooltip(ev,d); })
+    .on('mousemove',  ev  =>{ moveNodeTooltip(ev); })
+    .on('mouseleave', ()  =>{ document.getElementById('nodeTooltip').style.display='none'; });
+  // ── Simulation ──
+  const sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(edges).id(d=>d.ip)
+      .distance(d=>{
+        const s = typeof d.source==='object'?d.source:byIp[d.source];
+        const t = typeof d.target==='object'?d.target:byIp[d.target];
+        return (s?.type==='gateway'||t?.type==='gateway') ? 170 : 110;
+      }).strength(.55))
+    .force('charge', d3.forceManyBody().strength(-700).distanceMax(400))
+    .force('center', d3.forceCenter(W/2, H/2).strength(.05))
+    .force('collide', d3.forceCollide().radius(d=>(NODE_CFG[d.type]||NODE_CFG.unknown).r+50).strength(.8))
+    .on('tick', ()=>{
+      linkSel.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
+             .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+      nodeSel.attr('transform',d=>`translate(${d.x},${d.y})`);
+    });
+  _mapSim = sim;
+  // Auto-fit after 2 s
+  setTimeout(()=>fitGraph(svg, g, W, H), 2200);
+}
+
+function fitGraph(svg, g, W, H) {
+  try {
+    const bb = g.node().getBBox();
+    if (bb.width<2 || bb.height<2) return;
+    const pad = 80;
+    const sc  = Math.min(.95, Math.min((W-pad)/(bb.width+pad), (H-pad)/(bb.height+pad)));
+    const tx  = W/2 - sc*(bb.x+bb.width/2);
+    const ty  = H/2 - sc*(bb.y+bb.height/2);
+    svg.transition().duration(700)
+      .call(_mapZoom.transform, d3.zoomIdentity.translate(tx,ty).scale(sc));
+  } catch(e){}
+}
+
+function showNodeTooltip(ev, d) {
+  const cfg = NODE_CFG[d.type] || NODE_CFG.unknown;
+  document.getElementById('ttTitle').innerHTML =
+    `<span style="color:${cfg.stroke}">${cfg.icon}&nbsp;${d.ip}</span>`;
+  let html = `<div class="tt-row"><b>Tipo:</b>${cfg.label}</div>`;
+  if (d.hostname) html += `<div class="tt-row"><b>Hostname:</b>${esc(d.hostname)}</div>`;
+  if (d.mac)      html += `<div class="tt-row"><b>MAC:</b><span style="font-family:'Courier New',monospace;color:var(--yellow)">${esc(d.mac)}</span></div>`;
+  if (d.vendor)   html += `<div class="tt-row"><b>Vendor:</b>${esc(d.vendor)}</div>`;
+  if (d.ports && d.ports.length) {
+    html += '<div class="tt-row"><b>Puertos:</b><br>';
+    html += d.ports.map(p=>
+      `<span class="tt-port" style="border-color:${portColor(p.port)};color:${portColor(p.port)}">${p.port}/${p.service}</span>`
+    ).join('');
+    html += '</div>';
+  } else {
+    html += '<div class="tt-row" style="color:var(--dim)"><i>Sin puertos abiertos detectados</i></div>';
+  }
+  document.getElementById('ttContent').innerHTML = html;
+  document.getElementById('nodeTooltip').style.display = 'block';
+  moveNodeTooltip(ev);
+}
+
+function moveNodeTooltip(ev) {
+  const c  = document.getElementById('mapContainer').getBoundingClientRect();
+  const tt = document.getElementById('nodeTooltip');
+  let x = ev.clientX - c.left + 18;
+  let y = ev.clientY - c.top  - 12;
+  if (x + 300 > c.width)  x = ev.clientX - c.left - 306;
+  if (y + 230 > c.height) y = ev.clientY - c.top  - 234;
+  tt.style.left = Math.max(0,x) + 'px';
+  tt.style.top  = Math.max(0,y) + 'px';
+}
+
+function portColor(port) {
+  if ([80,8080,8000].includes(port))          return '#58a6ff';
+  if ([443,8443].includes(port))              return '#3fb950';
+  if (port===22)                              return '#e3b341';
+  if ([445,3389].includes(port))             return '#f0883e';
+  if ([3306,5432,27017,1521].includes(port)) return '#bc8cff';
+  if (port===21)                             return '#f85149';
+  if ([25,110,143].includes(port))           return '#ffa657';
+  return '#6e7681';
+}
+
+function setMapStatus(msg, spin) {
+  const el = document.getElementById('mapStatus');
+  el.textContent = (spin ? '⟳ ' : '') + msg;
+  el.style.color = spin ? 'var(--blue)' : 'var(--dim)';
+}
+
+function resetMapView() {
+  const c   = document.getElementById('mapContainer');
+  const svg = d3.select('#networkSvg');
+  svg.transition().duration(500)
+    .call(_mapZoom.transform, d3.zoomIdentity.translate(c.clientWidth/2, c.clientHeight/2).scale(1));
 }
 </script>
 </body>
