@@ -27,7 +27,7 @@ network_maps: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
 
 SCAN_PROFILES = {
-    "Descubrimiento (hosts vivos)":      "nmap -sn -T4 {target}",
+    "Descubrimiento (hosts vivos)":      "nmap -sT -T4 --open -p 22,80,443,445,3306,3389,8080,8443,21,25,110,8000 {target}",
     "Puertos top-1000":                   "nmap -sT -Pn -T4 --open {target}",
     "Puertos completos (1-65535)":        "nmap -sT -Pn -T4 -p- --open {target}",
     "Info HTTP/SSH/FTP":                  "nmap -sT -Pn -T4 --script http-title,http-headers,ssh-hostkey,ftp-anon {target}",
@@ -80,6 +80,50 @@ def now_display():
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mABCDEFGHJKLMSTfhin]|\x1b\(B|\x1b=|\x1b>')
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub('', text)
+
+# ── PDF: Host table parser ─────────────────────────────────────────────────────
+
+def _parse_hosts_from_lines(lines: list) -> list:
+    """
+    Extract structured host data from nmap scan output lines.
+    Returns list of dicts: {hostname, ip, mac, vendor, ports}.
+    """
+    hosts, cur = [], None
+    for raw in lines:
+        line = raw.strip() if isinstance(raw, str) else ""
+        # New host block
+        m = re.match(r'Nmap scan report for (.+)', line)
+        if m:
+            if cur:
+                hosts.append(cur)
+            s = m.group(1).strip()
+            ip_m = re.search(r'\((\d+\.\d+\.\d+\.\d+)\)', s)
+            if ip_m:
+                ip = ip_m.group(1)
+                hn = s[:s.rfind('(')].strip()
+            else:
+                ip = s; hn = ""
+            # Strip AWS reverse-DNS noise
+            if "compute.internal" in hn or "ec2.internal" in hn:
+                hn = ""
+            cur = {"hostname": hn, "ip": ip, "mac": "—", "vendor": "—", "ports": []}
+            continue
+        if cur is None:
+            continue
+        # MAC address line
+        mac_m = re.match(r'MAC Address: ([0-9A-Fa-f:]{17})\s*(?:\(([^)]*)\))?', line)
+        if mac_m:
+            cur["mac"]    = mac_m.group(1)
+            cur["vendor"] = mac_m.group(2) or "—"
+            continue
+        # Open port line
+        pm = re.match(r'(\d+)/tcp\s+open\s+(\S+)', line)
+        if pm:
+            cur["ports"].append(f"{pm.group(1)}/{pm.group(2)}")
+    if cur:
+        hosts.append(cur)
+    return hosts
+
 
 # ── PDF Generation ─────────────────────────────────────────────────────────────
 
@@ -293,6 +337,66 @@ def generate_pdf_report(scan: dict) -> bytes:
     story.append(Paragraph("Comando ejecutado:", st["h2"]))
     story.append(Paragraph(command, st["code"]))
 
+    # ── HOST TABLE ────────────────────────────────────────────────────────────
+    discovered = _parse_hosts_from_lines(lines)
+    if discovered:
+        story.append(Spacer(1, 0.3*cm))
+        story.append(Paragraph("Hosts Activos Descubiertos", st["h1"]))
+        story.append(hr())
+        story.append(Paragraph(
+            f"Se identificaron <b>{len(discovered)}</b> host(s) con servicios activos:",
+            st["body"]))
+        story.append(Spacer(1, 0.15*cm))
+
+        host_rows = [[
+            Paragraph("<b>Hostname</b>",    S("hh", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
+            Paragraph("<b>IP</b>",          S("hi", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
+            Paragraph("<b>MAC</b>",         S("hm", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
+            Paragraph("<b>Vendor</b>",      S("hv", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
+            Paragraph("<b>Puertos abiertos</b>", S("hp", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
+        ]]
+        for h in discovered:
+            ports_str = ", ".join(h["ports"]) if h["ports"] else "—"
+            host_rows.append([
+                Paragraph(h["hostname"] or "—",
+                          S("hbody", fontSize=7.5, textColor=C_FG,    fontName="Helvetica")),
+                Paragraph(h["ip"],
+                          S("hip",   fontSize=7.5, textColor=C_BLUE,  fontName="Courier")),
+                Paragraph(h["mac"],
+                          S("hmac",  fontSize=7.5, textColor=colors.HexColor("#e3b341"), fontName="Courier")),
+                Paragraph(h["vendor"],
+                          S("hven",  fontSize=7.5, textColor=C_FG,    fontName="Helvetica")),
+                Paragraph(ports_str,
+                          S("hprt",  fontSize=7.5, textColor=C_GREEN,  fontName="Courier")),
+            ])
+
+        col_w = [3.8*cm, 3.2*cm, 4.0*cm, 3.2*cm, 1.0*cm]  # last col expands
+        # Give remaining space to ports column
+        total = sum(col_w)
+        avail = W - 3.6*cm  # page margins
+        col_w[-1] = avail - sum(col_w[:-1])
+
+        ht = Table(host_rows, colWidths=col_w, repeatRows=1)
+        ht.setStyle(TableStyle([
+            # Header row
+            ("BACKGROUND",    (0,0), (-1,0),  C_GRAY),
+            ("TEXTCOLOR",     (0,0), (-1,0),  C_DIM),
+            ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0,0), (-1,0),  8),
+            ("TOPPADDING",    (0,0), (-1,0),  6),
+            ("BOTTOMPADDING", (0,0), (-1,0),  6),
+            # Data rows
+            ("FONTSIZE",      (0,1), (-1,-1), 7.5),
+            ("ROWBACKGROUNDS",(0,1), (-1,-1), [C_ROW1, C_ROW2]),
+            ("TOPPADDING",    (0,1), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,1), (-1,-1), 5),
+            ("LEFTPADDING",   (0,0), (-1,-1), 7),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 7),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("GRID",          (0,0), (-1,-1), 0.3, C_GRAY),
+        ]))
+        story.append(ht)
+
     # ── RESULTS ───────────────────────────────────────────────────────────────
     story.append(Spacer(1, 0.2*cm))
     story.append(Paragraph("Resultados del Escaneo", st["h1"]))
@@ -499,21 +603,30 @@ def _run_network_map(map_id: str, target: str):
             f"nmap -sn -T4 {target}",
             shell=True, capture_output=True, text=True, timeout=120
         )
-        hosts = _parse_discovery(disc.stdout)
-        state["status"] = f"Escaneando puertos en {len(hosts)} host(s)..."
+        all_hosts = _parse_discovery(disc.stdout)
+        total_discovered = len(all_hosts)
+        state["status"] = f"Escaneando puertos en {total_discovered} host(s)..."
 
-        by_ip = {h["ip"]: h for h in hosts}
-        if hosts:
-            ips_str = " ".join(h["ip"] for h in hosts)
+        by_ip = {h["ip"]: h for h in all_hosts}
+        if all_hosts:
+            ips_str = " ".join(h["ip"] for h in all_hosts)
             port_out = subprocess.run(
                 f"nmap -sT -Pn -T4 --open -p 21,22,25,80,110,443,445,3306,3389,5432,8080,8443 {ips_str}",
                 shell=True, capture_output=True, text=True, timeout=180
             )
             _parse_ports(port_out.stdout, by_ip)
 
-        for h in hosts:
+        # Classify all hosts first so gateway detection works correctly
+        for h in all_hosts:
             h["type"] = _classify_node(h)
 
+        # Keep only hosts that are gateways OR have at least one open port confirmed.
+        # Hosts that only responded to ping but expose no services are excluded —
+        # they add visual noise without actionable information.
+        hosts = [h for h in all_hosts if h["type"] == "gateway" or len(h["ports"]) > 0]
+        filtered_out = total_discovered - len(hosts)
+
+        # If no gateway found among filtered hosts, promote the first host
         gateways = [h["ip"] for h in hosts if h["type"] == "gateway"]
         if not gateways and hosts:
             hosts[0]["type"] = "gateway"
@@ -527,9 +640,11 @@ def _run_network_map(map_id: str, target: str):
         for i in range(len(gateways) - 1):
             edges.append({"source": gateways[i], "target": gateways[i + 1]})
 
+        note = f" ({filtered_out} sin servicios excluidos)" if filtered_out else ""
         state["nodes"]  = hosts
         state["edges"]  = edges
         state["status"] = "done"
+        state["summary"] = f"{total_discovered} descubiertos · {len(hosts)} con servicios activos{note}"
     except Exception as e:
         state["status"] = f"error: {e}"
     finally:
@@ -564,7 +679,7 @@ def api_network_stream(map_id):
                 last = m["status"]
                 yield f"data: {json.dumps({'type': 'status', 'msg': m['status']})}\n\n"
             if m["done"]:
-                yield f"data: {json.dumps({'type': 'result', 'nodes': m['nodes'], 'edges': m['edges']})}\n\n"
+                yield f"data: {json.dumps({'type': 'result', 'nodes': m['nodes'], 'edges': m['edges'], 'summary': m.get('summary','')})}\n\n"
                 break
             time.sleep(0.5)
     return Response(stream_with_context(generate()),
@@ -2084,8 +2199,7 @@ async function startNetworkMap() {
       setMapStatus(d.msg, true);
     } else if (d.type === 'result') {
       sse.close(); btn.disabled = false;
-      const n = d.nodes.length;
-      setMapStatus(n + ' host' + (n!==1?'s':'') + ' encontrado' + (n!==1?'s':''), false);
+      setMapStatus(d.summary || (d.nodes.length + ' hosts activos'), false);
       renderNetworkGraph(d.nodes, d.edges);
     } else if (d.error) {
       sse.close(); btn.disabled = false;
