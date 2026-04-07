@@ -1420,10 +1420,15 @@ def _vpn_connect_bg(name, c):
             cmd = ["sudo","openvpn","--config",vpn_path,"--daemon",
                    "--log","/tmp/openvpn_scanner.log"]
         iface = "tun0"
+        subprocess.run(cmd, capture_output=True)
+    elif vpn_type == "Nebula":
+        iface = "nebula"
+        subprocess.Popen(["sudo", "/opt/nebula/nebula", "-config", vpn_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         cmd = ["sudo","wg-quick","up",vpn_path]
         iface = "wg0"
-    subprocess.run(cmd, capture_output=True)
+        subprocess.run(cmd, capture_output=True)
     for _ in range(20):
         time.sleep(2)
         r = subprocess.run(["ip","a","show",iface], capture_output=True, text=True)
@@ -1436,13 +1441,15 @@ def _vpn_connect_bg(name, c):
 def api_vpn_disconnect():
     if vpn_state["iface"] == "tun0":
         subprocess.run(["sudo","pkill","openvpn"], capture_output=True)
+    elif vpn_state["iface"] == "nebula":
+        subprocess.run(["sudo","pkill","-f","/opt/nebula/nebula"], capture_output=True)
     else:
         c = load_clients().get(vpn_state["client"], {})
         subprocess.run(["sudo","wg-quick","down", c.get("vpn_path","")], capture_output=True)
     vpn_state.update({"active": False, "client": "", "iface": ""})
     return jsonify({"ok": True})
 
-VPN_IFACES = ["tailscale0", "tun0", "tun1", "wg0", "wg1", "ppp0", "nordlynx"]
+VPN_IFACES = ["nebula", "tailscale0", "tun0", "tun1", "wg0", "wg1", "ppp0", "nordlynx"]
 
 def _detect_vpn_ifaces():
     """Devuelve lista de interfaces VPN activas con sus IPs."""
@@ -1459,7 +1466,7 @@ def api_vpn_autodetect():
     """Detecta VPNs activas en el servidor y actualiza el estado global."""
     detected = _detect_vpn_ifaces()
     if detected:
-        best = detected[0]   # Tailscale primero por orden en VPN_IFACES
+        best = detected[0]   # Nebula primero por orden en VPN_IFACES
         vpn_state["active"] = True
         vpn_state["iface"]  = best["iface"]
         if not vpn_state["client"]:
@@ -1979,7 +1986,7 @@ select option{background:var(--bg3)}
 <header>
   <div>
     <h1>&#x26A1; Kali VPN Vulnerability Scanner</h1>
-    <span>nmap &bull; vulners &bull; nikto &bull; OpenVPN &bull; WireGuard</span>
+    <span>nmap &bull; vulners &bull; nikto &bull; Nebula &bull; OpenVPN &bull; WireGuard</span>
   </div>
   <div style="margin-left:auto;display:flex;gap:10px;align-items:center">
     <div id="vpnBadge" class="badge-vpn off" onclick="openVpnModal()">&#x25CF; VPN Inactiva</div>
@@ -2024,6 +2031,7 @@ select option{background:var(--bg3)}
             <option>Tailscale</option>
             <option>OpenVPN</option>
             <option>WireGuard</option>
+            <option>Nebula</option>
           </select>
         </div>
         <div class="form-group">
