@@ -1,0 +1,36 @@
+# Claves y credenciales
+*.pem
+*.key
+*.env
+.env
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Instaladores / paquetes grandes
+*.pkg
+*.deb
+*.rpm
+
+# Claude Code internals
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PDFs generados (mantener solo los de referencia)
+# Descomenta si NO quieres los PDFs en el repo:
+# *.pdf

@@ -38,6 +38,28 @@ SCAN_PROFILES = {
     "SMB vulnerabilidades":               "nmap -sT -Pn -p445 --script 'smb-vuln*' -T4 {target}",
     "SSL/TLS — red/subred (nmap)":        "nmap -sT -Pn --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
     "SSL/TLS — host único (sslscan)":     "sslscan --no-colour {target}",
+    # ── Fase 2: Enumeración de servicios ──────────────────────────────────────
+    "Enum SMB completo (enum4linux)":     "enum4linux -a {target}",
+    "SMB shares anónimo (smbclient)":     "smbclient -L //{target} -N",
+    "Banner grabbing (puertos clave)":    "nmap -sT -Pn -T4 --script=banner -p 21,22,23,25,80,110,143,443,3389,8080 {target}",
+    "SNMP walk — community public":       "snmpwalk -v2c -c public -t 10 {target}",
+    "SNMP walk — community private":      "snmpwalk -v2c -c private -t 10 {target}",
+    # ── Fase 3: Análisis de aplicaciones web ──────────────────────────────────
+    "Web — Gobuster dirs (HTTP)":         "gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -q --no-progress",
+    "Web — Gobuster dirs (HTTPS)":        "gobuster dir -u https://{target} -w /usr/share/wordlists/dirb/common.txt -q --no-progress",
+    "Web — Gobuster dirs (big.txt HTTP)": "gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/big.txt -q --no-progress",
+    "Web — SQLMap GET básico":            "sqlmap -u \"http://{target}\" --level=3 --risk=2 --batch --timeout=10",
+    "Web — SQLMap POST login":            "sqlmap -u \"http://{target}\" --data=\"user=admin&pass=test\" --level=3 --risk=2 --batch --timeout=10",
+    # ── Fase 4: Auditoría de credenciales ─────────────────────────────────────
+    "Creds — Hydra SSH (admin)":          "hydra -l admin -P /usr/share/wordlists/rockyou.txt ssh://{target} -t 4 -V",
+    "Creds — Hydra SSH (root)":           "hydra -l root  -P /usr/share/wordlists/rockyou.txt ssh://{target} -t 4 -V",
+    "Creds — Hydra RDP (administrator)":  "hydra -l administrator -P /usr/share/wordlists/rockyou.txt rdp://{target} -t 4 -V",
+    "Creds — Hydra HTTP-form POST":       "hydra -l admin -P /usr/share/wordlists/rockyou.txt {target} http-post-form \"/login:user=^USER^&pass=^PASS^:F=incorrect\" -t 4 -V",
+    "Creds — Hydra FTP (admin)":          "hydra -l admin -P /usr/share/wordlists/rockyou.txt ftp://{target} -t 4 -V",
+    "Creds — John (objetivo=ruta/hashes)":        "john --wordlist=/usr/share/wordlists/rockyou.txt {target}",
+    "Creds — John NTLM (objetivo=ruta/hashes)":   "john --wordlist=/usr/share/wordlists/rockyou.txt --format=NT {target}",
+    "Creds — Hashcat NTLM (objetivo=ruta/hashes)":"hashcat -m 1000 {target} /usr/share/wordlists/rockyou.txt --force --potfile-disable",
+    "Creds — Hashcat MD5 (objetivo=ruta/hashes)": "hashcat -m 0    {target} /usr/share/wordlists/rockyou.txt --force --potfile-disable",
 }
 
 SEV_COLORS = {
@@ -122,7 +144,8 @@ def _parse_hosts_from_lines(lines: list) -> list:
             cur["ports"].append(f"{pm.group(1)}/{pm.group(2)}")
     if cur:
         hosts.append(cur)
-    return hosts
+    # Only return hosts with at least one confirmed open port
+    return [h for h in hosts if h["ports"]]
 
 
 # ── PDF Generation ─────────────────────────────────────────────────────────────
@@ -139,22 +162,24 @@ def generate_pdf_report(scan: dict) -> bytes:
     )
 
     W, H = A4
-    C_BG    = colors.HexColor("#0d1117")
-    C_BLUE  = colors.HexColor("#58a6ff")
-    C_GREEN = colors.HexColor("#3fb950")
-    C_GRAY  = colors.HexColor("#30363d")
-    C_DIM   = colors.HexColor("#8b949e")
-    C_FG    = colors.HexColor("#c9d1d9")
-    C_ROW1  = colors.HexColor("#161b22")
-    C_ROW2  = colors.HexColor("#0d1117")
-    C_CRIT  = colors.HexColor("#ff4444")
-    C_HIGH  = colors.HexColor("#ff8800")
-    C_MED   = colors.HexColor("#ffcc00")
-    C_LOW   = colors.HexColor("#44aaff")
-    WHITE   = colors.white
 
-    SEV_C = {"CRITICAL": C_CRIT, "HIGH": C_HIGH,
-              "MEDIUM": C_MED, "LOW": C_LOW, "INFO": C_FG}
+    # ── Light professional palette ──────────────────────────────────────────
+    C_NAVY   = colors.HexColor("#1a2e4a")   # header/cover bg, section titles
+    C_BLUE   = colors.HexColor("#1565c0")   # accent: links, port text
+    C_GREEN  = colors.HexColor("#2e7d32")   # sub-headings
+    C_BORDER = colors.HexColor("#c5cdd8")   # table grid lines
+    C_HDR    = colors.HexColor("#2c3e50")   # table header bg
+    C_LABEL  = colors.HexColor("#546e7a")   # label text (muted)
+    C_BODY   = colors.HexColor("#212121")   # main body text
+    C_ROW1   = colors.HexColor("#f0f4f8")   # alternating row (light blue-gray)
+    C_ROW2   = colors.white                 # alternating row (white)
+    C_CRIT   = colors.HexColor("#c62828")   # CRITICAL – dark red
+    C_HIGH   = colors.HexColor("#e65100")   # HIGH – dark orange
+    C_MED    = colors.HexColor("#f9a825")   # MEDIUM – amber
+    C_LOW    = colors.HexColor("#1565c0")   # LOW – blue
+    C_CODE   = colors.HexColor("#263238")   # code text
+    C_CODEBG = colors.HexColor("#eceff1")   # code block bg
+    WHITE    = colors.white
 
     engineer   = scan.get("engineer", "Sin especificar")
     client     = scan.get("client",   "N/A")
@@ -166,7 +191,6 @@ def generate_pdf_report(scan: dict) -> bytes:
     scan_id    = scan.get("id",       "N/A")
     lines      = scan.get("lines",    [])
 
-    # Count findings
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for line in lines:
         sev = detect_severity(line if isinstance(line, str) else "")
@@ -176,37 +200,35 @@ def generate_pdf_report(scan: dict) -> bytes:
 
     def on_page(canvas, doc):
         canvas.saveState()
-        # Header
-        canvas.setFillColor(C_BG)
-        canvas.rect(0, H - 1.5*cm, W, 1.5*cm, fill=1, stroke=0)
+        # ── Header bar ──
+        canvas.setFillColor(C_NAVY)
+        canvas.rect(0, H - 1.4*cm, W, 1.4*cm, fill=1, stroke=0)
         canvas.setFont("Helvetica-Bold", 8)
-        canvas.setFillColor(C_BLUE)
-        canvas.drawString(1.5*cm, H - 0.85*cm,
+        canvas.setFillColor(WHITE)
+        canvas.drawString(1.5*cm, H - 0.82*cm,
                           "INFORME DE ESCANEO DE VULNERABILIDADES — CONFIDENCIAL")
-        canvas.setFillColor(C_DIM)
         canvas.setFont("Helvetica", 7.5)
-        canvas.drawRightString(W - 1.5*cm, H - 0.85*cm, f"ID: {scan_id}")
-        # Top line
+        canvas.setFillColor(colors.HexColor("#90caf9"))
+        canvas.drawRightString(W - 1.5*cm, H - 0.82*cm, f"ID: {scan_id}")
+        # Accent line below header
         canvas.setStrokeColor(C_BLUE)
-        canvas.setLineWidth(1.5)
-        canvas.line(0, H - 1.5*cm, W, H - 1.5*cm)
-        # Footer
-        canvas.setFillColor(C_BG)
-        canvas.rect(0, 0, W, 1.1*cm, fill=1, stroke=0)
+        canvas.setLineWidth(2)
+        canvas.line(0, H - 1.4*cm, W, H - 1.4*cm)
+        # ── Footer ──
+        canvas.setStrokeColor(C_BORDER)
         canvas.setLineWidth(0.5)
-        canvas.setStrokeColor(C_GRAY)
-        canvas.line(0, 1.1*cm, W, 1.1*cm)
-        canvas.setFillColor(C_DIM)
+        canvas.line(1.5*cm, 1.1*cm, W - 1.5*cm, 1.1*cm)
         canvas.setFont("Helvetica", 7)
-        canvas.drawString(1.5*cm, 0.45*cm,
+        canvas.setFillColor(C_LABEL)
+        canvas.drawString(1.5*cm, 0.55*cm,
                           f"Datacom Security  •  Generado: {now_display()}  •  Confidencial")
-        canvas.drawRightString(W - 1.5*cm, 0.45*cm, f"Página {doc.page}")
+        canvas.drawRightString(W - 1.5*cm, 0.55*cm, f"Página {doc.page}")
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=1.8*cm, rightMargin=1.8*cm,
-        topMargin=2.2*cm, bottomMargin=1.8*cm,
+        topMargin=2.0*cm, bottomMargin=1.8*cm,
     )
 
     base = getSampleStyleSheet()
@@ -214,67 +236,65 @@ def generate_pdf_report(scan: dict) -> bytes:
         return ParagraphStyle(name, parent=base[parent], **kw)
 
     st = {
-        "title":  S("t", fontSize=20, leading=26, textColor=WHITE,
-                    fontName="Helvetica-Bold", alignment=TA_CENTER),
-        "sub":    S("s", fontSize=10, leading=14, textColor=C_BLUE,
-                    fontName="Helvetica-Bold", alignment=TA_CENTER),
-        "h1":     S("h1", fontSize=13, leading=18, textColor=C_BLUE,
-                    fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=4),
-        "h2":     S("h2", fontSize=10, leading=14, textColor=C_GREEN,
-                    fontName="Helvetica-Bold", spaceBefore=8, spaceAfter=3),
-        "body":   S("b", fontSize=8.5, leading=13, textColor=C_FG,
-                    fontName="Helvetica", alignment=TA_JUSTIFY,
-                    spaceBefore=2, spaceAfter=3),
-        "code":   S("c", fontSize=7.5, leading=11, textColor=colors.HexColor("#e3b341"),
-                    fontName="Courier", backColor=C_ROW1,
-                    leftIndent=8, rightIndent=8, spaceBefore=3, spaceAfter=3),
-        "sign":   S("sg", fontSize=9, leading=14, textColor=C_FG,
-                    fontName="Helvetica", alignment=TA_CENTER),
-        "sign_name": S("sn", fontSize=13, leading=18, textColor=WHITE,
+        "title": S("t",  fontSize=22, leading=28, textColor=WHITE,
+                   fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "sub":   S("s",  fontSize=10, leading=14, textColor=colors.HexColor("#90caf9"),
+                   fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "h1":    S("h1", fontSize=13, leading=18, textColor=C_NAVY,
+                   fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=4),
+        "h2":    S("h2", fontSize=10, leading=14, textColor=C_GREEN,
+                   fontName="Helvetica-Bold", spaceBefore=8, spaceAfter=3),
+        "body":  S("b",  fontSize=9, leading=13, textColor=C_BODY,
+                   fontName="Helvetica", alignment=TA_JUSTIFY,
+                   spaceBefore=2, spaceAfter=3),
+        "code":  S("c",  fontSize=7.5, leading=11, textColor=C_CODE,
+                   fontName="Courier", backColor=C_CODEBG,
+                   leftIndent=8, rightIndent=8, spaceBefore=2, spaceAfter=2),
+        "sign_name": S("sn", fontSize=13, leading=18, textColor=C_NAVY,
                        fontName="Helvetica-Bold", alignment=TA_CENTER),
-        "label":  S("l", fontSize=8, leading=12, textColor=C_DIM,
-                    fontName="Helvetica-Bold"),
+        "label": S("l",  fontSize=8, leading=12, textColor=C_LABEL,
+                   fontName="Helvetica-Bold"),
     }
 
-    def hr(c=C_BLUE, t=0.5):
+    def hr(c=C_NAVY, t=0.6):
         return HRFlowable(width="100%", thickness=t, color=c,
-                          spaceAfter=5, spaceBefore=5)
+                          spaceAfter=6, spaceBefore=4)
 
     def meta_table(rows):
-        t = Table(rows, colWidths=[4.5*cm, 10.7*cm])
+        t = Table(rows, colWidths=[4.8*cm, 10.4*cm])
         t.setStyle(TableStyle([
-            ("FONTNAME",  (0,0), (0,-1), "Helvetica-Bold"),
-            ("FONTNAME",  (1,0), (1,-1), "Helvetica"),
-            ("FONTSIZE",  (0,0), (-1,-1), 8.5),
-            ("TEXTCOLOR", (0,0), (0,-1), C_DIM),
-            ("TEXTCOLOR", (1,0), (1,-1), WHITE),
-            ("VALIGN",    (0,0), (-1,-1), "MIDDLE"),
-            ("TOPPADDING",(0,0), (-1,-1), 5),
-            ("BOTTOMPADDING",(0,0),(-1,-1), 5),
-            ("LEFTPADDING",(0,0),(-1,-1), 6),
-            ("ROWBACKGROUNDS",(0,0),(-1,-1), [C_ROW1, C_ROW2]),
-            ("GRID", (0,0), (-1,-1), 0.3, C_GRAY),
+            ("FONTNAME",        (0,0), (0,-1),  "Helvetica-Bold"),
+            ("FONTNAME",        (1,0), (1,-1),  "Helvetica"),
+            ("FONTSIZE",        (0,0), (-1,-1), 8.5),
+            ("TEXTCOLOR",       (0,0), (0,-1),  C_LABEL),
+            ("TEXTCOLOR",       (1,0), (1,-1),  C_BODY),
+            ("VALIGN",          (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING",      (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING",   (0,0), (-1,-1), 5),
+            ("LEFTPADDING",     (0,0), (-1,-1), 8),
+            ("ROWBACKGROUNDS",  (0,0), (-1,-1), [C_ROW1, C_ROW2]),
+            ("GRID",            (0,0), (-1,-1), 0.4, C_BORDER),
+            ("BOX",             (0,0), (-1,-1), 0.8, C_NAVY),
         ]))
         return t
 
     story = []
 
     # ── COVER BLOCK ──────────────────────────────────────────────────────────
-    cover_bg = Table(
-        [[Paragraph("INFORME DE ESCANEO DE VULNERABILIDADES", st["title"]),],
+    cover = Table(
+        [[Paragraph("INFORME DE ESCANEO DE VULNERABILIDADES", st["title"])],
          [Paragraph("Datacom Security — Ethical Hacking", st["sub"])]],
         colWidths=[W - 3.6*cm]
     )
-    cover_bg.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), C_BG),
-        ("TOPPADDING",  (0,0), (-1,-1), 16),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 16),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING",(0,0), (-1,-1), 16),
-        ("LINEABOVE",  (0,0), (-1,0), 2, C_BLUE),
-        ("LINEBELOW",  (0,-1),(-1,-1), 2, C_BLUE),
+    cover.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C_NAVY),
+        ("TOPPADDING",    (0,0), (-1,-1), 18),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 18),
+        ("LEFTPADDING",   (0,0), (-1,-1), 20),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 20),
+        ("LINEBELOW",     (0,-1),(-1,-1), 3, C_BLUE),
     ]))
-    story.append(cover_bg)
+    story.append(cover)
     story.append(Spacer(1, 0.5*cm))
 
     # ── META TABLE ────────────────────────────────────────────────────────────
@@ -292,156 +312,144 @@ def generate_pdf_report(scan: dict) -> bytes:
     ]))
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
-    story.append(Spacer(1, 0.3*cm))
+    story.append(Spacer(1, 0.4*cm))
     story.append(Paragraph("Resumen de Hallazgos", st["h1"]))
     story.append(hr())
 
-    sev_rows = [["Severidad", "Cantidad", "Descripción"]]
     sev_info = [
         ("CRITICAL", C_CRIT, "Vulnerabilidades críticas explotables remotamente"),
         ("HIGH",     C_HIGH, "Vulnerabilidades con CVE conocido o alto impacto"),
         ("MEDIUM",   C_MED,  "Configuraciones débiles o riesgo moderado"),
         ("LOW",      C_LOW,  "Información de baja criticidad"),
-        ("INFO",     C_FG,   "Líneas informativas sin implicación de riesgo"),
+        ("INFO",     C_LABEL,"Líneas informativas sin implicación de riesgo"),
     ]
-    sev_rows += [[s, str(counts[s]), d] for s, c, d in sev_info]
+    sev_rows = [[
+        Paragraph("<b>Severidad</b>",  S("sh", fontSize=8.5, textColor=WHITE, fontName="Helvetica-Bold")),
+        Paragraph("<b>Cantidad</b>",   S("sh2",fontSize=8.5, textColor=WHITE, fontName="Helvetica-Bold", alignment=TA_CENTER)),
+        Paragraph("<b>Descripción</b>",S("sh3",fontSize=8.5, textColor=WHITE, fontName="Helvetica-Bold")),
+    ]]
+    for sev, col, desc in sev_info:
+        cnt = counts[sev]
+        sev_rows.append([
+            Paragraph(f"<b>{sev}</b>", S(f"sv{sev}", fontSize=8.5, textColor=col, fontName="Helvetica-Bold")),
+            Paragraph(str(cnt),        S(f"sc{sev}", fontSize=9,   textColor=col if cnt>0 else C_BODY,
+                                          fontName="Helvetica-Bold" if cnt>0 else "Helvetica", alignment=TA_CENTER)),
+            Paragraph(desc,            S(f"sd{sev}", fontSize=8.5, textColor=C_BODY, fontName="Helvetica")),
+        ])
 
-    sev_style = [
-        ("BACKGROUND", (0,0), (-1,0), C_GRAY),
-        ("TEXTCOLOR",  (0,0), (-1,0), WHITE),
-        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",   (0,0), (-1,-1), 8.5),
-        ("ALIGN",      (1,0), (1,-1), "CENTER"),
-        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING", (0,0), (-1,-1), 6),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 6),
-        ("LEFTPADDING",(0,0), (-1,-1), 8),
-        ("GRID",       (0,0), (-1,-1), 0.3, C_GRAY),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW1, C_ROW2]),
-    ]
-    for i, (sev, col, _) in enumerate(sev_info, 1):
-        sev_style += [
-            ("TEXTCOLOR", (0,i), (0,i), col),
-            ("FONTNAME",  (0,i), (0,i), "Helvetica-Bold"),
-        ]
-        if counts[sev] > 0 and sev in ("CRITICAL","HIGH"):
-            sev_style.append(("TEXTCOLOR", (1,i), (1,i), col))
-            sev_style.append(("FONTNAME",  (1,i), (1,i), "Helvetica-Bold"))
-
-    t = Table(sev_rows, colWidths=[2.8*cm, 2.2*cm, 10.2*cm])
-    t.setStyle(TableStyle(sev_style))
-    story.append(t)
+    sev_t = Table(sev_rows, colWidths=[2.8*cm, 2.2*cm, 10.2*cm])
+    sev_t.setStyle(TableStyle([
+        ("BACKGROUND",   (0,0), (-1,0),  C_HDR),
+        ("FONTSIZE",     (0,0), (-1,-1), 8.5),
+        ("ALIGN",        (1,0), (1,-1),  "CENTER"),
+        ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",   (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 6),
+        ("LEFTPADDING",  (0,0), (-1,-1), 8),
+        ("GRID",         (0,0), (-1,-1), 0.4, C_BORDER),
+        ("BOX",          (0,0), (-1,-1), 0.8, C_NAVY),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW2, C_ROW1]),
+    ]))
+    story.append(sev_t)
 
     # ── COMMAND ───────────────────────────────────────────────────────────────
-    story.append(Spacer(1, 0.3*cm))
+    story.append(Spacer(1, 0.4*cm))
     story.append(Paragraph("Comando ejecutado:", st["h2"]))
-    story.append(Paragraph(command, st["code"]))
+    story.append(Paragraph(
+        command.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"),
+        st["code"]))
 
     # ── HOST TABLE ────────────────────────────────────────────────────────────
+    avail = W - 3.6*cm
     discovered = _parse_hosts_from_lines(lines)
     if discovered:
-        story.append(Spacer(1, 0.3*cm))
+        story.append(Spacer(1, 0.4*cm))
         story.append(Paragraph("Hosts Activos Descubiertos", st["h1"]))
         story.append(hr())
         story.append(Paragraph(
-            f"Se identificaron <b>{len(discovered)}</b> host(s) con servicios activos:",
+            f"Se identificaron <b>{len(discovered)}</b> host(s) con servicios confirmados:",
             st["body"]))
         story.append(Spacer(1, 0.15*cm))
+        col_w = [3.2*cm, 3.0*cm, 4.2*cm, 2.8*cm, avail - 13.2*cm]
 
         host_rows = [[
-            Paragraph("<b>Hostname</b>",    S("hh", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
-            Paragraph("<b>IP</b>",          S("hi", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
-            Paragraph("<b>MAC</b>",         S("hm", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
-            Paragraph("<b>Vendor</b>",      S("hv", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
-            Paragraph("<b>Puertos abiertos</b>", S("hp", fontSize=8, textColor=C_DIM, fontName="Helvetica-Bold")),
+            Paragraph("<b>Hostname</b>",        S("hh0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>IP</b>",              S("hi0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>MAC</b>",             S("hm0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>Vendor</b>",          S("hv0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>Puertos abiertos</b>",S("hp0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
         ]]
-        for h in discovered:
+        for i, h in enumerate(discovered):
+            bg = C_ROW1 if i % 2 == 0 else C_ROW2
             ports_str = ", ".join(h["ports"]) if h["ports"] else "—"
             host_rows.append([
-                Paragraph(h["hostname"] or "—",
-                          S("hbody", fontSize=7.5, textColor=C_FG,    fontName="Helvetica")),
-                Paragraph(h["ip"],
-                          S("hip",   fontSize=7.5, textColor=C_BLUE,  fontName="Courier")),
-                Paragraph(h["mac"],
-                          S("hmac",  fontSize=7.5, textColor=colors.HexColor("#e3b341"), fontName="Courier")),
-                Paragraph(h["vendor"],
-                          S("hven",  fontSize=7.5, textColor=C_FG,    fontName="Helvetica")),
-                Paragraph(ports_str,
-                          S("hprt",  fontSize=7.5, textColor=C_GREEN,  fontName="Courier")),
+                Paragraph(h["hostname"] or "—",   S(f"hb{i}",fontSize=8,textColor=C_BODY, fontName="Helvetica")),
+                Paragraph(h["ip"],                S(f"hI{i}",fontSize=8,textColor=C_BLUE, fontName="Courier")),
+                Paragraph(h["mac"],               S(f"hM{i}",fontSize=8,textColor=C_CODE, fontName="Courier")),
+                Paragraph(h["vendor"],            S(f"hV{i}",fontSize=8,textColor=C_BODY, fontName="Helvetica")),
+                Paragraph(ports_str,              S(f"hP{i}",fontSize=8,textColor=C_GREEN,fontName="Courier")),
             ])
-
-        col_w = [3.8*cm, 3.2*cm, 4.0*cm, 3.2*cm, 1.0*cm]  # last col expands
-        # Give remaining space to ports column
-        total = sum(col_w)
-        avail = W - 3.6*cm  # page margins
-        col_w[-1] = avail - sum(col_w[:-1])
 
         ht = Table(host_rows, colWidths=col_w, repeatRows=1)
         ht.setStyle(TableStyle([
-            # Header row
-            ("BACKGROUND",    (0,0), (-1,0),  C_GRAY),
-            ("TEXTCOLOR",     (0,0), (-1,0),  C_DIM),
-            ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
-            ("FONTSIZE",      (0,0), (-1,0),  8),
-            ("TOPPADDING",    (0,0), (-1,0),  6),
-            ("BOTTOMPADDING", (0,0), (-1,0),  6),
-            # Data rows
-            ("FONTSIZE",      (0,1), (-1,-1), 7.5),
+            ("BACKGROUND",    (0,0), (-1,0),  C_HDR),
             ("ROWBACKGROUNDS",(0,1), (-1,-1), [C_ROW1, C_ROW2]),
-            ("TOPPADDING",    (0,1), (-1,-1), 5),
-            ("BOTTOMPADDING", (0,1), (-1,-1), 5),
+            ("TOPPADDING",    (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
             ("LEFTPADDING",   (0,0), (-1,-1), 7),
             ("RIGHTPADDING",  (0,0), (-1,-1), 7),
             ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-            ("GRID",          (0,0), (-1,-1), 0.3, C_GRAY),
+            ("GRID",          (0,0), (-1,-1), 0.4, C_BORDER),
+            ("BOX",           (0,0), (-1,-1), 0.8, C_NAVY),
         ]))
         story.append(ht)
 
-    # ── RESULTS ───────────────────────────────────────────────────────────────
-    story.append(Spacer(1, 0.2*cm))
-    story.append(Paragraph("Resultados del Escaneo", st["h1"]))
-    story.append(hr())
-
-    # Filter critical/high/medium findings separately
+    # ── FINDINGS TABLE ────────────────────────────────────────────────────────
     findings = [(l, detect_severity(l)) for l in lines
                 if detect_severity(l) in ("CRITICAL","HIGH","MEDIUM")]
-
     if findings:
+        story.append(Spacer(1, 0.4*cm))
+        story.append(Paragraph("Hallazgos Relevantes", st["h1"]))
+        story.append(hr())
         story.append(Paragraph(
-            f"Se detectaron <b>{len(findings)}</b> hallazgos relevantes (CRITICAL/HIGH/MEDIUM):",
+            f"Se detectaron <b>{len(findings)}</b> hallazgos (CRITICAL / HIGH / MEDIUM):",
             st["body"]))
         story.append(Spacer(1, 0.15*cm))
-        find_rows = [["SEV", "Hallazgo"]]
-        for line, sev in findings[:80]:  # max 80 findings
-            find_rows.append([sev, line.strip()])
-        ft = Table(find_rows, colWidths=[2*cm, 13.2*cm])
-        fs = [
-            ("BACKGROUND", (0,0), (-1,0), C_GRAY),
-            ("TEXTCOLOR",  (0,0), (-1,0), WHITE),
-            ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE",   (0,0), (-1,-1), 7.5),
-            ("FONTNAME",   (0,1), (-1,-1), "Courier"),
-            ("VALIGN",     (0,0), (-1,-1), "TOP"),
-            ("TOPPADDING", (0,0), (-1,-1), 4),
-            ("BOTTOMPADDING",(0,0),(-1,-1), 4),
-            ("LEFTPADDING",(0,0), (-1,-1), 6),
-            ("GRID",       (0,0), (-1,-1), 0.3, C_GRAY),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW1, C_ROW2]),
-            ("WORDWRAP",   (1,1), (1,-1),  True),
-        ]
+
         sev_col = {"CRITICAL": C_CRIT, "HIGH": C_HIGH, "MEDIUM": C_MED}
-        for i, (_, sev) in enumerate(findings[:80], 1):
-            col = sev_col.get(sev, C_FG)
-            fs += [("TEXTCOLOR", (0,i), (0,i), col),
-                   ("FONTNAME",  (0,i), (0,i), "Helvetica-Bold")]
-        ft.setStyle(TableStyle(fs))
+        find_rows = [[
+            Paragraph("<b>SEV</b>",      S("fh0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>Hallazgo</b>", S("fh1",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+        ]]
+        for i, (line, sev) in enumerate(findings[:80]):
+            col = sev_col.get(sev, C_BODY)
+            find_rows.append([
+                Paragraph(f"<b>{sev}</b>", S(f"fs{i}",fontSize=8,textColor=col,fontName="Helvetica-Bold")),
+                Paragraph(line.strip()[:200].replace("&","&amp;").replace("<","&lt;"),
+                          S(f"fl{i}",fontSize=7.5,textColor=C_BODY,fontName="Courier")),
+            ])
+
+        ft = Table(find_rows, colWidths=[2.2*cm, avail - 2.2*cm])
+        ft.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,0),  C_HDR),
+            ("ROWBACKGROUNDS",(0,1), (-1,-1), [C_ROW2, C_ROW1]),
+            ("TOPPADDING",    (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ("LEFTPADDING",   (0,0), (-1,-1), 7),
+            ("VALIGN",        (0,0), (-1,-1), "TOP"),
+            ("GRID",          (0,0), (-1,-1), 0.4, C_BORDER),
+            ("BOX",           (0,0), (-1,-1), 0.8, C_NAVY),
+            ("WORDWRAP",      (1,1), (1,-1),  True),
+        ]))
         story.append(ft)
         story.append(Spacer(1, 0.3*cm))
 
-    # Full output (truncated)
-    story.append(Paragraph("Salida completa del escaneo:", st["h2"]))
+    # ── FULL OUTPUT ───────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.2*cm))
+    story.append(Paragraph("Salida completa del escaneo", st["h1"]))
+    story.append(hr())
     MAX_LINES = 300
-    output_lines = [l for l in lines if isinstance(l, str)]
+    output_lines = [l for l in lines if isinstance(l, str) and l.strip()]
     truncated = len(output_lines) > MAX_LINES
     for line in output_lines[:MAX_LINES]:
         clean = line.rstrip()
@@ -451,85 +459,411 @@ def generate_pdf_report(scan: dict) -> bytes:
                 st["code"]))
     if truncated:
         story.append(Paragraph(
-            f"[... salida truncada — {len(output_lines) - MAX_LINES} líneas adicionales "
-            f"disponibles en el servidor en /opt/scanner/scans/ ...]",
-            S("trunc", fontSize=7.5, leading=11, textColor=C_DIM,
-              fontName="Helvetica-Oblique")))
+            f"[ ... salida truncada — {len(output_lines)-MAX_LINES} líneas adicionales en /opt/scanner/scans/ ]",
+            S("tr", fontSize=7.5, leading=10, textColor=C_LABEL, fontName="Helvetica-Oblique")))
 
     # ── SIGNATURE BLOCK ───────────────────────────────────────────────────────
     story.append(Spacer(1, 0.8*cm))
-    story.append(hr(C_BLUE, 1))
-    story.append(Spacer(1, 0.5*cm))
+    story.append(hr(C_NAVY, 1))
+    story.append(Spacer(1, 0.4*cm))
 
     sig_date = end_time or start_time
-
     sig_data = [
         [
-            Table([[Paragraph("Firma del Ingeniero Responsable", st["label"])]],
-                  style=TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER")])),
-            Table([[Paragraph("Fecha y Hora del Test", st["label"])]],
-                  style=TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER")])),
+            Paragraph("Firma del Ingeniero Responsable",
+                      S("slh", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold", alignment=TA_CENTER)),
+            Paragraph("Fecha y Hora del Test",
+                      S("sdh", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold", alignment=TA_CENTER)),
         ],
         [
-            # Signature line
             Table([
-                [Paragraph("_" * 35, S("ul", fontSize=11, textColor=C_DIM,
-                                       fontName="Helvetica", alignment=TA_CENTER))],
-                [Paragraph(engineer, st["sign_name"])],
+                [Paragraph("_" * 38, S("ul",fontSize=10,textColor=C_LABEL,fontName="Helvetica",alignment=TA_CENTER))],
+                [Paragraph(engineer,  st["sign_name"])],
                 [Paragraph("Ingeniero de Seguridad — Datacom Security",
-                           S("role", fontSize=8, textColor=C_DIM,
-                             fontName="Helvetica-Oblique", alignment=TA_CENTER))],
+                           S("ro",fontSize=8,textColor=C_LABEL,fontName="Helvetica-Oblique",alignment=TA_CENTER))],
             ], style=TableStyle([
-                ("ALIGN",   (0,0),(-1,-1),"CENTER"),
-                ("TOPPADDING",(0,0),(-1,-1), 4),
-                ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+                ("ALIGN",(0,0),(-1,-1),"CENTER"),
+                ("TOPPADDING",(0,0),(-1,-1),5),
+                ("BOTTOMPADDING",(0,0),(-1,-1),5),
             ])),
-            # Date block
             Table([
-                [Paragraph(sig_date, S("dt", fontSize=13, textColor=WHITE,
-                                       fontName="Helvetica-Bold", alignment=TA_CENTER))],
+                [Paragraph(sig_date,
+                           S("dt",fontSize=13,textColor=C_NAVY,fontName="Helvetica-Bold",alignment=TA_CENTER))],
                 [Paragraph("Inicio del escaneo",
-                           S("dt2", fontSize=8, textColor=C_DIM,
-                             fontName="Helvetica", alignment=TA_CENTER))],
+                           S("dt2",fontSize=8,textColor=C_LABEL,fontName="Helvetica",alignment=TA_CENTER))],
                 [Paragraph(f"Generado: {now_display()}",
-                           S("dt3", fontSize=8, textColor=C_GREEN,
-                             fontName="Helvetica", alignment=TA_CENTER))],
+                           S("dt3",fontSize=8,textColor=C_GREEN,fontName="Helvetica",alignment=TA_CENTER))],
             ], style=TableStyle([
-                ("ALIGN",   (0,0),(-1,-1),"CENTER"),
-                ("TOPPADDING",(0,0),(-1,-1), 4),
-                ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+                ("ALIGN",(0,0),(-1,-1),"CENTER"),
+                ("TOPPADDING",(0,0),(-1,-1),5),
+                ("BOTTOMPADDING",(0,0),(-1,-1),5),
             ])),
         ],
     ]
 
     sig_table = Table(sig_data, colWidths=[8*cm, 7.2*cm])
     sig_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), C_ROW1),
-        ("BOX",        (0,0), (-1,-1), 0.5, C_GRAY),
-        ("LINEAFTER",  (0,0), (0,-1),  0.5, C_GRAY),
-        ("ALIGN",      (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING", (0,0), (-1,0),  8),
-        ("BOTTOMPADDING",(0,0),(-1,0), 6),
-        ("TOPPADDING", (0,1), (-1,1),  14),
-        ("BOTTOMPADDING",(0,1),(-1,1), 18),
-        ("BACKGROUND", (0,0), (-1,0),  C_GRAY),
-        ("TEXTCOLOR",  (0,0), (-1,0),  C_DIM),
-        ("FONTNAME",   (0,0), (-1,0),  "Helvetica-Bold"),
-        ("FONTSIZE",   (0,0), (-1,0),  8),
+        ("BACKGROUND",    (0,0), (-1,0),  C_HDR),
+        ("BACKGROUND",    (0,1), (-1,-1), C_ROW1),
+        ("BOX",           (0,0), (-1,-1), 0.8, C_NAVY),
+        ("LINEAFTER",     (0,0), (0,-1),  0.5, C_BORDER),
+        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING",    (0,0), (-1,0),  8),
+        ("BOTTOMPADDING", (0,0), (-1,0),  8),
+        ("TOPPADDING",    (0,1), (-1,1),  16),
+        ("BOTTOMPADDING", (0,1), (-1,1),  20),
     ]))
     story.append(sig_table)
-    story.append(Spacer(1, 0.3*cm))
+    story.append(Spacer(1, 0.4*cm))
     story.append(Paragraph(
         "Este informe ha sido generado automáticamente por el sistema Kali VPN Vulnerability Scanner "
         "de Datacom Security. Su contenido es confidencial y de uso exclusivo del cliente indicado. "
         "Queda prohibida su reproducción o distribución sin autorización escrita.",
-        S("disc", fontSize=7, leading=10, textColor=C_DIM,
+        S("disc", fontSize=7, leading=10, textColor=C_LABEL,
           fontName="Helvetica-Oblique", alignment=TA_CENTER)))
 
     doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
     buf.seek(0)
     return buf.read()
+
+
+# ── Executive HTML Report ──────────────────────────────────────────────────────
+
+def generate_executive_html_report(scan: dict) -> str:
+    """Generate a management-facing executive HTML report, tailored per scan profile."""
+    import html as _html
+
+    engineer   = scan.get("engineer",   "Sin especificar") or "Sin especificar"
+    client     = scan.get("client",     "N/A") or "N/A"
+    target     = scan.get("target",     "N/A")
+    profile    = scan.get("profile",    "N/A")
+    start_time = scan.get("start",      now_str())
+    end_time   = scan.get("end",        now_str()) or now_str()
+    scan_id    = scan.get("id",         "N/A")
+    vpn_iface  = scan.get("vpn_client", "No") or "No"
+    lines      = scan.get("lines",      [])
+
+    # ── Parse hosts ────────────────────────────────────────────────────────────
+    hosts = _parse_hosts_from_lines(lines)
+
+    # ── Count severities (skip retransmission noise) ───────────────────────────
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    for line in lines:
+        if isinstance(line, str) and "retransmission" not in line.lower():
+            sev = detect_severity(line)
+            if sev in counts:
+                counts[sev] += 1
+
+    # ── Overall risk badge ─────────────────────────────────────────────────────
+    if counts["CRITICAL"] > 0:
+        risk_class, risk_label = "badge-risk-critico",  "RIESGO: CRÍTICO"
+    elif counts["HIGH"] > 0:
+        risk_class, risk_label = "badge-risk-alto",     "RIESGO: ALTO"
+    elif counts["MEDIUM"] > 5:
+        risk_class, risk_label = "badge-risk-moderado", "RIESGO: MODERADO"
+    else:
+        risk_class, risk_label = "badge-risk-bajo",     "RIESGO: BAJO"
+
+    # ── Bar chart widths (% of max) ────────────────────────────────────────────
+    max_c = max(counts.values(), default=1) or 1
+    pct   = {k: max(round(v / max_c * 100), 2) if v > 0 else 0 for k, v in counts.items()}
+
+    # ── Host risk scoring ──────────────────────────────────────────────────────
+    _PORT_SCORE = {
+        23: 3, 21: 3, 5900: 3, 3389: 3, 3306: 3, 1433: 3,
+        25: 2, 110: 2, 143: 2, 514: 2, 111: 2,
+        80: 1, 22: 1, 443: 1,
+    }
+    _SVC_LABEL = {
+        21: "FTP (sin cifrado)",        22: "Acceso SSH",
+        23: "Telnet (sin cifrado)",     25: "Correo SMTP",
+        80: "Web HTTP",                 110: "Correo POP3",
+        111: "RPC",                     143: "Correo IMAP",
+        443: "Web HTTPS",               445: "Compartición SMB",
+        514: "Acceso Shell remoto",     1433: "Base de datos MSSQL",
+        3306: "Base de datos MySQL",    3389: "Escritorio Remoto (RDP)",
+        5432: "Base de datos PostgreSQL", 5900: "Control Remoto VNC",
+        8080: "Web HTTP alternativo",   8443: "Web HTTPS alternativo",
+        8000: "Web HTTP alternativo",   27017: "Base de datos MongoDB",
+    }
+    _DANGER = {23, 21, 3389, 5900, 1433, 3306, 5432}
+    _WARN   = {25, 110, 143, 514, 111, 445}
+
+    def _pnum(ps):
+        try: return int(ps.split("/")[0])
+        except: return 0
+
+    def _score(h):
+        return sum(_PORT_SCORE.get(_pnum(ps), 0) for ps in h.get("ports", []))
+
+    for h in hosts:
+        h["_score"] = _score(h)
+    top6 = sorted(hosts, key=lambda h: -h["_score"])[:6]
+
+    # ── Discover all open port numbers across all hosts ────────────────────────
+    all_ports = {_pnum(ps) for h in hosts for ps in h.get("ports", [])}
+    all_svcs  = " ".join(
+        (ps.split("/")[1] if "/" in ps else ps)
+        for h in hosts for ps in h.get("ports", [])
+    ).lower()
+
+    # ── Action items ───────────────────────────────────────────────────────────
+    actions = []
+    if all_ports & {21, 23}:
+        actions.append(("URGENTE", "action-urgente",
+            "Deshabilitar protocolos sin cifrado (Telnet y FTP) en todos los equipos afectados "
+            "y reemplazarlos por alternativas seguras: SSH para administración remota y SFTP para transferencia de archivos."))
+    if 3389 in all_ports:
+        actions.append(("URGENTE", "action-urgente",
+            "Proteger el acceso remoto al escritorio (RDP) con autenticación de doble factor "
+            "y restringir las conexiones únicamente a redes internas autorizadas."))
+    if all_ports & {3306, 1433, 5432}:
+        actions.append(("URGENTE", "action-urgente",
+            "Bloquear el acceso directo a las bases de datos desde la red general mediante reglas de cortafuegos. "
+            "Solo los servidores de aplicación autorizados deben poder conectarse."))
+    if 5900 in all_ports:
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Auditar todos los equipos con control remoto de pantalla (VNC) activo: verificar que cuentan con "
+            "contraseña fuerte y que el acceso está limitado a usuarios específicos."))
+    if all_ports & {445, 137, 138, 139}:
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Revisar la configuración de compartición de archivos en red (Windows/SMB): este protocolo es el "
+            "vector de entrada más común en ataques de ransomware. Deshabilitar en equipos que no lo necesiten."))
+    if any(s in all_svcs for s in ["rtsp", "jetdirect", "sccp", "sip"]):
+        actions.append(("30 DÍAS", "action-30dias",
+            "Segmentar la red en zonas separadas (VLANs) según el tipo de dispositivo: servidores, "
+            "equipos de usuario, cámaras, impresoras y teléfonos IP. Esto limita el impacto de cualquier incidente futuro."))
+    actions.append(("30 DÍAS", "action-30dias",
+        "Repetir el escaneo de seguridad en 30 días para verificar que las acciones correctivas "
+        "han sido implementadas y medir la reducción del riesgo."))
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+    def e(s): return _html.escape(str(s))
+
+    def risk_cls(score):
+        if score >= 6: return "risk-high"
+        if score >= 3: return "risk-medium"
+        return "risk-low"
+
+    def svc_tag(ps):
+        p   = _pnum(ps)
+        lbl = _SVC_LABEL.get(p, ps)
+        cls = " danger" if p in _DANGER else (" warn" if p in _WARN else "")
+        return f'<span class="service-tag{cls}">{e(lbl)}</span>'
+
+    host_cards = "".join(f"""
+      <div class="host-card {risk_cls(h['_score'])}">
+        <div class="host-ip">{e(h['ip'])}</div>
+        <div class="host-score">Puntuación de riesgo: {h['_score']}</div>
+        <div class="host-services">{''.join(svc_tag(ps) for ps in h.get('ports',[])[:8])}</div>
+      </div>""" for h in top6) or \
+      '<div style="color:#8A94A6;font-size:13px;padding:12px 0;">No se detectaron hosts con servicios activos.</div>'
+
+    action_items = "".join(f"""
+      <li class="action-item {css}">
+        <span class="action-tag">{e(tag)}</span>
+        <span class="action-text">{e(text)}</span>
+      </li>""" for tag, css, text in actions)
+
+    def bar_row(label, lc, bc, cnt, pw):
+        w = pw if cnt > 0 else 0
+        return (f'<div class="chart-row">'
+                f'<span class="chart-label {lc}">{label}</span>'
+                f'<div class="chart-bar-bg"><div class="chart-bar {bc}" style="width:{w}%;"></div></div>'
+                f'<span class="chart-count {lc}">{cnt}</span></div>')
+
+    chart = (
+        bar_row("CRÍTICO", "label-critico", "bar-critico", counts["CRITICAL"], pct["CRITICAL"]) +
+        bar_row("ALTO",    "label-alto",    "bar-alto",    counts["HIGH"],     pct["HIGH"])     +
+        bar_row("MEDIO",   "label-medio",   "bar-medio",   counts["MEDIUM"],   pct["MEDIUM"])   +
+        bar_row("BAJO",    "label-bajo",    "bar-bajo",    counts["LOW"],      pct["LOW"])
+    )
+
+    try:
+        from datetime import datetime as _dt
+        _fmt = "%Y-%m-%d %H:%M:%S"
+        dur_str = str(_dt.strptime(end_time, _fmt) - _dt.strptime(start_time, _fmt))
+    except Exception:
+        dur_str = "—"
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reporte Ejecutivo — {e(client)}</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
+     font-size:14px;line-height:1.6;background:#F4F6F9;color:#1A1A2E}}
+.page{{max-width:900px;margin:32px auto;background:#fff;border-radius:10px;
+       box-shadow:0 4px 24px rgba(0,0,0,.10);overflow:hidden}}
+.report-header{{background:linear-gradient(135deg,#0D1B2A 0%,#1B3556 100%);
+               color:#fff;padding:36px 40px 28px}}
+.header-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}}
+.header-logo{{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#7BAFD4;font-weight:600}}
+.report-title{{font-size:22px;font-weight:700;margin:6px 0 2px;letter-spacing:-.3px}}
+.report-subtitle{{font-size:13px;color:#A8C4DC}}
+.badges{{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start}}
+.badge{{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;
+        letter-spacing:.06em;text-transform:uppercase;white-space:nowrap}}
+.badge-vpn{{background:#1E4D78;color:#7EC8E3;border:1px solid #2A6099}}
+.badge-risk-critico{{background:#A32D2D;color:#fff;border:1px solid #c84040}}
+.badge-risk-alto{{background:#854F0B;color:#fff;border:1px solid #b06a10}}
+.badge-risk-moderado{{background:#7D6008;color:#fff;border:1px solid #a8820a}}
+.badge-risk-bajo{{background:#3B6D11;color:#fff;border:1px solid #5a9e1a}}
+.header-meta{{margin-top:22px;display:grid;
+             grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 24px}}
+.meta-label{{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#7BAFD4;font-weight:600}}
+.meta-value{{font-size:13px;color:#E8F1F8;font-weight:500}}
+.report-body{{padding:32px 40px}}
+.section{{margin-bottom:36px}}
+.section-title{{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.10em;
+               color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:8px;margin-bottom:18px}}
+.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}}
+.card{{border-radius:8px;padding:18px 16px 14px;text-align:center;border-width:1px;border-style:solid}}
+.card-num{{font-size:36px;font-weight:800;line-height:1}}
+.card-label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;margin-top:5px}}
+.card-hosts{{background:#E6F1FB;border-color:#B5D4F4;color:#185FA5}}
+.card-critico{{background:#FCEBEB;border-color:#F09595;color:#A32D2D}}
+.card-alto{{background:#FAEEDA;border-color:#FAC775;color:#854F0B}}
+.card-medio{{background:#E6F1FB;border-color:#B5D4F4;color:#185FA5}}
+.chart-wrap{{padding:6px 0}}
+.chart-row{{display:flex;align-items:center;gap:10px;margin-bottom:12px}}
+.chart-label{{width:78px;font-size:12px;font-weight:600;text-align:right;flex-shrink:0}}
+.chart-bar-bg{{flex:1;background:#F0F2F6;border-radius:4px;height:26px;overflow:hidden}}
+.chart-bar{{height:100%;border-radius:4px;min-width:0}}
+.chart-count{{font-size:13px;font-weight:700;width:28px;text-align:left;flex-shrink:0}}
+.bar-critico{{background:#C94040}}.bar-alto{{background:#D4780A}}
+.bar-medio{{background:#2274C8}}.bar-bajo{{background:#4E9E1A}}
+.label-critico{{color:#A32D2D}}.label-alto{{color:#854F0B}}
+.label-medio{{color:#185FA5}}.label-bajo{{color:#3B6D11}}
+.hosts-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}}
+.host-card{{border-radius:8px;border:1px solid #E0E6EF;border-left-width:5px;
+            padding:14px 16px;background:#FAFBFD}}
+.host-card.risk-high{{border-left-color:#C94040}}
+.host-card.risk-medium{{border-left-color:#D4780A}}
+.host-card.risk-low{{border-left-color:#2274C8}}
+.host-ip{{font-size:15px;font-weight:700;color:#1A1A2E;font-family:'SF Mono','Fira Code',monospace}}
+.host-score{{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#8A94A6;margin:2px 0 8px}}
+.host-services{{display:flex;flex-wrap:wrap;gap:5px}}
+.service-tag{{font-size:11px;padding:2px 8px;border-radius:12px;font-weight:500;
+              background:#E6EDF6;color:#3B5278}}
+.service-tag.danger{{background:#FCEBEB;color:#A32D2D}}
+.service-tag.warn{{background:#FAEEDA;color:#854F0B}}
+.actions-list{{list-style:none;display:flex;flex-direction:column;gap:10px}}
+.action-item{{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;
+              border-radius:8px;border-width:1px;border-style:solid}}
+.action-tag{{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+             padding:3px 10px;border-radius:20px;white-space:nowrap;flex-shrink:0;margin-top:1px}}
+.action-text{{font-size:13px;line-height:1.5}}
+.action-urgente{{background:#FCEBEB;border-color:#F09595}}
+.action-urgente .action-tag{{background:#A32D2D;color:#fff}}
+.action-urgente .action-text{{color:#5A1515}}
+.action-2semanas{{background:#FAEEDA;border-color:#FAC775}}
+.action-2semanas .action-tag{{background:#854F0B;color:#fff}}
+.action-2semanas .action-text{{color:#4A2B05}}
+.action-30dias{{background:#E6F1FB;border-color:#B5D4F4}}
+.action-30dias .action-tag{{background:#185FA5;color:#fff}}
+.action-30dias .action-text{{color:#0D2E4E}}
+.report-footer{{background:#F0F2F6;border-top:1px solid #DDE2EC;padding:20px 40px;
+               display:flex;justify-content:space-between;align-items:flex-start;
+               flex-wrap:wrap;gap:12px}}
+.footer-meta{{font-size:11px;color:#5C6B8A;line-height:1.8}}
+.footer-meta strong{{color:#1A1A2E}}
+.footer-confidential{{font-size:10px;color:#8A94A6;text-align:right;max-width:260px;line-height:1.5}}
+.confidential-badge{{display:inline-block;background:#1A1A2E;color:#fff;font-size:9px;font-weight:700;
+                    letter-spacing:.15em;text-transform:uppercase;padding:2px 8px;border-radius:3px;margin-bottom:4px}}
+@media print{{
+  body{{background:#fff}}
+  .page{{box-shadow:none;border-radius:0;margin:0}}
+  .report-header,.card,.host-card,.action-item,.chart-bar{{
+    -webkit-print-color-adjust:exact;print-color-adjust:exact}}
+}}
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="report-header">
+    <div class="header-top">
+      <div>
+        <div class="header-logo">Reporte Ejecutivo de Seguridad &mdash; Datacom Security</div>
+        <div class="report-title">Análisis de Vulnerabilidades de Red</div>
+        <div class="report-subtitle">{e(client)} &mdash; Gerencia General</div>
+      </div>
+      <div class="badges">
+        <span class="badge badge-vpn">VPN: {e(vpn_iface)}</span>
+        <span class="badge {risk_class}">{e(risk_label)}</span>
+      </div>
+    </div>
+    <div class="header-meta">
+      <div><div class="meta-label">Cliente</div><div class="meta-value">{e(client)}</div></div>
+      <div><div class="meta-label">Objetivo</div><div class="meta-value">{e(target)}</div></div>
+      <div><div class="meta-label">Fecha de escaneo</div><div class="meta-value">{e(start_time)}</div></div>
+      <div><div class="meta-label">Ingeniero responsable</div><div class="meta-value">{e(engineer)}</div></div>
+      <div><div class="meta-label">ID de escaneo</div>
+           <div class="meta-value" style="font-family:monospace;font-size:12px;">{e(scan_id)}</div></div>
+    </div>
+  </header>
+
+  <div class="report-body">
+
+    <section class="section">
+      <div class="section-title">Resumen Ejecutivo</div>
+      <div class="cards">
+        <div class="card card-hosts">
+          <div class="card-num">{len(hosts)}</div>
+          <div class="card-label">Hosts Activos</div>
+        </div>
+        <div class="card card-critico">
+          <div class="card-num">{counts["CRITICAL"]}</div>
+          <div class="card-label">Críticos</div>
+        </div>
+        <div class="card card-alto">
+          <div class="card-num">{counts["HIGH"]}</div>
+          <div class="card-label">Altos</div>
+        </div>
+        <div class="card card-medio">
+          <div class="card-num">{counts["MEDIUM"]}</div>
+          <div class="card-label">Medios</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-title">Distribución de Riesgo</div>
+      <div class="chart-wrap">{chart}</div>
+    </section>
+
+    <section class="section">
+      <div class="section-title">Hosts Prioritarios</div>
+      <div class="hosts-grid">{host_cards}</div>
+    </section>
+
+    <section class="section">
+      <div class="section-title">Acciones Recomendadas para Gerencia</div>
+      <ul class="actions-list">{action_items}</ul>
+    </section>
+
+  </div>
+
+  <footer class="report-footer">
+    <div class="footer-meta">
+      <div><strong>Perfil de escaneo:</strong> {e(profile)}</div>
+      <div><strong>Duración:</strong> {e(start_time)} &rarr; {e(end_time)} ({e(dur_str)})</div>
+      <div><strong>Ingeniero:</strong> {e(engineer)} &nbsp;|&nbsp;
+           <strong>ID:</strong> <span style="font-family:monospace;">{e(scan_id)}</span></div>
+    </div>
+    <div class="footer-confidential">
+      <div class="confidential-badge">Confidencial</div>
+      <div>Este documento contiene información sensible sobre la infraestructura de {e(client)}.
+      Su distribución está restringida a la Gerencia General y al equipo de TI autorizado.</div>
+    </div>
+  </footer>
+</div>
+</body>
+</html>"""
 
 
 # ── Network Map ────────────────────────────────────────────────────────────────
@@ -685,6 +1019,339 @@ def api_network_stream(map_id):
     return Response(stream_with_context(generate()),
                     mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Traffic Capture (tcpdump) ─────────────────────────────────────────────────
+capture_sessions: dict[str, dict] = {}
+
+@app.route("/api/capture/ifaces", methods=["GET"])
+def api_capture_ifaces():
+    try:
+        r = subprocess.run("ip -o link show | awk -F': ' '{print $2}'",
+                           shell=True, capture_output=True, text=True)
+        ifaces = [i.strip().split('@')[0] for i in r.stdout.strip().split('\n')
+                  if i.strip() and 'lo' not in i]
+        return jsonify({"ifaces": ifaces or ["eth0"]})
+    except:
+        return jsonify({"ifaces": ["eth0", "tailscale0"]})
+
+@app.route("/api/capture/start", methods=["POST"])
+def api_capture_start():
+    data  = request.json or {}
+    iface = data.get("iface", "eth0").strip()
+    bpf   = data.get("bpf", "").strip()
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', iface):
+        return jsonify({"error": "Interfaz inválida"}), 400
+    cap_id = str(uuid.uuid4())[:8]
+    fname  = f"/opt/scanner/scans/capture_{cap_id}.pcap"
+    cmd    = ["tcpdump", "-i", iface, "-w", fname, "-n", "--print"]
+    if bpf:
+        cmd.append(bpf)
+    capture_sessions[cap_id] = {
+        "status": "running", "lines": [], "file": fname, "proc": None, "done": False,
+        "stats": {"buckets": [], "top_src": {}, "top_dst_port": {}, "flags": {"S":0,"A":0,"F":0,"R":0,"P":0,"U":0}}
+    }
+    # Regex flexible: matches both formats
+    #  eth0:  "18:17:59.728 IP 172.31.30.212.22 > 186.4.168.33.53318: Flags [P.], ..."
+    #  any:   "18:18:08.304 eth0  Out IP 172.31.30.212.22 > 186.4.168.33.53325: Flags [P.], ..."
+    #  UDP:   "18:17:59.744 IP 172.31.30.212.41641 > 186.4.168.33.41641: UDP, length 96"
+    _pkt_tcp = re.compile(
+        r'IP\s+([\d.]+)\.(\d+)\s+>\s+([\d.]+)\.(\d+):.*?Flags\s+\[([^\]]*)\]'
+    )
+    _pkt_udp = re.compile(
+        r'IP\s+([\d.]+)\.(\d+)\s+>\s+([\d.]+)\.(\d+):.*?UDP'
+    )
+    _WINDOW = 300  # 5 minutes in seconds
+
+    def _update_stats(state, line, ts_epoch):
+        m = _pkt_tcp.search(line)
+        is_udp = False
+        if not m:
+            m = _pkt_udp.search(line)
+            is_udp = True
+        if not m:
+            return
+        direction = "In" if " In " in line else "Out"
+        src_ip, src_port = m.group(1), m.group(2)
+        dst_ip, dst_port_s = m.group(3), m.group(4)
+        flags_s = "" if is_udp else m.group(5)
+        stats = state["stats"]
+        now_s = int(ts_epoch)
+        buckets = stats["buckets"]
+        cutoff = ts_epoch - _WINDOW
+        # Prune old buckets
+        while buckets and buckets[0]["t"] < cutoff:
+            old = buckets.pop(0)
+            for ip, n in old.get("srcs", {}).items():
+                stats["top_src"][ip] = max(0, stats["top_src"].get(ip, 0) - n)
+            for p, n in old.get("ports", {}).items():
+                stats["top_dst_port"][p] = max(0, stats["top_dst_port"].get(p, 0) - n)
+            for f, n in old.get("fl", {}).items():
+                stats["flags"][f] = max(0, stats["flags"].get(f, 0) - n)
+        # Current bucket
+        if not buckets or buckets[-1]["t"] != now_s:
+            buckets.append({"t": now_s, "in": 0, "out": 0, "srcs": {}, "ports": {}, "fl": {}})
+        b = buckets[-1]
+        if direction == "In": b["in"] += 1
+        else:                  b["out"] += 1
+        b["srcs"][src_ip]      = b["srcs"].get(src_ip, 0) + 1
+        b["ports"][dst_port_s] = b["ports"].get(dst_port_s, 0) + 1
+        # Flag chars (TCP only; UDP counted as 'U')
+        if is_udp:
+            b["fl"]["U"]     = b["fl"].get("U", 0) + 1
+            stats["flags"]["U"] = stats["flags"].get("U", 0) + 1
+        else:
+            for fc in ("S","A","F","R","P"):
+                if fc in flags_s:
+                    b["fl"][fc]     = b["fl"].get(fc, 0) + 1
+                    stats["flags"][fc] = stats["flags"].get(fc, 0) + 1
+        stats["top_src"][src_ip]          = stats["top_src"].get(src_ip, 0) + 1
+        stats["top_dst_port"][dst_port_s] = stats["top_dst_port"].get(dst_port_s, 0) + 1
+
+    def run():
+        state = capture_sessions[cap_id]
+        try:
+            state["lines"].append(f"[tcpdump] Interfaz: {iface}")
+            if bpf:
+                state["lines"].append(f"[tcpdump] Filtro BPF: {bpf}")
+            state["lines"].append(f"[tcpdump] Guardando en: {fname}")
+            state["lines"].append("")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            state["proc"] = proc
+            for line in proc.stdout:
+                stripped = line.rstrip()
+                state["lines"].append(stripped)
+                _update_stats(state, stripped, time.time())
+            proc.wait()
+            state["lines"].append(f"\n[tcpdump] Finalizado (código {proc.returncode})")
+        except Exception as e:
+            state["lines"].append(f"[ERROR] {e}")
+        finally:
+            state["done"] = True
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"cap_id": cap_id, "file": fname})
+
+@app.route("/api/capture/stream/<cap_id>")
+def api_capture_stream(cap_id):
+    def gen():
+        sent = 0
+        while True:
+            state = capture_sessions.get(cap_id)
+            if not state:
+                yield "data: [sesión no encontrada]\n\n"; break
+            lines = state["lines"]
+            while sent < len(lines):
+                yield f"data: {lines[sent]}\n\n"
+                sent += 1
+            if state["done"] and sent >= len(lines):
+                yield "data: __DONE__\n\n"; break
+            time.sleep(0.3)
+    return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/api/capture/stop/<cap_id>", methods=["POST"])
+def api_capture_stop(cap_id):
+    state = capture_sessions.get(cap_id)
+    if state and state.get("proc"):
+        state["proc"].terminate()
+        return jsonify({"ok": True})
+    return jsonify({"ok": False})
+
+@app.route("/api/capture/stats/<cap_id>")
+def api_capture_stats(cap_id):
+    state = capture_sessions.get(cap_id)
+    if not state or "stats" not in state:
+        return jsonify({"error": "not found"}), 404
+    stats = state["stats"]
+    buckets = stats["buckets"]
+    # Time series: last 300 seconds, fill missing with zeros
+    now_s = int(time.time())
+    series_in, series_out, series_labels = [], [], []
+    bucket_map = {b["t"]: b for b in buckets}
+    for s in range(max(now_s - 299, buckets[0]["t"] if buckets else now_s), now_s + 1):
+        b = bucket_map.get(s, {})
+        series_labels.append(str(s))
+        series_in.append(b.get("in", 0))
+        series_out.append(b.get("out", 0))
+    # Top 10 src IPs
+    top_src = sorted(stats["top_src"].items(), key=lambda x: -x[1])[:10]
+    # Top 10 dst ports
+    top_ports = sorted(stats["top_dst_port"].items(), key=lambda x: -x[1])[:10]
+    return jsonify({
+        "labels":     series_labels,
+        "series_in":  series_in,
+        "series_out": series_out,
+        "top_src":    top_src,
+        "top_ports":  top_ports,
+        "flags":      stats["flags"],
+        "total":      sum(series_in) + sum(series_out),
+    })
+
+@app.route("/api/capture/read", methods=["POST"])
+def api_capture_read():
+    data   = request.json or {}
+    fname  = data.get("file", "").strip()
+    filt   = data.get("filter", "").strip()
+    if not re.match(r'^/opt/scanner/scans/[a-zA-Z0-9_.\-]+\.pcap$', fname):
+        return jsonify({"error": "Ruta de archivo inválida"}), 400
+    cap_id = str(uuid.uuid4())[:8]
+    capture_sessions[cap_id] = {"status": "running", "lines": [], "done": False, "proc": None}
+    def run():
+        state = capture_sessions[cap_id]
+        try:
+            cmd = ["tcpdump", "-r", fname, "-n", "-tttt"]
+            if filt:
+                cmd.append(filt)
+            state["lines"].append(f"[tcpdump] Leyendo: {fname}")
+            if filt:
+                state["lines"].append(f"[tcpdump] Filtro: {filt}")
+            state["lines"].append("")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            for line in proc.stdout:
+                state["lines"].append(line.rstrip())
+            proc.wait()
+        except Exception as e:
+            state["lines"].append(f"[ERROR] {e}")
+        finally:
+            state["done"] = True
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"cap_id": cap_id})
+
+
+# ── Suricata IDS ──────────────────────────────────────────────────────────────
+ids_state = {"proc": None, "running": False, "alerts": [], "stats": {
+    "buckets": [], "top_sig": {}, "top_src": {}, "severity": {1:0,2:0,3:0}
+}}
+_IDS_WINDOW = 300
+
+# Regex for suricata fast.log:
+# 04/07/2026-20:00:00.123456  [**] [1:2001219:20] ET SCAN ... [**] [Classification: ...] [Priority: 2] {TCP} 1.2.3.4:12345 -> 5.6.7.8:80
+_ids_re = re.compile(
+    r'(\d+/\d+/\d+-\d+:\d+:\d+)\.\d+\s+\[\*\*\]\s+\[[\d:]+\]\s+(.*?)\s+\[\*\*\]'
+    r'(?:\s+\[Classification:\s*(.*?)\])?'
+    r'\s+\[Priority:\s*(\d+)\]'
+    r'\s+\{(\w+)\}\s+([\d.]+):\d+\s+->\s+([\d.]+):\d+'
+)
+
+@app.route("/api/ids/start", methods=["POST"])
+def api_ids_start():
+    if ids_state["running"]:
+        return jsonify({"error": "Suricata ya está corriendo"}), 400
+    data  = request.json or {}
+    iface = data.get("iface", "eth0").strip()
+    if not re.match(r'^[a-zA-Z0-9_.\-]+$', iface):
+        return jsonify({"error": "Interfaz inválida"}), 400
+    ids_state["alerts"] = []
+    ids_state["stats"]  = {"buckets": [], "top_sig": {}, "top_src": {}, "severity": {1:0,2:0,3:0}}
+    ids_state["running"] = True
+
+    def run():
+        try:
+            # Clear old fast.log
+            subprocess.run("sudo truncate -s 0 /var/log/suricata/fast.log", shell=True)
+            # Start suricata
+            proc = subprocess.Popen(
+                ["sudo", "suricata", "-c", "/etc/suricata/suricata.yaml",
+                 "-i", iface, "--runmode=autofp", "-D"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            proc.wait()
+            ids_state["proc"] = True  # suricata runs as daemon
+            ids_state["alerts"].append({"t": time.strftime("%H:%M:%S"), "msg": f"[IDS] Suricata iniciado en {iface}", "sev": 0, "src": "", "dst": "", "proto": "", "cat": ""})
+            # Tail fast.log for alerts
+            tail = subprocess.Popen(
+                ["sudo", "tail", "-F", "/var/log/suricata/fast.log"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1
+            )
+            ids_state["tail"] = tail
+            for line in tail.stdout:
+                if not ids_state["running"]:
+                    break
+                line = line.rstrip()
+                if not line:
+                    continue
+                m = _ids_re.search(line)
+                if m:
+                    ts_raw, sig, cat, prio, proto, src, dst = m.groups()
+                    prio = int(prio)
+                    ts_short = ts_raw.split("-")[1] if "-" in ts_raw else ts_raw
+                    alert = {"t": ts_short, "msg": sig.strip(), "sev": prio,
+                             "src": src, "dst": dst, "proto": proto, "cat": cat or "Sin clasificar"}
+                    ids_state["alerts"].append(alert)
+                    # Keep max 2000 alerts
+                    if len(ids_state["alerts"]) > 2000:
+                        ids_state["alerts"] = ids_state["alerts"][-1500:]
+                    # Update rolling stats
+                    now_s = int(time.time())
+                    stats = ids_state["stats"]
+                    buckets = stats["buckets"]
+                    cutoff = now_s - _IDS_WINDOW
+                    while buckets and buckets[0]["t"] < cutoff:
+                        old = buckets.pop(0)
+                        for s, n in old.get("sigs", {}).items():
+                            stats["top_sig"][s] = max(0, stats["top_sig"].get(s, 0) - n)
+                        for s, n in old.get("srcs", {}).items():
+                            stats["top_src"][s] = max(0, stats["top_src"].get(s, 0) - n)
+                        for s, n in old.get("sevs", {}).items():
+                            stats["severity"][s] = max(0, stats["severity"].get(s, 0) - n)
+                    if not buckets or buckets[-1]["t"] != now_s:
+                        buckets.append({"t": now_s, "count": 0, "sigs": {}, "srcs": {}, "sevs": {}})
+                    b = buckets[-1]
+                    b["count"] += 1
+                    b["sigs"][sig.strip()[:60]] = b["sigs"].get(sig.strip()[:60], 0) + 1
+                    b["srcs"][src]              = b["srcs"].get(src, 0) + 1
+                    b["sevs"][prio]             = b["sevs"].get(prio, 0) + 1
+                    stats["top_sig"][sig.strip()[:60]] = stats["top_sig"].get(sig.strip()[:60], 0) + 1
+                    stats["top_src"][src]              = stats["top_src"].get(src, 0) + 1
+                    stats["severity"][prio]            = stats["severity"].get(prio, 0) + 1
+                else:
+                    ids_state["alerts"].append({"t": time.strftime("%H:%M:%S"), "msg": line[:200], "sev": 0, "src": "", "dst": "", "proto": "", "cat": ""})
+        except Exception as e:
+            ids_state["alerts"].append({"t": time.strftime("%H:%M:%S"), "msg": f"[ERROR] {e}", "sev": 0, "src":"","dst":"","proto":"","cat":""})
+        finally:
+            ids_state["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/api/ids/stop", methods=["POST"])
+def api_ids_stop():
+    ids_state["running"] = False
+    if ids_state.get("tail"):
+        try: ids_state["tail"].terminate()
+        except: pass
+    subprocess.run("sudo killall suricata 2>/dev/null", shell=True)
+    ids_state["alerts"].append({"t": time.strftime("%H:%M:%S"), "msg": "[IDS] Suricata detenido", "sev": 0, "src":"","dst":"","proto":"","cat":""})
+    return jsonify({"ok": True})
+
+@app.route("/api/ids/alerts")
+def api_ids_alerts():
+    since = int(request.args.get("since", 0))
+    alerts = ids_state["alerts"][since:]
+    return jsonify({"alerts": alerts, "total": len(ids_state["alerts"]), "running": ids_state["running"]})
+
+@app.route("/api/ids/stats")
+def api_ids_stats():
+    stats = ids_state["stats"]
+    buckets = stats["buckets"]
+    now_s = int(time.time())
+    labels, counts = [], []
+    bmap = {b["t"]: b for b in buckets}
+    start = max(now_s - 299, buckets[0]["t"] if buckets else now_s)
+    for s in range(start, now_s + 1):
+        labels.append(str(s))
+        counts.append(bmap.get(s, {}).get("count", 0))
+    top_sig  = sorted(stats["top_sig"].items(), key=lambda x: -x[1])[:10]
+    top_src  = sorted(stats["top_src"].items(), key=lambda x: -x[1])[:10]
+    sev = stats["severity"]
+    return jsonify({
+        "labels": labels, "counts": counts,
+        "top_sig": top_sig, "top_src": top_src,
+        "severity": {"high": sev.get(1,0), "medium": sev.get(2,0), "low": sev.get(3,0)},
+        "total": sum(counts)
+    })
 
 
 # ── API: Clients ───────────────────────────────────────────────────────────────
@@ -1085,6 +1752,11 @@ td{{padding:3px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
 <table>{rows}</table></body></html>"""
         return Response(html, mimetype="text/html",
                         headers={"Content-Disposition": f"attachment; filename={fname}"})
+    elif fmt == "exec":
+        html_content = generate_executive_html_report(s)
+        safe_fname   = f"reporte_ejecutivo_{re.sub(r'[^a-zA-Z0-9._-]','_',s['client'] or 'cliente')}_{scan_id}.html"
+        return Response(html_content, mimetype="text/html",
+                        headers={"Content-Disposition": f"attachment; filename={safe_fname}"})
     return "fmt inválido", 400
 
 # ── Main page ──────────────────────────────────────────────────────────────────
@@ -1101,6 +1773,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kali VPN Vulnerability Scanner</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{
   --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bg4:#30363d;
@@ -1238,23 +1911,27 @@ select option{background:var(--bg3)}
              border-radius:4px;padding:2px 8px;font-size:.72rem;white-space:nowrap;
              font-family:'Courier New',monospace;animation:chipIn .3s ease}
 @keyframes chipIn{from{opacity:0;transform:scale(.8)}to{opacity:1;transform:scale(1)}}
-.ping-bar{display:flex;align-items:center;gap:8px;padding:7px 16px;
-          border-bottom:1px solid var(--bg4);flex-shrink:0;flex-wrap:wrap;
-          background:var(--bg2)}
+.ping-bar{display:flex;flex-direction:column;gap:0;
+          border-bottom:1px solid var(--bg4);flex-shrink:0;background:var(--bg2)}
+.ping-controls{display:flex;align-items:center;gap:8px;padding:7px 16px;flex-wrap:wrap}
 .ping-label{font-size:.78rem;font-weight:700;color:var(--green);white-space:nowrap}
-.ping-bar input{max-width:220px;padding:5px 10px;font-size:.85rem;
+.ping-controls input{max-width:220px;padding:5px 10px;font-size:.85rem;
                 background:var(--bg3);border:1px solid var(--bg4);
                 color:var(--fg);border-radius:6px;outline:none}
-.ping-bar input:focus{border-color:var(--green)}
-.ping-bar select{width:120px;padding:5px 8px;font-size:.83rem;
+.ping-controls input:focus{border-color:var(--green)}
+.ping-controls select{width:120px;padding:5px 8px;font-size:.83rem;
                  background:var(--bg3);border:1px solid var(--bg4);
                  color:var(--fg);border-radius:6px;outline:none}
 .btn-ping{background:#1a5c2a;color:var(--green);border:1px solid var(--green);padding:5px 14px;font-size:.83rem}
 .btn-ping:hover{background:var(--green);color:#000}
 .btn-ping.running{background:#0d3318;color:var(--dim);border-color:var(--dim);cursor:not-allowed}
-.ping-output{display:flex;align-items:center;gap:12px;font-family:'Courier New',monospace;
-             font-size:.8rem;flex:1;min-width:0;overflow:hidden;white-space:nowrap;
-             background:var(--bg3);border-radius:6px;padding:5px 10px;border:1px solid var(--bg4)}
+.ping-status{font-size:.78rem;font-family:'Courier New',monospace;display:flex;
+             align-items:center;gap:6px;margin-left:4px}
+.ping-console{background:#090d13;font-family:'Courier New',monospace;font-size:.8rem;
+              padding:6px 16px;max-height:90px;overflow-y:auto;
+              border-top:1px solid var(--bg4);display:none;line-height:1.6}
+.ping-console.visible{display:block}
+.ping-console-line{white-space:pre-wrap;word-break:break-all}
 .ping-line-success{color:var(--green);font-weight:600}
 .ping-line-error{color:var(--red);font-weight:600}
 .ping-line-header{color:var(--blue);font-weight:700}
@@ -1376,6 +2053,8 @@ select option{background:var(--bg3)}
       <div class="tab active" id="tab-btn-scanner" onclick="showTab('scanner',this)">&#x1F50D; Escaneo</div>
       <div class="tab" id="tab-btn-history"  onclick="showTab('history',this);loadHistory()">&#x1F4CB; Historial</div>
       <div class="tab" id="tab-btn-map"      onclick="showTab('map',this);onMapTabOpen()">&#x1F5A7; Mapa de Red</div>
+      <div class="tab" id="tab-btn-capture"  onclick="showTab('capture',this);loadCapIfaces()">&#x1F4E1; Captura de Tráfico</div>
+      <div class="tab" id="tab-btn-ids"      onclick="showTab('ids',this)">&#x1F6E1; IDS Suricata</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -1412,17 +2091,23 @@ select option{background:var(--bg3)}
 
       <!-- Ping Tool -->
       <div class="ping-bar">
-        <span class="ping-label">&#x1F4E1; PING</span>
-        <input id="pingHost" type="text" placeholder="IP o hostname (ej: 192.168.1.1)"
-               onkeydown="if(event.key==='Enter')doPing()" autocomplete="off">
-        <select id="pingCount">
-          <option value="4">4 paquetes</option>
-          <option value="8">8 paquetes</option>
-          <option value="10">10 paquetes</option>
-        </select>
-        <button class="btn btn-ping" id="btnPing" onclick="doPing()">&#x25B6; Ping</button>
-        <button class="btn btn-gray btn-sm" onclick="clearPing()" title="Limpiar">&#x2715;</button>
-        <div class="ping-output" id="pingOutput"><span style="color:var(--dim)">Introduce una IP o hostname y pulsa Ping.</span></div>
+        <div class="ping-controls">
+          <span class="ping-label">&#x1F4E1; PING</span>
+          <input id="pingHost" type="text" placeholder="IP o hostname (ej: 192.168.1.1)"
+                 onkeydown="if(event.key==='Enter')doPing()" autocomplete="off">
+          <select id="pingCount">
+            <option value="4">4 paquetes</option>
+            <option value="8">8 paquetes</option>
+            <option value="10">10 paquetes</option>
+          </select>
+          <button class="btn btn-ping" id="btnPing" onclick="doPing()">&#x25B6; Ping</button>
+          <button class="btn btn-gray btn-sm" onclick="clearPing()" title="Limpiar">&#x2715;</button>
+          <div class="ping-status" id="pingStatus">
+            <span id="pingDot" class="ping-dot waiting"></span>
+            <span id="pingStatusText" style="color:var(--dim)">Introduce una IP y pulsa Ping</span>
+          </div>
+        </div>
+        <div class="ping-console" id="pingOutput"></div>
       </div>
 
       <!-- Stats bar -->
@@ -1469,6 +2154,7 @@ select option{background:var(--bg3)}
         <button class="btn btn-gray btn-sm" id="btnTxt"  onclick="exportScan('txt')"  style="display:none">&#x2B07; TXT</button>
         <button class="btn btn-gray btn-sm" id="btnJson" onclick="exportScan('json')" style="display:none">&#x2B07; JSON</button>
         <button class="btn btn-gray btn-sm" id="btnHtml" onclick="exportScan('html')" style="display:none">&#x2B07; HTML</button>
+        <button class="btn btn-green btn-sm" id="btnExec" onclick="exportScan('exec')" style="display:none" title="Reporte ejecutivo para Gerencia General">&#x1F4CA; Informe Ejecutivo</button>
         <span id="scanStatus" style="color:var(--dim);font-size:.82rem;margin-left:auto"></span>
       </div>
       <div class="progress-bar"><div class="progress-inner" id="progressBar"></div></div>
@@ -1527,6 +2213,160 @@ select option{background:var(--bg3)}
       </div>
     </div>
 
+    <!-- CAPTURE TAB -->
+    <div class="tab-content" id="tab-capture">
+      <div style="padding:16px;display:flex;flex-direction:column;gap:12px;height:100%;box-sizing:border-box">
+
+        <!-- Toolbar: captura -->
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <div style="display:flex;flex-direction:column;gap:4px;min-width:150px">
+            <label style="font-size:.78rem;color:var(--dim);font-weight:700">Interfaz</label>
+            <select id="capIface" style="background:var(--bg3);color:var(--fg);border:1px solid var(--bg4);
+                    border-radius:6px;padding:5px 10px;font-size:.88rem;min-width:140px">
+              <option value="eth0">eth0</option>
+            </select>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:220px">
+            <label style="font-size:.78rem;color:var(--dim);font-weight:700">Filtro BPF (captura)</label>
+            <input id="capBpf" placeholder="ej: net 192.168.1.0/24  |  port 445 or port 80"
+                   style="padding:5px 10px;background:var(--bg3);color:var(--fg);
+                          border:1px solid var(--bg4);border-radius:6px;font-size:.85rem;
+                          font-family:'Courier New',monospace;width:100%;box-sizing:border-box">
+          </div>
+          <button class="btn btn-green btn-sm" id="btnCapStart" onclick="startCapture()">&#x25CF; Iniciar captura</button>
+          <button class="btn btn-red   btn-sm" id="btnCapStop"  onclick="stopCapture()" disabled>&#x25A0; Detener</button>
+          <button class="btn btn-gray  btn-sm" onclick="capClear()">&#x1F5D1; Limpiar</button>
+        </div>
+
+        <!-- Live console -->
+        <div id="capConsole" style="background:#090d13;border:1px solid var(--bg4);
+             border-radius:8px;overflow-y:auto;padding:10px 14px;height:160px;
+             font-family:'Courier New',monospace;font-size:.8rem;line-height:1.55;color:#c9d1d9"></div>
+
+        <!-- Charts grid (visible only during capture) -->
+        <div id="capCharts" style="display:none;grid-template-columns:1fr 1fr;grid-template-rows:auto auto;gap:12px">
+          <!-- Traffic over time -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px;grid-column:1/-1">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">
+              PAQUETES / SEGUNDO — últimos 5 min
+              <span id="capTotalPkts" style="float:right;color:var(--blue)"></span>
+            </div>
+            <canvas id="chartTime" height="70"></canvas>
+          </div>
+          <!-- Top src IPs -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">TOP 10 IPs ORIGEN</div>
+            <canvas id="chartSrc" height="140"></canvas>
+          </div>
+          <!-- Top dst ports -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">TOP 10 PUERTOS DESTINO</div>
+            <canvas id="chartPorts" height="140"></canvas>
+          </div>
+          <!-- TCP Flags -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px;
+                      display:flex;flex-direction:column;align-items:center">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px;width:100%">FLAGS TCP</div>
+            <canvas id="chartFlags" style="max-height:160px;max-width:220px"></canvas>
+          </div>
+          <!-- In vs Out stacked -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">IN vs OUT (acumulado 5 min)</div>
+            <canvas id="chartInOut" height="140"></canvas>
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bg4);margin:4px 0">
+
+        <!-- Sección leer/filtrar pcap -->
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <span style="font-size:.82rem;color:var(--dim);font-weight:700;white-space:nowrap;
+                       align-self:center">&#x1F4C2; Analizar .pcap:</span>
+          <div style="display:flex;flex-direction:column;gap:4px;flex:2;min-width:220px">
+            <label style="font-size:.78rem;color:var(--dim)">Archivo</label>
+            <input id="capReadFile" placeholder="/opt/scanner/scans/capture_XXXXXXXX.pcap"
+                   style="padding:5px 10px;background:var(--bg3);color:var(--fg);
+                          border:1px solid var(--bg4);border-radius:6px;font-size:.82rem;
+                          font-family:'Courier New',monospace;width:100%;box-sizing:border-box">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:160px">
+            <label style="font-size:.78rem;color:var(--dim)">Filtro (BPF)</label>
+            <input id="capReadFilter" placeholder="port 445 or port 80"
+                   style="padding:5px 10px;background:var(--bg3);color:var(--fg);
+                          border:1px solid var(--bg4);border-radius:6px;font-size:.82rem;
+                          font-family:'Courier New',monospace;width:100%;box-sizing:border-box">
+          </div>
+          <button class="btn btn-blue btn-sm" onclick="readCapture()">&#x1F50D; Leer / Filtrar</button>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- IDS SURICATA TAB -->
+    <div class="tab-content" id="tab-ids">
+      <div style="padding:16px;display:flex;flex-direction:column;gap:12px;height:100%;box-sizing:border-box;overflow-y:auto">
+        <!-- Toolbar -->
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <div style="display:flex;flex-direction:column;gap:4px;min-width:150px">
+            <label style="font-size:.78rem;color:var(--dim);font-weight:700">Interfaz</label>
+            <select id="idsIface" style="background:var(--bg3);color:var(--fg);border:1px solid var(--bg4);
+                    border-radius:6px;padding:5px 10px;font-size:.88rem;min-width:140px">
+              <option value="eth0">eth0</option><option value="tailscale0">tailscale0</option>
+            </select>
+          </div>
+          <button class="btn btn-green btn-sm" id="btnIdsStart" onclick="idsStart()">&#x25CF; Iniciar Suricata</button>
+          <button class="btn btn-red   btn-sm" id="btnIdsStop"  onclick="idsStop()" disabled>&#x25A0; Detener</button>
+          <span id="idsStatusText" style="font-size:.82rem;color:var(--dim)"></span>
+          <span id="idsTotalAlerts" style="font-size:.82rem;color:var(--yellow);margin-left:auto"></span>
+        </div>
+
+        <!-- Stats grid -->
+        <div id="idsCharts" style="display:none;grid-template-columns:1fr 1fr;gap:12px">
+          <!-- Alerts timeline -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px;grid-column:1/-1">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">ALERTAS / SEGUNDO — últimos 5 min</div>
+            <canvas id="idsChartTime" height="55"></canvas>
+          </div>
+          <!-- Top signatures -->
+          <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px">
+            <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">TOP 10 FIRMAS</div>
+            <canvas id="idsChartSig" height="150"></canvas>
+          </div>
+          <!-- Severity donut + top src -->
+          <div style="display:flex;gap:12px;flex-direction:column">
+            <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px;
+                        display:flex;flex-direction:column;align-items:center;flex:1">
+              <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px;width:100%">SEVERIDAD</div>
+              <canvas id="idsChartSev" style="max-height:120px;max-width:200px"></canvas>
+            </div>
+            <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;padding:12px;flex:1">
+              <div style="font-size:.75rem;color:var(--dim);font-weight:700;margin-bottom:6px">TOP 10 IPs ORIGEN</div>
+              <canvas id="idsChartSrc" height="120"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live alerts table -->
+        <div style="font-size:.75rem;color:var(--dim);font-weight:700">ALERTAS EN TIEMPO REAL</div>
+        <div id="idsAlertBox" style="flex:1;background:#090d13;border:1px solid var(--bg4);border-radius:8px;
+             overflow-y:auto;min-height:150px;font-family:'Courier New',monospace;font-size:.76rem;line-height:1.5">
+          <table style="width:100%;border-collapse:collapse">
+            <thead style="position:sticky;top:0;background:#161b22;z-index:1">
+              <tr>
+                <th style="text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--bg4);width:70px">Hora</th>
+                <th style="text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--bg4);width:30px">Sev</th>
+                <th style="text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--bg4);width:100px">Origen</th>
+                <th style="text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--bg4);width:100px">Destino</th>
+                <th style="text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--bg4);width:40px">Proto</th>
+                <th style="text-align:left;padding:6px 8px;color:var(--dim);border-bottom:1px solid var(--bg4)">Firma / Alerta</th>
+              </tr>
+            </thead>
+            <tbody id="idsAlertBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <!-- HISTORY TAB -->
     <div class="tab-content" id="tab-history" style="overflow:auto;padding:16px">
       <table class="history-table" id="historyTable">
@@ -1580,6 +2420,314 @@ let currentScanId = null, sseSource = null;
 let scanRunning = false, startTime = null, timerInterval = null;
 let profiles = {};
 let knownDevices = new Set();
+
+// ── Capture Tab ───────────────────────────────────────────────────────────────
+let capId = null, capSse = null, capRunning = false;
+let capStatsInterval = null;
+let chartTime = null, chartSrc = null, chartPorts = null, chartFlags = null, chartInOut = null;
+
+const CAP_COLORS = ['#4fc3f7','#81c784','#ffb74d','#e57373','#ba68c8','#4dd0e1','#fff176','#a1887f','#90a4ae','#f48fb1'];
+
+function initCharts() {
+  Chart.defaults.color = '#8b949e';
+  Chart.defaults.borderColor = '#21262d';
+
+  const ctTime = document.getElementById('chartTime').getContext('2d');
+  chartTime = new Chart(ctTime, {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'Entrada', data: [], borderColor: '#4fc3f7', backgroundColor: 'rgba(79,195,247,.15)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+      { label: 'Salida',  data: [], borderColor: '#81c784', backgroundColor: 'rgba(129,199,132,.15)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+    ]},
+    options: { animation: false, scales: {
+      x: { ticks: { maxTicksLimit: 10, callback: (v, i, a) => { const d = new Date(parseInt(chartTime.data.labels[i])*1000); return d.toLocaleTimeString(); } } },
+      y: { beginAtZero: true, ticks: { precision: 0 } }
+    }, plugins: { legend: { position: 'top' } } }
+  });
+
+  const ctSrc = document.getElementById('chartSrc').getContext('2d');
+  chartSrc = new Chart(ctSrc, {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'Paquetes', data: [], backgroundColor: CAP_COLORS }] },
+    options: { animation: false, indexAxis: 'y', plugins: { legend: { display: false } },
+               scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } }
+  });
+
+  const ctPorts = document.getElementById('chartPorts').getContext('2d');
+  chartPorts = new Chart(ctPorts, {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'Paquetes', data: [], backgroundColor: '#ffb74d' }] },
+    options: { animation: false, plugins: { legend: { display: false } },
+               scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+  });
+
+  const ctFlags = document.getElementById('chartFlags').getContext('2d');
+  chartFlags = new Chart(ctFlags, {
+    type: 'doughnut',
+    data: { labels: ['SYN','ACK','FIN','RST','PSH','UDP'],
+            datasets: [{ data: [0,0,0,0,0,0], backgroundColor: ['#4fc3f7','#81c784','#e57373','#f48fb1','#ffb74d','#ce93d8'] }] },
+    options: { animation: false, plugins: { legend: { position: 'right' } } }
+  });
+
+  const ctIO = document.getElementById('chartInOut').getContext('2d');
+  chartInOut = new Chart(ctIO, {
+    type: 'bar',
+    data: { labels: [], datasets: [
+      { label: 'Entrada', data: [], backgroundColor: 'rgba(79,195,247,.7)'  },
+      { label: 'Salida',  data: [], backgroundColor: 'rgba(129,199,132,.7)' },
+    ]},
+    options: { animation: false, scales: {
+      x: { stacked: true, ticks: { maxTicksLimit: 8, callback: (v, i) => { const d = new Date(parseInt(chartInOut.data.labels[i])*1000); return d.toLocaleTimeString(); } } },
+      y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } }
+    }, plugins: { legend: { position: 'top' } } }
+  });
+}
+
+function destroyCharts() {
+  [chartTime, chartSrc, chartPorts, chartFlags, chartInOut].forEach(c => { if(c) c.destroy(); });
+  chartTime = chartSrc = chartPorts = chartFlags = chartInOut = null;
+}
+
+async function updateCapStats() {
+  if (!capId) return;
+  try {
+    const r = await fetch('/api/capture/stats/' + capId);
+    if (!r.ok) return;
+    const d = await r.json();
+    // Time series
+    chartTime.data.labels       = d.labels;
+    chartTime.data.datasets[0].data = d.series_in;
+    chartTime.data.datasets[1].data = d.series_out;
+    chartTime.update('none');
+    // In/Out stacked
+    chartInOut.data.labels = d.labels;
+    chartInOut.data.datasets[0].data = d.series_in;
+    chartInOut.data.datasets[1].data = d.series_out;
+    chartInOut.update('none');
+    // Top src IPs
+    chartSrc.data.labels = d.top_src.map(x => x[0]);
+    chartSrc.data.datasets[0].data = d.top_src.map(x => x[1]);
+    chartSrc.update('none');
+    // Top ports
+    chartPorts.data.labels = d.top_ports.map(x => x[0]);
+    chartPorts.data.datasets[0].data = d.top_ports.map(x => x[1]);
+    chartPorts.update('none');
+    // Flags
+    const f = d.flags;
+    chartFlags.data.datasets[0].data = [f.S||0, f.A||0, f.F||0, f.R||0, f.P||0, f.U||0];
+    chartFlags.update('none');
+    // Total
+    document.getElementById('capTotalPkts').textContent = d.total.toLocaleString() + ' paquetes';
+  } catch(e) {}
+}
+
+async function loadCapIfaces() {
+  try {
+    const r = await fetch('/api/capture/ifaces');
+    const j = await r.json();
+    const sel = document.getElementById('capIface');
+    sel.innerHTML = '';
+    for (const iface of j.ifaces) {
+      const opt = document.createElement('option');
+      opt.value = opt.textContent = iface;
+      sel.appendChild(opt);
+    }
+    const anyOpt = document.createElement('option');
+    anyOpt.value = 'any'; anyOpt.textContent = 'any (todas las interfaces)';
+    sel.appendChild(anyOpt);
+  } catch(e) {}
+}
+
+function capAppend(text, color) {
+  const c = document.getElementById('capConsole');
+  const d = document.createElement('div');
+  d.style.color = color || '#c9d1d9';
+  d.style.whiteSpace = 'pre';
+  d.textContent = text;
+  c.appendChild(d);
+  c.scrollTop = c.scrollHeight;
+}
+
+function capClear() { document.getElementById('capConsole').innerHTML = ''; }
+
+async function startCapture() {
+  const iface = document.getElementById('capIface').value.trim();
+  const bpf   = document.getElementById('capBpf').value.trim();
+  if (!iface) return;
+  capClear();
+  capAppend('Iniciando captura...', '#4fc3f7');
+  const r = await fetch('/api/capture/start', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({iface, bpf})
+  });
+  const j = await r.json();
+  if (j.error) { capAppend('[ERROR] ' + j.error, '#ff4444'); return; }
+  capId = j.cap_id;
+  document.getElementById('capReadFile').value = j.file;
+  capRunning = true;
+  document.getElementById('btnCapStart').disabled = true;
+  document.getElementById('btnCapStop').disabled  = false;
+  // Show and init charts
+  const chartsEl = document.getElementById('capCharts');
+  chartsEl.style.display = 'grid';
+  destroyCharts();
+  initCharts();
+  capStatsInterval = setInterval(updateCapStats, 2000);
+  if (capSse) capSse.close();
+  capSse = new EventSource('/api/capture/stream/' + capId);
+  capSse.onmessage = e => {
+    if (e.data === '__DONE__') {
+      capSse.close(); capRunning = false;
+      clearInterval(capStatsInterval);
+      document.getElementById('btnCapStart').disabled = false;
+      document.getElementById('btnCapStop').disabled  = true;
+      updateCapStats();  // final update
+      return;
+    }
+    const color = e.data.startsWith('[tcpdump]') ? '#4fc3f7'
+                : e.data.startsWith('[ERROR]')   ? '#ff4444' : '#c9d1d9';
+    capAppend(e.data, color);
+  };
+}
+
+async function stopCapture() {
+  if (!capId) return;
+  await fetch('/api/capture/stop/' + capId, {method: 'POST'});
+  if (capSse) capSse.close();
+  clearInterval(capStatsInterval);
+  capRunning = false;
+  document.getElementById('btnCapStart').disabled = false;
+  document.getElementById('btnCapStop').disabled  = true;
+  capAppend('\n[Captura detenida por el usuario]', '#ffcc00');
+  updateCapStats();  // final update
+}
+
+async function readCapture() {
+  const file   = document.getElementById('capReadFile').value.trim();
+  const filter = document.getElementById('capReadFilter').value.trim();
+  if (!file) { capAppend('[ERROR] Especifica la ruta del archivo .pcap', '#ff4444'); return; }
+  capClear();
+  capAppend('Leyendo archivo...', '#4fc3f7');
+  const r = await fetch('/api/capture/read', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({file, filter})
+  });
+  const j = await r.json();
+  if (j.error) { capAppend('[ERROR] ' + j.error, '#ff4444'); return; }
+  const sse = new EventSource('/api/capture/stream/' + j.cap_id);
+  sse.onmessage = e => {
+    if (e.data === '__DONE__') { sse.close(); return; }
+    const color = e.data.startsWith('[tcpdump]') ? '#4fc3f7'
+                : e.data.startsWith('[ERROR]')   ? '#ff4444' : '#a8ff78';
+    capAppend(e.data, color);
+  };
+}
+
+// ── IDS Suricata ─────────────────────────────────────────────────────────────
+let idsRunning = false, idsPoll = null, idsStatsPoll = null, idsAlertIdx = 0;
+let idsChartTime = null, idsChartSig = null, idsChartSev = null, idsChartSrc = null;
+const SEV_COLORS_IDS = {1:'#e57373',2:'#ffb74d',3:'#4fc3f7',0:'#8b949e'};
+const SEV_LABEL = {1:'HIGH',2:'MED',3:'LOW',0:'INFO'};
+
+function idsInitCharts() {
+  Chart.defaults.color = '#8b949e';
+  Chart.defaults.borderColor = '#21262d';
+  idsChartTime = new Chart(document.getElementById('idsChartTime').getContext('2d'), {
+    type:'line', data:{labels:[],datasets:[{label:'Alertas/s',data:[],borderColor:'#e57373',backgroundColor:'rgba(229,115,115,.15)',fill:true,tension:.3,pointRadius:0,borderWidth:1.5}]},
+    options:{animation:false,scales:{x:{ticks:{maxTicksLimit:10,callback:(v,i)=>{const d=new Date(parseInt(idsChartTime.data.labels[i])*1000);return d.toLocaleTimeString()}}},y:{beginAtZero:true,ticks:{precision:0}}},plugins:{legend:{display:false}}}
+  });
+  idsChartSig = new Chart(document.getElementById('idsChartSig').getContext('2d'), {
+    type:'bar', data:{labels:[],datasets:[{label:'Alertas',data:[],backgroundColor:['#e57373','#ffb74d','#4fc3f7','#81c784','#ce93d8','#fff176','#4dd0e1','#a1887f','#90a4ae','#f48fb1']}]},
+    options:{animation:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,ticks:{precision:0}}}}
+  });
+  idsChartSev = new Chart(document.getElementById('idsChartSev').getContext('2d'), {
+    type:'doughnut', data:{labels:['High (P1)','Medium (P2)','Low (P3)'],datasets:[{data:[0,0,0],backgroundColor:['#e57373','#ffb74d','#4fc3f7']}]},
+    options:{animation:false,plugins:{legend:{position:'right'}}}
+  });
+  idsChartSrc = new Chart(document.getElementById('idsChartSrc').getContext('2d'), {
+    type:'bar', data:{labels:[],datasets:[{label:'Alertas',data:[],backgroundColor:'#ce93d8'}]},
+    options:{animation:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+  });
+}
+function idsDestroyCharts(){[idsChartTime,idsChartSig,idsChartSev,idsChartSrc].forEach(c=>{if(c)c.destroy()});idsChartTime=idsChartSig=idsChartSev=idsChartSrc=null;}
+
+async function idsStart() {
+  const iface = document.getElementById('idsIface').value;
+  document.getElementById('idsAlertBody').innerHTML = '';
+  idsAlertIdx = 0;
+  document.getElementById('idsStatusText').textContent = 'Iniciando Suricata...';
+  const r = await fetch('/api/ids/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({iface})});
+  const j = await r.json();
+  if (j.error) { document.getElementById('idsStatusText').textContent = j.error; return; }
+  idsRunning = true;
+  document.getElementById('btnIdsStart').disabled = true;
+  document.getElementById('btnIdsStop').disabled  = false;
+  document.getElementById('idsCharts').style.display = 'grid';
+  idsDestroyCharts(); idsInitCharts();
+  document.getElementById('idsStatusText').textContent = 'Suricata activo';
+  document.getElementById('idsStatusText').style.color = '#81c784';
+  idsPoll      = setInterval(idsPollAlerts, 1500);
+  idsStatsPoll = setInterval(idsPollStats, 2500);
+}
+
+async function idsStop() {
+  await fetch('/api/ids/stop',{method:'POST'});
+  idsRunning = false;
+  clearInterval(idsPoll); clearInterval(idsStatsPoll);
+  document.getElementById('btnIdsStart').disabled = false;
+  document.getElementById('btnIdsStop').disabled  = true;
+  document.getElementById('idsStatusText').textContent = 'Detenido';
+  document.getElementById('idsStatusText').style.color = 'var(--dim)';
+  idsPollStats();
+}
+
+async function idsPollAlerts() {
+  try {
+    const r = await fetch('/api/ids/alerts?since='+idsAlertIdx);
+    const j = await r.json();
+    const tbody = document.getElementById('idsAlertBody');
+    const box = document.getElementById('idsAlertBox');
+    for (const a of j.alerts) {
+      const tr = document.createElement('tr');
+      const sc = SEV_COLORS_IDS[a.sev] || '#8b949e';
+      tr.innerHTML =
+        '<td style="padding:4px 8px;color:var(--dim);white-space:nowrap">'+a.t+'</td>'+
+        '<td style="padding:4px 8px;font-weight:bold;color:'+sc+'">'+(SEV_LABEL[a.sev]||'')+'</td>'+
+        '<td style="padding:4px 8px;color:#4fc3f7">'+a.src+'</td>'+
+        '<td style="padding:4px 8px;color:#81c784">'+a.dst+'</td>'+
+        '<td style="padding:4px 8px;color:var(--dim)">'+a.proto+'</td>'+
+        '<td style="padding:4px 8px;color:#c9d1d9;word-break:break-all">'+a.msg.replace(/</g,'&lt;')+'</td>';
+      tbody.appendChild(tr);
+    }
+    idsAlertIdx = j.total;
+    box.scrollTop = box.scrollHeight;
+    document.getElementById('idsTotalAlerts').textContent = j.total + ' alertas';
+    if (!j.running && idsRunning) {
+      idsRunning = false;
+      clearInterval(idsPoll); clearInterval(idsStatsPoll);
+      document.getElementById('btnIdsStart').disabled = false;
+      document.getElementById('btnIdsStop').disabled  = true;
+    }
+  } catch(e) {}
+}
+
+async function idsPollStats() {
+  try {
+    const r = await fetch('/api/ids/stats');
+    const d = await r.json();
+    idsChartTime.data.labels = d.labels;
+    idsChartTime.data.datasets[0].data = d.counts;
+    idsChartTime.update('none');
+    idsChartSig.data.labels = d.top_sig.map(x=>x[0]);
+    idsChartSig.data.datasets[0].data = d.top_sig.map(x=>x[1]);
+    idsChartSig.update('none');
+    idsChartSev.data.datasets[0].data = [d.severity.high, d.severity.medium, d.severity.low];
+    idsChartSev.update('none');
+    idsChartSrc.data.labels = d.top_src.map(x=>x[0]);
+    idsChartSrc.data.datasets[0].data = d.top_src.map(x=>x[1]);
+    idsChartSrc.update('none');
+  } catch(e) {}
+}
 
 window.onload = async () => {
   await loadProfiles();
@@ -1837,7 +2985,7 @@ async function startScan() {
   document.getElementById('btnStop').disabled = false;
   document.getElementById('progressBar').classList.add('running');
   // Hide export buttons during scan
-  ['btnPdf','btnTxt','btnJson','btnHtml'].forEach(id =>
+  ['btnPdf','btnTxt','btnJson','btnHtml','btnExec'].forEach(id =>
     document.getElementById(id).style.display = 'none');
   startTimer();
   streamScan(currentScanId);
@@ -1884,6 +3032,7 @@ function scanDone() {
   document.getElementById('btnTxt').style.display  = 'inline-flex';
   document.getElementById('btnJson').style.display = 'inline-flex';
   document.getElementById('btnHtml').style.display = 'inline-flex';
+  document.getElementById('btnExec').style.display = 'inline-flex';
 }
 
 function startTimer() {
@@ -2006,7 +3155,7 @@ function clearOutput() {
   clearFindings();
   document.getElementById('elapsedText').textContent = '';
   document.getElementById('scanStatus').textContent  = '';
-  ['btnPdf','btnTxt','btnJson','btnHtml'].forEach(id =>
+  ['btnPdf','btnTxt','btnJson','btnHtml','btnExec'].forEach(id =>
     document.getElementById(id).style.display = 'none');
   setStatus('Listo.');
 }
@@ -2030,6 +3179,7 @@ async function loadHistory() {
       <td><span class="badge ${s.done?'badge-done':'badge-run'}">${s.done?'Completado':'En curso'}</span></td>
       <td style="display:flex;gap:5px;flex-wrap:wrap">
         <button class="btn btn-pdf btn-sm" onclick="exportById('${s.id}','pdf')">&#x1F4C4; PDF</button>
+        <button class="btn btn-green btn-sm" onclick="exportById('${s.id}','exec')" title="Reporte ejecutivo para Gerencia">&#x1F4CA; Ejecutivo</button>
         <button class="btn btn-gray btn-sm" onclick="exportById('${s.id}','txt')">TXT</button>
         <button class="btn btn-gray btn-sm" onclick="replayScan('${s.id}')">Ver</button>
       </td>`;
@@ -2046,6 +3196,7 @@ function replayScan(id) {
   document.getElementById('btnTxt').style.display  = 'inline-flex';
   document.getElementById('btnJson').style.display = 'inline-flex';
   document.getElementById('btnHtml').style.display = 'inline-flex';
+  document.getElementById('btnExec').style.display = 'inline-flex';
 }
 
 function exportScan(fmt)      { exportById(currentScanId, fmt); }
@@ -2055,52 +3206,55 @@ function exportById(id, fmt)  {
 }
 
 // ── Ping ──────────────────────────────────────────────────────────────────────
-let pingSse = null;
+function _pingSetStatus(dot, text, color) {
+  document.getElementById('pingDot').className = 'ping-dot ' + dot;
+  const st = document.getElementById('pingStatusText');
+  st.textContent = text;
+  st.style.color = color || 'var(--dim)';
+}
+
+function _pingAppendLine(text, type) {
+  const out = document.getElementById('pingOutput');
+  const cls = {success:'ping-line-success', error:'ping-line-error',
+               header:'ping-line-header', info:'ping-line-info'}[type] || 'ping-line-info';
+  const div = document.createElement('div');
+  div.className = 'ping-console-line ' + cls;
+  div.textContent = text;
+  out.appendChild(div);
+  out.scrollTop = out.scrollHeight;
+}
 
 function doPing() {
   const host  = document.getElementById('pingHost').value.trim();
   const count = document.getElementById('pingCount').value;
   if (!host) { document.getElementById('pingHost').focus(); return; }
 
-  if (pingSse) { pingSse.close(); pingSse = null; }
-
   const out = document.getElementById('pingOutput');
   const btn = document.getElementById('btnPing');
-  out.innerHTML = `<span class="ping-dot waiting"></span><span style="color:var(--dim)">Enviando ping a ${esc(host)}...</span>`;
+
+  // Reset console
+  out.innerHTML = '';
+  out.classList.add('visible');
   btn.classList.add('running');
   btn.disabled = true;
+  _pingSetStatus('waiting', `Enviando ping a ${host}...`, 'var(--dim)');
 
-  // Pre-fill target field with pinged host
-  const targetField = document.getElementById('inTarget');
-  if (!targetField.value) targetField.value = host;
-
-  // Use fetch + SSE
-  pingSse = new EventSource(`/api/ping?_=${Date.now()}`);
-
-  // We trigger via fetch POST then open SSE — instead do both in one request via EventSource workaround
-  // Actually send POST first, then read stream
-  pingSse.close();
+  // Pre-fill scan target
+  const tf = document.getElementById('inTarget');
+  if (!tf.value) tf.value = host;
 
   fetch('/api/ping', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({host, count: parseInt(count)})
   }).then(res => {
-    const reader = res.body.getReader();
+    const reader  = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-    let lastLine = null;
-    let success = null;
-
-    out.innerHTML = '';
 
     function readChunk() {
       reader.read().then(({done, value}) => {
-        if (done) {
-          btn.classList.remove('running');
-          btn.disabled = false;
-          return;
-        }
+        if (done) { btn.classList.remove('running'); btn.disabled = false; return; }
         buf += decoder.decode(value, {stream: true});
         const parts = buf.split('\n\n');
         buf = parts.pop();
@@ -2109,37 +3263,16 @@ function doPing() {
           if (!m) return;
           try {
             const d = JSON.parse(m[1]);
-            lastLine = d;
             if (d.done) {
-              success = d.type === 'success';
-              // Show final status badge
-              const dot = document.createElement('span');
-              dot.className = 'ping-dot ' + (success ? 'ok' : 'fail');
-              const msg = document.createElement('span');
-              msg.className = success ? 'ping-line-success' : 'ping-line-error';
-              msg.textContent = d.line;
-              out.innerHTML = '';
-              out.appendChild(dot);
-              out.appendChild(msg);
-              // Show full log in tooltip / title
+              const ok = d.type === 'success';
+              _pingSetStatus(ok ? 'ok' : 'fail', d.line, ok ? 'var(--green)' : 'var(--red)');
+              _pingAppendLine(d.line, d.type);
               btn.classList.remove('running');
               btn.disabled = false;
-              setStatus(success
-                ? `✓ ${host} responde al ping`
-                : `✗ ${host} no responde`);
+              setStatus(ok ? `✓ ${host} responde al ping` : `✗ ${host} no responde`);
             } else {
-              // Accumulate last meaningful line
-              const span = document.createElement('span');
-              const cls = {success:'ping-line-success',error:'ping-line-error',
-                           header:'ping-line-header',info:'ping-line-info'}[d.type] || 'ping-line-info';
-              span.className = cls;
-              span.textContent = d.line;
-              // Only show last line in the bar (space limited)
-              out.innerHTML = '';
-              const dot = document.createElement('span');
-              dot.className = 'ping-dot waiting';
-              out.appendChild(dot);
-              out.appendChild(span);
+              _pingAppendLine(d.line, d.type);
+              _pingSetStatus('waiting', d.line, 'var(--dim)');
             }
           } catch {}
         });
@@ -2148,16 +3281,19 @@ function doPing() {
     }
     readChunk();
   }).catch(e => {
-    out.innerHTML = `<span class="ping-dot fail"></span><span class="ping-line-error">Error: ${esc(String(e))}</span>`;
+    _pingAppendLine('Error de conexión: ' + String(e), 'error');
+    _pingSetStatus('fail', 'Error', 'var(--red)');
     btn.classList.remove('running');
     btn.disabled = false;
   });
 }
 
 function clearPing() {
-  document.getElementById('pingOutput').innerHTML =
-    '<span style="color:var(--dim)">Introduce una IP o hostname y pulsa Ping.</span>';
+  const out = document.getElementById('pingOutput');
+  out.innerHTML = '';
+  out.classList.remove('visible');
   document.getElementById('pingHost').value = '';
+  _pingSetStatus('waiting', 'Introduce una IP y pulsa Ping', 'var(--dim)');
 }
 
 function setStatus(msg) { document.getElementById('statusText').textContent = msg; }

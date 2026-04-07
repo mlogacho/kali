@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reporte Ejecutivo de Vulnerabilidades — {{client}}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    background: #F4F6F9;
+    color: #1A1A2E;
+  }
+  .page {
+    max-width: 900px;
+    margin: 32px auto;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.10);
+    overflow: hidden;
+  }
+
+  /* ── HEADER ── */
+  .report-header {
+    background: linear-gradient(135deg, #0D1B2A 0%, #1B3556 100%);
+    color: #fff;
+    padding: 36px 40px 28px;
+  }
+  .header-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  .header-logo { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: #7BAFD4; font-weight: 600; }
+  .report-title { font-size: 22px; font-weight: 700; margin: 6px 0 2px; letter-spacing: -0.3px; }
+  .report-subtitle { font-size: 13px; color: #A8C4DC; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+
+  .badge {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .badge-vpn   { background: #1E4D78; color: #7EC8E3; border: 1px solid #2A6099; }
+  .badge-risk-critico  { background: #A32D2D; color: #fff; border: 1px solid #c84040; }
+  .badge-risk-alto     { background: #854F0B; color: #fff; border: 1px solid #b06a10; }
+  .badge-risk-moderado { background: #7D6008; color: #fff; border: 1px solid #a8820a; }
+  .badge-risk-bajo     { background: #3B6D11; color: #fff; border: 1px solid #5a9e1a; }
+
+  .header-meta {
+    margin-top: 22px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px 24px;
+  }
+  .meta-item { }
+  .meta-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: #7BAFD4; font-weight: 600; }
+  .meta-value { font-size: 13px; color: #E8F1F8; font-weight: 500; }
+
+  /* ── BODY ── */
+  .report-body { padding: 32px 40px; }
+
+  .section { margin-bottom: 36px; }
+  .section-title {
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    color: #5C6B8A;
+    border-bottom: 2px solid #E8ECF2;
+    padding-bottom: 8px;
+    margin-bottom: 18px;
+  }
+
+  /* ── METRIC CARDS ── */
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 680px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+  .card {
+    border-radius: 8px;
+    padding: 18px 16px 14px;
+    text-align: center;
+    border-width: 1px;
+    border-style: solid;
+  }
+  .card-num   { font-size: 36px; font-weight: 800; line-height: 1; }
+  .card-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.09em; margin-top: 5px; }
+
+  .card-hosts    { background:#E6F1FB; border-color:#B5D4F4; color:#185FA5; }
+  .card-critico  { background:#FCEBEB; border-color:#F09595; color:#A32D2D; }
+  .card-alto     { background:#FAEEDA; border-color:#FAC775; color:#854F0B; }
+  .card-medio    { background:#E6F1FB; border-color:#B5D4F4; color:#185FA5; }
+
+  /* ── CHART ── */
+  .chart-wrap { padding: 6px 0; }
+  .chart-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .chart-label { width: 78px; font-size: 12px; font-weight: 600; text-align: right; flex-shrink: 0; }
+  .chart-bar-bg { flex: 1; background: #F0F2F6; border-radius: 4px; height: 26px; overflow: hidden; position: relative; }
+  .chart-bar { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 8px; font-size: 12px; font-weight: 700; color: #fff; min-width: 28px; transition: width 0.3s; }
+  .chart-count { font-size: 13px; font-weight: 700; width: 28px; text-align: left; flex-shrink: 0; }
+
+  .bar-critico  { background: #C94040; }
+  .bar-alto     { background: #D4780A; }
+  .bar-medio    { background: #2274C8; }
+  .bar-bajo     { background: #4E9E1A; }
+  .label-critico { color: #A32D2D; }
+  .label-alto    { color: #854F0B; }
+  .label-medio   { color: #185FA5; }
+  .label-bajo    { color: #3B6D11; }
+
+  /* ── HOST CARDS ── */
+  .hosts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+  .host-card {
+    border-radius: 8px;
+    border: 1px solid #E0E6EF;
+    border-left-width: 5px;
+    padding: 14px 16px;
+    background: #FAFBFD;
+  }
+  .host-card.risk-high   { border-left-color: #C94040; }
+  .host-card.risk-medium { border-left-color: #D4780A; }
+  .host-card.risk-low    { border-left-color: #2274C8; }
+  .host-ip { font-size: 15px; font-weight: 700; color: #1A1A2E; font-family: 'SF Mono', 'Fira Code', monospace; }
+  .host-score { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #8A94A6; margin: 2px 0 8px; }
+  .host-services { display: flex; flex-wrap: wrap; gap: 5px; }
+  .service-tag {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-weight: 500;
+    background: #E6EDF6;
+    color: #3B5278;
+  }
+  .service-tag.danger { background: #FCEBEB; color: #A32D2D; }
+  .service-tag.warn   { background: #FAEEDA; color: #854F0B; }
+
+  /* ── ACTION ITEMS ── */
+  .actions-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+  .action-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 14px 16px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-style: solid;
+  }
+  .action-tag {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 3px 10px;
+    border-radius: 20px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .action-text { font-size: 13px; line-height: 1.5; }
+
+  .action-urgente { background:#FCEBEB; border-color:#F09595; }
+  .action-urgente .action-tag { background:#A32D2D; color:#fff; }
+  .action-urgente .action-text { color:#5A1515; }
+
+  .action-2semanas { background:#FAEEDA; border-color:#FAC775; }
+  .action-2semanas .action-tag { background:#854F0B; color:#fff; }
+  .action-2semanas .action-text { color:#4A2B05; }
+
+  .action-30dias { background:#E6F1FB; border-color:#B5D4F4; }
+  .action-30dias .action-tag { background:#185FA5; color:#fff; }
+  .action-30dias .action-text { color:#0D2E4E; }
+
+  /* ── FOOTER ── */
+  .report-footer {
+    background: #F0F2F6;
+    border-top: 1px solid #DDE2EC;
+    padding: 20px 40px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .footer-meta { font-size: 11px; color: #5C6B8A; line-height: 1.8; }
+  .footer-meta strong { color: #1A1A2E; }
+  .footer-confidential {
+    font-size: 10px;
+    color: #8A94A6;
+    text-align: right;
+    max-width: 260px;
+    line-height: 1.5;
+  }
+  .confidential-badge {
+    display: inline-block;
+    background: #1A1A2E;
+    color: #fff;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 3px;
+    margin-bottom: 4px;
+  }
+
+  /* ── PRINT ── */
+  @media print {
+    body { background: #fff; }
+    .page { box-shadow: none; border-radius: 0; margin: 0; }
+    .report-header { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .card, .host-card, .action-item, .chart-bar { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ══════════════════════════════════════════════
+       1. HEADER
+  ══════════════════════════════════════════════ -->
+  <header class="report-header">
+    <div class="header-top">
+      <div>
+        <div class="header-logo">Reporte Ejecutivo de Seguridad</div>
+        <div class="report-title">Análisis de Vulnerabilidades de Red</div>
+        <div class="report-subtitle">{{client}} &mdash; Gerencia General</div>
+      </div>
+      <div class="badges">
+        <span class="badge badge-vpn">VPN: {{vpn_interface}}</span>
+        <!-- RISK BADGE: replace class and text based on overall risk logic -->
+        <span class="badge badge-risk-critico" id="overall-risk-badge">RIESGO: CRÍTICO</span>
+      </div>
+    </div>
+    <div class="header-meta">
+      <div class="meta-item">
+        <div class="meta-label">Cliente</div>
+        <div class="meta-value">{{client}}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Objetivo</div>
+        <div class="meta-value">{{target}}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Fecha de escaneo</div>
+        <div class="meta-value">{{start_time}}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Ingeniero responsable</div>
+        <div class="meta-value">{{engineer}}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">ID de escaneo</div>
+        <div class="meta-value" style="font-family:monospace;font-size:12px;">{{scan_id}}</div>
+      </div>
+    </div>
+  </header>
+
+  <div class="report-body">
+
+    <!-- ══════════════════════════════════════════════
+         2. RESUMEN EJECUTIVO (METRIC CARDS)
+    ══════════════════════════════════════════════ -->
+    <section class="section">
+      <div class="section-title">Resumen Ejecutivo</div>
+      <div class="cards">
+        <div class="card card-hosts">
+          <div class="card-num" id="cnt-hosts">{{hosts_count}}</div>
+          <div class="card-label">Hosts Activos</div>
+        </div>
+        <div class="card card-critico">
+          <div class="card-num" id="cnt-critical">{{critical_count}}</div>
+          <div class="card-label">Críticos</div>
+        </div>
+        <div class="card card-alto">
+          <div class="card-num" id="cnt-high">{{high_count}}</div>
+          <div class="card-label">Altos</div>
+        </div>
+        <div class="card card-medio">
+          <div class="card-num" id="cnt-medium">{{medium_count}}</div>
+          <div class="card-label">Medios</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════
+         3. DISTRIBUCIÓN DE RIESGO (INLINE SVG BAR CHART)
+    ══════════════════════════════════════════════ -->
+    <section class="section">
+      <div class="section-title">Distribución de Riesgo</div>
+      <div class="chart-wrap">
+
+        <!-- CRÍTICO -->
+        <div class="chart-row">
+          <span class="chart-label label-critico">CRÍTICO</span>
+          <div class="chart-bar-bg">
+            <div class="chart-bar bar-critico" style="width: {{pct_critical}}%;">
+              <!-- bar fill width = (count / max_count * 100)% — set inline at generation time -->
+            </div>
+          </div>
+          <span class="chart-count label-critico">{{critical_count}}</span>
+        </div>
+
+        <!-- ALTO -->
+        <div class="chart-row">
+          <span class="chart-label label-alto">ALTO</span>
+          <div class="chart-bar-bg">
+            <div class="chart-bar bar-alto" style="width: {{pct_high}}%;">
+            </div>
+          </div>
+          <span class="chart-count label-alto">{{high_count}}</span>
+        </div>
+
+        <!-- MEDIO -->
+        <div class="chart-row">
+          <span class="chart-label label-medio">MEDIO</span>
+          <div class="chart-bar-bg">
+            <div class="chart-bar bar-medio" style="width: {{pct_medium}}%;">
+            </div>
+          </div>
+          <span class="chart-count label-medio">{{medium_count}}</span>
+        </div>
+
+        <!-- BAJO -->
+        <div class="chart-row">
+          <span class="chart-label label-bajo">BAJO</span>
+          <div class="chart-bar-bg">
+            <div class="chart-bar bar-bajo" style="width: {{pct_low}}%;">
+            </div>
+          </div>
+          <span class="chart-count label-bajo">{{low_count}}</span>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════
+         4. HOSTS PRIORITARIOS (top 6 by risk heuristic)
+    ══════════════════════════════════════════════ -->
+    <section class="section">
+      <div class="section-title">Hosts Prioritarios</div>
+      <div class="hosts-grid">
+
+        <!--
+          Scoring heuristic (calculated at generation time):
+            +3: Telnet, FTP, VNC, RDP, MySQL, MSSQL
+            +2: SMTP, POP3, IMAP, Shell, RPCbind
+            +1: HTTP, SSH, HTTPS
+          Border color:
+            score >= 6  → risk-high   (red)
+            score  3-5  → risk-medium (orange)
+            score  1-2  → risk-low    (blue)
+        -->
+
+        <!-- Example host card — repeat for each of top-6 hosts -->
+        <div class="host-card risk-high">
+          <div class="host-ip">{{host_ip_1}}</div>
+          <div class="host-score">Puntuación de riesgo: {{score_1}}</div>
+          <div class="host-services">
+            <span class="service-tag danger">Escritorio Remoto (RDP)</span>
+            <span class="service-tag danger">Base de Datos MySQL</span>
+            <span class="service-tag warn">Acceso Shell</span>
+            <span class="service-tag">Web HTTP</span>
+          </div>
+        </div>
+
+        <div class="host-card risk-high">
+          <div class="host-ip">{{host_ip_2}}</div>
+          <div class="host-score">Puntuación de riesgo: {{score_2}}</div>
+          <div class="host-services">
+            <span class="service-tag danger">Telnet (sin cifrado)</span>
+            <span class="service-tag danger">FTP (sin cifrado)</span>
+            <span class="service-tag">Correo SMTP</span>
+          </div>
+        </div>
+
+        <div class="host-card risk-medium">
+          <div class="host-ip">{{host_ip_3}}</div>
+          <div class="host-score">Puntuación de riesgo: {{score_3}}</div>
+          <div class="host-services">
+            <span class="service-tag danger">Control Remoto VNC</span>
+            <span class="service-tag">Correo IMAP</span>
+          </div>
+        </div>
+
+        <div class="host-card risk-medium">
+          <div class="host-ip">{{host_ip_4}}</div>
+          <div class="host-score">Puntuación de riesgo: {{score_4}}</div>
+          <div class="host-services">
+            <span class="service-tag warn">Compartición de Archivos (SMB)</span>
+            <span class="service-tag warn">RPC</span>
+          </div>
+        </div>
+
+        <div class="host-card risk-low">
+          <div class="host-ip">{{host_ip_5}}</div>
+          <div class="host-score">Puntuación de riesgo: {{score_5}}</div>
+          <div class="host-services">
+            <span class="service-tag">Web HTTPS</span>
+            <span class="service-tag">Acceso SSH</span>
+          </div>
+        </div>
+
+        <div class="host-card risk-low">
+          <div class="host-ip">{{host_ip_6}}</div>
+          <div class="host-score">Puntuación de riesgo: {{score_6}}</div>
+          <div class="host-services">
+            <span class="service-tag">Web HTTP</span>
+            <span class="service-tag">Acceso SSH</span>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════
+         5. ACCIONES EJECUTIVAS RECOMENDADAS
+    ══════════════════════════════════════════════ -->
+    <section class="section">
+      <div class="section-title">Acciones Recomendadas para Gerencia</div>
+      <ul class="actions-list">
+
+        <!--
+          Rules (evaluated at generation time from discovered services):
+          telnet/ftp present      → URGENTE
+          rdp exposed             → URGENTE
+          mysql/mssql/postgresql  → URGENTE
+          vnc open                → 2 SEMANAS
+          smb/netbios             → 2 SEMANAS
+          mixed devices           → 30 DÍAS
+          always last             → 30 DÍAS (re-scan)
+        -->
+
+        <li class="action-item action-urgente">
+          <span class="action-tag">URGENTE</span>
+          <span class="action-text">Deshabilitar protocolos sin cifrado (Telnet y FTP) en todos los equipos afectados y reemplazarlos por alternativas seguras: SSH para administración remota y SFTP para transferencia de archivos.</span>
+        </li>
+
+        <li class="action-item action-urgente">
+          <span class="action-tag">URGENTE</span>
+          <span class="action-text">Proteger el acceso remoto al escritorio (RDP) con autenticación de doble factor y restringir las conexiones únicamente a redes internas autorizadas.</span>
+        </li>
+
+        <li class="action-item action-urgente">
+          <span class="action-tag">URGENTE</span>
+          <span class="action-text">Bloquear el acceso directo a las bases de datos desde la red general mediante reglas de cortafuegos. Solo los servidores de aplicación autorizados deben poder conectarse.</span>
+        </li>
+
+        <li class="action-item action-2semanas">
+          <span class="action-tag">2 SEMANAS</span>
+          <span class="action-text">Auditar todos los equipos con control remoto de pantalla (VNC) activo: verificar que cuentan con contraseña fuerte y que el acceso está limitado a usuarios específicos.</span>
+        </li>
+
+        <li class="action-item action-2semanas">
+          <span class="action-tag">2 SEMANAS</span>
+          <span class="action-text">Revisar la configuración de compartición de archivos en red (Windows/SMB): este protocolo es el vector de entrada más común en ataques de ransomware. Deshabilitar en equipos que no lo necesiten.</span>
+        </li>
+
+        <li class="action-item action-30dias">
+          <span class="action-tag">30 DÍAS</span>
+          <span class="action-text">Segmentar la red en zonas separadas (VLANs) según el tipo de dispositivo: servidores, equipos de usuario, cámaras, impresoras y teléfonos IP. Esto limita el impacto de cualquier incidente futuro.</span>
+        </li>
+
+        <li class="action-item action-30dias">
+          <span class="action-tag">30 DÍAS</span>
+          <span class="action-text">Repetir el escaneo de seguridad en 30 días para verificar que las acciones correctivas han sido implementadas y medir la reducción del riesgo.</span>
+        </li>
+
+      </ul>
+    </section>
+
+  </div><!-- /report-body -->
+
+  <!-- ══════════════════════════════════════════════
+       6. FOOTER
+  ══════════════════════════════════════════════ -->
+  <footer class="report-footer">
+    <div class="footer-meta">
+      <div><strong>Perfil de escaneo:</strong> {{scan_profile}}</div>
+      <div><strong>Duración:</strong> {{start_time}} &rarr; {{end_time}}</div>
+      <div><strong>Herramienta:</strong> Nmap — versión detectada en escaneo</div>
+      <div><strong>Ingeniero:</strong> {{engineer}} &nbsp;|&nbsp; <strong>ID:</strong> <span style="font-family:monospace;">{{scan_id}}</span></div>
+    </div>
+    <div class="footer-confidential">
+      <div class="confidential-badge">Confidencial</div>
+      <div>Este documento contiene información sensible sobre la infraestructura de {{client}}. Su distribución está restringida a la Gerencia General y al equipo de TI autorizado.</div>
+    </div>
+  </footer>
+
+</div><!-- /page -->
+</body>
+</html>
