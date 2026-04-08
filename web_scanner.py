@@ -1824,6 +1824,11 @@ tun:
   drop_multicast: false
   tx_queue: 500
   mtu: 1300
+  # Para exponer tu red local al servidor Kali, descomenta y ajusta:
+  # unsafe_routes:
+  #   - route: 10.11.121.0/24   # tu subnet local
+  #     via: <TU_IP_NEBULA>      # tu IP en la VPN Nebula (ej: 192.168.100.12)
+  #     mtu: 1300
 
 logging:
   level: info
