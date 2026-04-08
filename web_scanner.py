@@ -1818,7 +1818,8 @@ relay:
 
 tun:
   disabled: false
-  dev: nebula0
+  # macOS: debe ser utun o utun[0-9]+  |  Linux: puede ser nebula0 o cualquier nombre
+  dev: utun
   drop_local_broadcast: false
   drop_multicast: false
   tx_queue: 500
