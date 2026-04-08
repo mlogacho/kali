@@ -1846,6 +1846,23 @@ firewall:
       host: any
 """
 
+@app.route("/api/nebula/manual/windows")
+def api_nebula_manual_windows():
+    """Genera y descarga el manual PDF de Nebula VPN para Windows."""
+    import importlib.util
+    script = os.path.join(os.path.dirname(__file__), "generar_manual_nebula_windows.py")
+    output = os.path.join(UPLOAD_DIR, "Nebula-Windows-Manual-ES.pdf")
+    try:
+        spec = importlib.util.spec_from_file_location("nebula_win_manual", script)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.build_pdf(output)
+        return send_file(output, as_attachment=True,
+                         download_name="Nebula-Windows-Manual-ES.pdf",
+                         mimetype="application/pdf")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
 @app.route("/api/ping", methods=["POST"])
 def api_ping():
     data   = request.json or {}
@@ -2831,7 +2848,13 @@ select option{background:var(--bg3)}
   <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px;flex:1">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
       <h3 style="color:var(--blue);font-size:.95rem;margin:0">&#x1F4C1; Certificados Emitidos</h3>
-      <button class="btn btn-gray btn-sm" onclick="loadNebulaCerts()">&#x21BB; Refrescar</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <a href="/api/nebula/manual/windows" class="btn btn-blue btn-sm"
+           title="Generar y descargar manual PDF de Nebula VPN para Windows">
+          &#x1F4CB; Manual Windows PDF
+        </a>
+        <button class="btn btn-gray btn-sm" onclick="loadNebulaCerts()">&#x21BB; Refrescar</button>
+      </div>
     </div>
     <div id="nebulaCertsWrap" style="overflow-x:auto">
       <table class="history-table" style="min-width:700px">
