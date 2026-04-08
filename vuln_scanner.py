@@ -12,7 +12,7 @@ import paramiko
 import os, datetime, json, re, queue, time
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
-DEFAULT_HOST = "18.117.130.45"
+DEFAULT_HOST = "3.143.18.161"
 DEFAULT_USER = "kali"
 DEFAULT_KEY  = os.path.join(os.path.dirname(__file__), "kali-aws.pem")
 CLIENTS_FILE = os.path.join(os.path.dirname(__file__), "clients.json")

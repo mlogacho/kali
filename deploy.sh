@@ -2,7 +2,7 @@
 # Deploy Kali VPN Vulnerability Scanner al servidor AWS
 # Uso: ./deploy.sh
 
-KALI_HOST="18.117.130.45"
+KALI_HOST="3.143.18.161"
 KALI_USER="kali"
 KEY="./kali-aws.pem"
 REMOTE_DIR="/opt/scanner"
@@ -23,7 +23,7 @@ echo "[2/4] Subiendo web_scanner.py..."
 $SCP web_scanner.py $KALI_USER@$KALI_HOST:$REMOTE_DIR/web_scanner.py
 
 echo "[3/4] Instalando dependencias en Kali..."
-$SSH "pip3 install flask --quiet 2>/dev/null || sudo pip3 install flask --quiet"
+$SSH "python3 -c 'import flask' 2>/dev/null || sudo apt-get install -y python3-flask --quiet"
 
 echo "[4/4] Configurando servicio systemd..."
 $SSH "sudo tee /etc/systemd/system/vuln-scanner.service > /dev/null <<'EOF'

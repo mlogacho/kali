@@ -211,7 +211,7 @@ def build_pdf():
         ["Versión",   "1.0"],
         ["Fecha",     "Marzo 2026"],
         ["Autor",     "Datacom Security"],
-        ["Servidor",  "18.117.130.45 (AWS us-east-2)"],
+        ["Servidor",  "3.143.18.161 (AWS us-east-2)"],
         ["Puerto",    "8040"],
     ]
     t = Table(meta, colWidths=[3.5*cm, 10*cm])
@@ -283,7 +283,7 @@ def build_pdf():
 
     arch = [
         ["Capa", "Componente", "Descripción"],
-        ["1 — Acceso", "Navegador web", "El usuario accede a http://18.117.130.45:8040 desde cualquier dispositivo"],
+        ["1 — Acceso", "Navegador web", "El usuario accede a http://3.143.18.161:8040 desde cualquier dispositivo"],
         ["2 — Plataforma", "Flask (Kali AWS)", "Servidor web Python que gestiona clientes, VPN y escaneos"],
         ["3 — Túnel VPN", "OpenVPN / WireGuard", "El Kali se conecta a la red interna del cliente"],
         ["4 — Escaneo", "nmap · nikto · vulners", "Las herramientas analizan la red desde dentro del perímetro"],
@@ -295,7 +295,7 @@ def build_pdf():
         ["Parámetro", "Valor"],
         ["Instancia AWS", "i-0149996bf2a11dbdd"],
         ["Tipo de instancia", "t3.micro — us-east-2"],
-        ["IP Pública", "18.117.130.45"],
+        ["IP Pública", "3.143.18.161"],
         ["Sistema Operativo", "Kali Linux 2025.4 amd64"],
         ["Puerto de la aplicación", "8040 (TCP)"],
         ["Servicio systemd", "vuln-scanner"],
@@ -315,7 +315,7 @@ def build_pdf():
     story.append(Paragraph("Requisitos del usuario (cliente):", st["h2"]))
     for item in [
         "Navegador web moderno: Chrome, Firefox, Edge o Safari",
-        "Acceso a internet o red con visibilidad a 18.117.130.45:8040",
+        "Acceso a internet o red con visibilidad a 3.143.18.161:8040",
         "Archivo de configuración VPN del cliente (.ovpn o .conf de WireGuard)",
         "Credenciales VPN del cliente (si aplica)",
     ]:
@@ -346,7 +346,7 @@ def build_pdf():
     story.append(hr())
     story.append(Paragraph(
         "Abre tu navegador web e ingresa la siguiente URL:", st["body"]))
-    story.append(Paragraph("http://18.117.130.45:8040", st["code"]))
+    story.append(Paragraph("http://3.143.18.161:8040", st["code"]))
     story.append(Paragraph(
         "La interfaz cargará automáticamente. No requiere login — asegúrate de que "
         "el acceso al puerto 8040 esté restringido a IPs autorizadas en el Security Group de AWS.",
@@ -636,13 +636,13 @@ def build_pdf():
     cmds = [
         ["Acción", "Comando SSH"],
         ["Ver estado del servicio",
-         "ssh -i kali-aws.pem kali@18.117.130.45 'sudo systemctl status vuln-scanner'"],
+         "ssh -i kali-aws.pem kali@3.143.18.161 'sudo systemctl status vuln-scanner'"],
         ["Ver logs en tiempo real",
-         "ssh -i kali-aws.pem kali@18.117.130.45 'sudo journalctl -u vuln-scanner -f'"],
+         "ssh -i kali-aws.pem kali@3.143.18.161 'sudo journalctl -u vuln-scanner -f'"],
         ["Reiniciar el servicio",
-         "ssh -i kali-aws.pem kali@18.117.130.45 'sudo systemctl restart vuln-scanner'"],
+         "ssh -i kali-aws.pem kali@3.143.18.161 'sudo systemctl restart vuln-scanner'"],
         ["Detener el servicio",
-         "ssh -i kali-aws.pem kali@18.117.130.45 'sudo systemctl stop vuln-scanner'"],
+         "ssh -i kali-aws.pem kali@3.143.18.161 'sudo systemctl stop vuln-scanner'"],
         ["Redesplegar la aplicación",
          "cd ~/Documents/Kali && ./deploy.sh"],
     ]
