@@ -1548,7 +1548,7 @@ def api_nebula_setup():
     """Inicializa la PKI Nebula: descarga binario (si falta) y genera CA + cert del servidor."""
     data      = request.json or {}
     ca_name   = data.get("ca_name", "Datacom Security Nebula CA")
-    server_ip = data.get("server_ip", "10.0.0.1/24")
+    server_ip = data.get("server_ip", "192.168.100.1/24")
     dur       = data.get("duration", "87600h")
 
     def generate():
@@ -1795,13 +1795,13 @@ pki:
   key: /etc/nebula/{name}.key
 
 static_host_map:
-  "10.0.0.1": ["{server_ip}:4242"]
+  "192.168.100.1": ["{server_ip}:4242"]
 
 lighthouse:
   am_lighthouse: false
   interval: 60
   hosts:
-    - "10.0.0.1"
+    - "192.168.100.1"
 
 listen:
   host: 0.0.0.0
@@ -2780,7 +2780,7 @@ select option{background:var(--bg3)}
       </div>
       <div class="form-group" style="min-width:170px">
         <label>IP del servidor (lighthouse)</label>
-        <input id="ni_server_ip" value="10.0.0.1/24">
+        <input id="ni_server_ip" value="192.168.100.1/24">
       </div>
       <div class="form-group" style="min-width:110px">
         <label>Duración CA</label>
