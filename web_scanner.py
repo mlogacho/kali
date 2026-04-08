@@ -16,8 +16,8 @@ UPLOAD_DIR       = "/opt/scanner/vpn_configs"
 SCANS_DIR        = "/opt/scanner/scans"
 NEBULA_BIN       = "/opt/nebula/nebula"
 NEBULA_CERT_BIN  = "/opt/nebula/nebula-cert"
-NEBULA_CERTS_DIR = "/etc/nebula/certs"
-NEBULA_CONFIG_DIR= "/etc/nebula"
+NEBULA_CERTS_DIR = "/opt/nebula"        # CA y certs viven aquí (nebula-setup los crea aquí)
+NEBULA_CONFIG_DIR= "/opt/nebula"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(SCANS_DIR,  exist_ok=True)
@@ -1543,6 +1543,87 @@ def _nebula_cert_info(cert_file: str) -> dict:
             info["is_ca"] = True
     return info
 
+@app.route("/api/nebula/setup", methods=["POST"])
+def api_nebula_setup():
+    """Inicializa la PKI Nebula: descarga binario (si falta) y genera CA + cert del servidor."""
+    data      = request.json or {}
+    ca_name   = data.get("ca_name", "Datacom Security Nebula CA")
+    server_ip = data.get("server_ip", "10.0.0.1/24")
+    dur       = data.get("duration", "87600h")
+
+    def generate():
+        def send(msg, cls=""):
+            yield f"data: {json.dumps({'msg': msg, 'cls': cls})}\n\n"
+
+        yield from send("▶ Iniciando setup de Nebula PKI...")
+
+        # ── 1. Verificar / instalar binario ──────────────────────────────────
+        if not os.path.exists(NEBULA_CERT_BIN):
+            yield from send("⬇ nebula-cert no encontrado. Descargando Nebula v1.9.5...", "warn")
+            ver = "v1.9.5"
+            url = f"https://github.com/slackhq/nebula/releases/download/{ver}/nebula-linux-amd64.tar.gz"
+            dl = subprocess.run(
+                ["sudo","bash","-c",
+                 f"mkdir -p /opt/nebula && curl -fsSL '{url}' | tar -xz -C /opt/nebula && "
+                 f"chmod +x /opt/nebula/nebula /opt/nebula/nebula-cert"],
+                capture_output=True, text=True)
+            if dl.returncode != 0:
+                yield from send(f"✗ Error descargando Nebula: {dl.stderr}", "error")
+                yield "data: {\"done\":true,\"error\":true}\n\n"
+                return
+            yield from send("✓ Nebula instalado en /opt/nebula/", "ok")
+        else:
+            yield from send(f"✓ nebula-cert encontrado: {NEBULA_CERT_BIN}", "ok")
+
+        # ── 2. Generar CA ─────────────────────────────────────────────────────
+        ca_crt = os.path.join(NEBULA_CERTS_DIR, "ca.crt")
+        ca_key = os.path.join(NEBULA_CERTS_DIR, "ca.key")
+        if os.path.exists(ca_crt):
+            yield from send(f"✓ CA ya existe en {ca_crt} — omitiendo generación", "ok")
+        else:
+            yield from send(f"🔑 Generando CA: '{ca_name}'...")
+            r = subprocess.run(
+                ["sudo", NEBULA_CERT_BIN, "ca",
+                 "-name", ca_name, "-duration", dur,
+                 "-out-crt", ca_crt, "-out-key", ca_key],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                yield from send(f"✗ Error generando CA: {r.stderr}", "error")
+                yield "data: {\"done\":true,\"error\":true}\n\n"
+                return
+            subprocess.run(["sudo","chmod","600", ca_key], capture_output=True)
+            yield from send(f"✓ CA generada: {ca_crt}", "ok")
+
+        # ── 3. Generar cert del servidor (lighthouse) ─────────────────────────
+        srv_crt = os.path.join(NEBULA_CERTS_DIR, "kali-server.crt")
+        srv_key = os.path.join(NEBULA_CERTS_DIR, "kali-server.key")
+        if os.path.exists(srv_crt):
+            yield from send(f"✓ Cert servidor ya existe en {srv_crt} — omitiendo", "ok")
+        else:
+            yield from send(f"🔑 Generando certificado del servidor ({server_ip})...")
+            r = subprocess.run(
+                ["sudo", NEBULA_CERT_BIN, "sign",
+                 "-ca-crt", ca_crt, "-ca-key", ca_key,
+                 "-name", "kali-lighthouse",
+                 "-ip", server_ip, "-groups", "lighthouse,servers",
+                 "-duration", dur,
+                 "-out-crt", srv_crt, "-out-key", srv_key],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                yield from send(f"✗ Error generando cert servidor: {r.stderr}", "error")
+                yield "data: {\"done\":true,\"error\":true}\n\n"
+                return
+            subprocess.run(["sudo","chmod","600", srv_key], capture_output=True)
+            yield from send(f"✓ Cert servidor: {srv_crt}", "ok")
+
+        yield from send("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        yield from send("✅ PKI Nebula lista. Ya puedes emitir certificados de cliente.", "ok")
+        yield "data: {\"done\":true,\"error\":false}\n\n"
+
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 @app.route("/api/nebula/status")
 def api_nebula_status():
     """Estado del proceso nebula y la interfaz nebula0."""
@@ -1650,13 +1731,13 @@ pki:
   key: /etc/nebula/{name}.key
 
 static_host_map:
-  "192.168.100.1/24": ["{server_ip}:4242"]
+  "10.0.0.1": ["{server_ip}:4242"]
 
 lighthouse:
   am_lighthouse: false
   interval: 60
   hosts:
-    - "192.168.100.1"
+    - "10.0.0.1"
 
 listen:
   host: 0.0.0.0
@@ -1664,6 +1745,8 @@ listen:
 
 punchy:
   punch: true
+  respond: true
+  delay: 1s
 
 relay:
   am_relay: false
@@ -1696,7 +1779,7 @@ firewall:
       host: any
     - port: any
       proto: any
-      group: clients
+      host: any
 """
 
 @app.route("/api/ping", methods=["POST"])
@@ -2617,6 +2700,35 @@ select option{background:var(--bg3)}
       <div class="stat-block"><div class="stat-label">CA</div><div id="ns_ca" class="stat-value">—</div></div>
       <div class="stat-block"><div class="stat-label">Binario</div><div id="ns_bin" class="stat-value">—</div></div>
     </div>
+  </div>
+
+  <!-- Panel Inicializar CA (visible sólo si CA falta) -->
+  <div id="nebula_init_panel" style="display:none;background:var(--bg2);border:1px solid #9a5700;border-radius:10px;padding:16px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+      <span style="font-size:1.3rem">&#x26A0;</span>
+      <h3 style="color:var(--orange);font-size:.95rem;margin:0">CA no encontrada — Inicializar PKI Nebula</h3>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px">
+      <div class="form-group" style="min-width:220px">
+        <label>Nombre de la CA</label>
+        <input id="ni_ca_name" value="Datacom Security Nebula CA">
+      </div>
+      <div class="form-group" style="min-width:170px">
+        <label>IP del servidor (lighthouse)</label>
+        <input id="ni_server_ip" value="10.0.0.1/24">
+      </div>
+      <div class="form-group" style="min-width:110px">
+        <label>Duración CA</label>
+        <select id="ni_dur">
+          <option value="87600h">10 años</option>
+          <option value="43800h">5 años</option>
+        </select>
+      </div>
+      <button class="btn btn-orange" onclick="nebulaInitCA()" id="btnNebulaInit">&#x1F527; Inicializar CA</button>
+    </div>
+    <div id="ni_log" style="background:#090d13;border-radius:6px;padding:10px;
+         font-family:'Courier New',monospace;font-size:.8rem;min-height:60px;
+         max-height:200px;overflow-y:auto;display:none;line-height:1.6"></div>
   </div>
 
   <!-- Generar Certificado -->
@@ -3851,13 +3963,71 @@ async function loadNebulaStatus() {
   try {
     const r = await fetch('/api/nebula/status');
     const d = await r.json();
-    const yn = (v, okCls, noCls) => `<span style="font-weight:700;color:${v ? 'var(--green)' : 'var(--red)'}">${v ? '✓' : '✗'}</span>`;
+    const yn = (v) => `<span style="font-weight:700;color:${v ? 'var(--green)' : 'var(--red)'}">${v ? '✓' : '✗'}</span>`;
     document.getElementById('ns_proc').innerHTML  = yn(d.running);
     document.getElementById('ns_iface').innerHTML = yn(d.iface_up);
     document.getElementById('ns_ip').textContent  = d.ip || '—';
     document.getElementById('ns_ca').innerHTML    = yn(d.ca_ok);
     document.getElementById('ns_bin').innerHTML   = yn(d.nebula_bin);
+    // Mostrar panel de inicialización sólo si la CA falta
+    document.getElementById('nebula_init_panel').style.display = d.ca_ok ? 'none' : '';
   } catch(e) { console.error('nebula status', e); }
+}
+
+async function nebulaInitCA() {
+  const btn  = document.getElementById('btnNebulaInit');
+  const log  = document.getElementById('ni_log');
+  const name = document.getElementById('ni_ca_name').value.trim();
+  const ip   = document.getElementById('ni_server_ip').value.trim();
+  const dur  = document.getElementById('ni_dur').value;
+
+  btn.disabled = true;
+  log.style.display = '';
+  log.innerHTML = '';
+
+  const addLine = (msg, cls) => {
+    const line = document.createElement('div');
+    line.textContent = msg;
+    if (cls === 'ok')    line.style.color = 'var(--green)';
+    if (cls === 'error') line.style.color = 'var(--red)';
+    if (cls === 'warn')  line.style.color = 'var(--yellow)';
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  try {
+    const res = await fetch('/api/nebula/setup', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ca_name: name, server_ip: ip, duration: dur})
+    });
+    const reader = res.body.getReader();
+    const dec    = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        try {
+          const j = JSON.parse(line.slice(5).trim());
+          if (j.msg) addLine(j.msg, j.cls);
+          if (j.done) {
+            btn.disabled = false;
+            if (!j.error) {
+              await loadNebulaStatus();
+              await loadNebulaCerts();
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch(e) {
+    addLine('Error: ' + e, 'error');
+    btn.disabled = false;
+  }
 }
 
 async function loadNebulaCerts() {
