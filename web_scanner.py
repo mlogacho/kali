@@ -1591,7 +1591,10 @@ def api_nebula_setup():
                 yield from send(f"✗ Error generando CA: {r.stderr}", "error")
                 yield "data: {\"done\":true,\"error\":true}\n\n"
                 return
+            # ca.crt = legible por todos (se distribuye a clientes); ca.key = solo root
+            subprocess.run(["sudo","chmod","644", ca_crt], capture_output=True)
             subprocess.run(["sudo","chmod","600", ca_key], capture_output=True)
+            subprocess.run(["sudo","chown","root:kali", ca_crt], capture_output=True)
             yield from send(f"✓ CA generada: {ca_crt}", "ok")
 
         # ── 3. Generar cert del servidor (lighthouse) ─────────────────────────
@@ -1613,7 +1616,9 @@ def api_nebula_setup():
                 yield from send(f"✗ Error generando cert servidor: {r.stderr}", "error")
                 yield "data: {\"done\":true,\"error\":true}\n\n"
                 return
-            subprocess.run(["sudo","chmod","600", srv_key], capture_output=True)
+            subprocess.run(["sudo","chmod","644", srv_crt], capture_output=True)
+            subprocess.run(["sudo","chmod","640", srv_key], capture_output=True)
+            subprocess.run(["sudo","chown","root:kali", srv_crt, srv_key], capture_output=True)
             yield from send(f"✓ Cert servidor: {srv_crt}", "ok")
 
         yield from send("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

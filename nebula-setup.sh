@@ -47,6 +47,9 @@ if [ ! -f "$CERTS_DIR/ca.crt" ]; then
         -out-crt "$CERTS_DIR/ca.crt" \
         -out-key "$CERTS_DIR/ca.key"
     chmod 600 "$CERTS_DIR/ca.key"
+    # ca.crt es público — lo distribuimos a todos los clientes
+    chmod 644 "$CERTS_DIR/ca.crt"
+    chown root:kali "$CERTS_DIR/ca.crt" 2>/dev/null || true
     info "CA generada: $CERTS_DIR/ca.crt"
 else
     warn "CA ya existe en $CERTS_DIR/ca.crt — omitiendo"
@@ -65,6 +68,8 @@ if [ ! -f "$CERTS_DIR/server.crt" ]; then
         -out-crt "$CERTS_DIR/server.crt" \
         -out-key "$CERTS_DIR/server.key"
     chmod 600 "$CERTS_DIR/server.key"
+    chmod 644 "$CERTS_DIR/server.crt"
+    chown root:kali "$CERTS_DIR/server.crt" "$CERTS_DIR/server.key" 2>/dev/null || true
     info "Cert servidor: $CERTS_DIR/server.crt"
 else
     warn "Cert servidor ya existe — omitiendo"
