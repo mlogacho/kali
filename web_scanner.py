@@ -1647,23 +1647,72 @@ def api_nebula_certs():
                 certs.append(info)
     return jsonify(certs)
 
+def _nebula_ca_not_after():
+    """Devuelve la fecha de expiración de la CA Nebula como datetime UTC, o None."""
+    import datetime as _dt
+    ca_crt = os.path.join(NEBULA_CERTS_DIR, "ca.crt")
+    if not os.path.exists(ca_crt):
+        return None
+    r = subprocess.run(["sudo", NEBULA_CERT_BIN, "print", "-path", ca_crt],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if "not after" in line.lower():
+            raw = line.split(":", 1)[1].strip()
+            try:
+                return _dt.datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=_dt.timezone.utc)
+            except ValueError:
+                return None
+    return None
+
 @app.route("/api/nebula/generate", methods=["POST"])
 def api_nebula_generate():
     """Emite un nuevo certificado Nebula para un nodo cliente."""
+    import datetime as _dt
     data   = request.json or {}
     name   = re.sub(r"[^a-zA-Z0-9_-]", "_", data.get("name","").strip())
     nip    = data.get("nebula_ip","").strip()
     groups = data.get("groups","clients").strip()
-    dur    = data.get("duration","8760h").strip()   # 1 año por defecto
+    dur    = data.get("duration","8760h").strip()
 
     if not name or not nip:
-        return jsonify({"error": "name y nebula_ip son obligatorios"}), 400
+        return jsonify({"error": "Nombre e IP Nebula son obligatorios"}), 400
+
+    # Auto-completar máscara CIDR si el usuario no la incluyó
+    if "/" not in nip:
+        nip = nip + "/24"
+
+    # Validar formato IP básico antes de llamar nebula-cert
+    ip_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
+    if not ip_re.match(nip):
+        return jsonify({"error": f"IP inválida: '{nip}'. Formato esperado: 192.168.100.10/24"}), 400
+
     ca_crt = os.path.join(NEBULA_CERTS_DIR, "ca.crt")
     ca_key = os.path.join(NEBULA_CERTS_DIR, "ca.key")
     if not os.path.exists(ca_crt) or not os.path.exists(ca_key):
-        return jsonify({"error": "CA no encontrada. Ejecuta nebula-setup.sh primero."}), 400
+        return jsonify({"error": "CA no encontrada. Ve a la pestaña Nebula VPN → Inicializar CA."}), 400
     if not os.path.exists(NEBULA_CERT_BIN):
         return jsonify({"error": f"nebula-cert no encontrado en {NEBULA_CERT_BIN}"}), 400
+
+    # Calcular duración máxima permitida (el cert debe expirar antes que la CA)
+    warn_msg = None
+    ca_exp = _nebula_ca_not_after()
+    if ca_exp:
+        now = _dt.datetime.now(_dt.timezone.utc)
+        unit_secs = {"h": 3600, "m": 60, "s": 1}
+        unit = dur[-1] if dur[-1] in unit_secs else "h"
+        try:
+            req_secs = int(dur[:-1]) * unit_secs.get(unit, 3600)
+        except ValueError:
+            req_secs = 8760 * 3600
+        max_secs = int((ca_exp - now).total_seconds()) - 3600  # 1h de margen seguro
+        if max_secs <= 0:
+            return jsonify({"error": "La CA ya ha expirado. Genera una nueva CA desde 'Inicializar CA'."}), 400
+        if req_secs >= max_secs:
+            safe_h = max(1, max_secs // 3600)
+            dur = f"{safe_h}h"
+            ca_days = int(max_secs / 86400)
+            warn_msg = f"Duración ajustada a {safe_h}h ({ca_days}d) — límite de expiración de la CA."
 
     out_crt = os.path.join(NEBULA_CERTS_DIR, f"{name}.crt")
     out_key = os.path.join(NEBULA_CERTS_DIR, f"{name}.key")
@@ -1675,13 +1724,16 @@ def api_nebula_generate():
            "-out-crt", out_crt, "-out-key", out_key]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        return jsonify({"error": r.stderr.strip() or "Error generando certificado"}), 500
+        # Extraer sólo la primera línea del error (evitar el dump del usage completo)
+        err_msg = (r.stderr or r.stdout or "Error generando certificado").strip()
+        first_line = err_msg.splitlines()[0] if err_msg else "Error desconocido"
+        return jsonify({"error": first_line}), 500
     # Dar permisos de lectura al usuario kali sobre el nuevo par
     subprocess.run(["sudo","chmod","644", out_crt], capture_output=True)
     subprocess.run(["sudo","chmod","640", out_key], capture_output=True)
-    subprocess.run(["sudo","chown", f"kali:kali", out_crt, out_key], capture_output=True)
+    subprocess.run(["sudo","chown","kali:kali", out_crt, out_key], capture_output=True)
     return jsonify({"ok": True, "crt": out_crt, "key": out_key,
-                    "cert": _nebula_cert_info(out_crt)})
+                    "warn": warn_msg, "cert": _nebula_cert_info(out_crt)})
 
 @app.route("/api/nebula/certs/<name>", methods=["DELETE"])
 def api_nebula_cert_delete(name):
@@ -2744,11 +2796,13 @@ select option{background:var(--bg3)}
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
       <div class="form-group" style="min-width:160px">
         <label>Nombre del nodo</label>
-        <input id="ncg_name" placeholder="empresa-router01">
+        <input id="ncg_name" placeholder="empresa-router01"
+               oninput="this.value=this.value.replace(/[^a-zA-Z0-9_-]/g,'-')">
       </div>
-      <div class="form-group" style="min-width:170px">
-        <label>IP Nebula (CIDR)</label>
-        <input id="ncg_ip" placeholder="192.168.100.10/24">
+      <div class="form-group" style="min-width:180px">
+        <label>IP Nebula (CIDR) <span style="color:var(--dim);font-weight:400;font-size:.72rem">— se agrega /24 si se omite</span></label>
+        <input id="ncg_ip" placeholder="192.168.100.10/24"
+               onblur="fixCIDR(this)" oninput="this.style.borderColor=''">
       </div>
       <div class="form-group" style="min-width:140px">
         <label>Grupos</label>
@@ -3961,6 +4015,19 @@ function onVpnTypeChange() {
   document.getElementById('classic_vpn_fields').style.display = isNebula ? 'none' : '';
 }
 
+function fixCIDR(input) {
+  let v = input.value.trim();
+  if (!v) return;
+  // Si no tiene máscara, agregar /24 por defecto
+  if (v && !v.includes('/')) {
+    v = v + '/24';
+    input.value = v;
+  }
+  // Validación visual rápida
+  const ok = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(v);
+  input.style.borderColor = ok ? 'var(--green)' : 'var(--red)';
+}
+
 async function loadNebulaTab() {
   await loadNebulaStatus();
   await loadNebulaCerts();
@@ -4068,25 +4135,46 @@ async function loadNebulaCerts() {
 
 async function nebulaGenCert() {
   const name   = document.getElementById('ncg_name').value.trim();
-  const ip     = document.getElementById('ncg_ip').value.trim();
+  let   ip     = document.getElementById('ncg_ip').value.trim();
   const groups = document.getElementById('ncg_groups').value.trim();
   const dur    = document.getElementById('ncg_dur').value;
   const msg    = document.getElementById('ncg_msg');
-  if (!name || !ip) { msg.style.color='var(--red)'; msg.textContent='Nombre e IP son obligatorios.'; return; }
-  msg.style.color='var(--dim)'; msg.textContent='Generando certificado...';
+
+  if (!name) { msg.style.color='var(--red)'; msg.textContent='⚠ Ingresa el nombre del nodo.'; return; }
+  if (!ip)   { msg.style.color='var(--red)'; msg.textContent='⚠ Ingresa la IP Nebula.'; return; }
+
+  // Auto-completar máscara si falta (igual que el backend)
+  if (!ip.includes('/')) ip = ip + '/24';
+  document.getElementById('ncg_ip').value = ip;
+
+  msg.style.color='var(--dim)'; msg.textContent='⏳ Generando certificado...';
   try {
     const r = await fetch('/api/nebula/generate', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({name, nebula_ip: ip, groups, duration: dur})
     });
     const j = await r.json();
-    if (j.error) { msg.style.color='var(--red)'; msg.textContent=j.error; return; }
+    if (j.error) {
+      msg.style.color='var(--red)';
+      msg.textContent='✗ ' + j.error;
+      return;
+    }
     msg.style.color='var(--green)';
-    msg.textContent=`✓ Certificado "${j.cert.name}" emitido (${j.cert.ip}) — descárgalo desde la tabla.`;
+    const certName = j.cert?.name || name;
+    const certIp   = j.cert?.ip   || ip;
+    msg.textContent = `✓ Certificado "${certName}" emitido (${certIp}) — descárgalo desde la tabla.`;
+    if (j.warn) {
+      const w = document.createElement('div');
+      w.style.color = 'var(--yellow)';
+      w.textContent = '⚠ ' + j.warn;
+      msg.parentNode.insertBefore(w, msg.nextSibling);
+      setTimeout(() => w.remove(), 8000);
+    }
     document.getElementById('ncg_name').value='';
     document.getElementById('ncg_ip').value='';
+    document.getElementById('ncg_ip').style.borderColor='';
     await loadNebulaCerts();
-  } catch(e) { msg.style.color='var(--red)'; msg.textContent=String(e); }
+  } catch(e) { msg.style.color='var(--red)'; msg.textContent='✗ ' + String(e); }
 }
 
 async function nebulaRevokeCert(name) {
