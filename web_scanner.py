@@ -1528,7 +1528,7 @@ def _nebula_cert_info(cert_file: str) -> dict:
             "ip": "", "groups": [], "not_after": "", "is_ca": False}
     if not os.path.exists(NEBULA_CERT_BIN):
         return info
-    r = subprocess.run([NEBULA_CERT_BIN, "print", "-path", cert_file],
+    r = subprocess.run(["sudo", NEBULA_CERT_BIN, "print", "-path", cert_file],
                        capture_output=True, text=True)
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -1667,7 +1667,7 @@ def api_nebula_generate():
 
     out_crt = os.path.join(NEBULA_CERTS_DIR, f"{name}.crt")
     out_key = os.path.join(NEBULA_CERTS_DIR, f"{name}.key")
-    cmd = [NEBULA_CERT_BIN, "sign",
+    cmd = ["sudo", NEBULA_CERT_BIN, "sign",
            "-ca-crt", ca_crt, "-ca-key", ca_key,
            "-name", name, "-ip", nip,
            "-groups", groups,
@@ -1675,7 +1675,11 @@ def api_nebula_generate():
            "-out-crt", out_crt, "-out-key", out_key]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        return jsonify({"error": r.stderr or "Error generando certificado"}), 500
+        return jsonify({"error": r.stderr.strip() or "Error generando certificado"}), 500
+    # Dar permisos de lectura al usuario kali sobre el nuevo par
+    subprocess.run(["sudo","chmod","644", out_crt], capture_output=True)
+    subprocess.run(["sudo","chmod","640", out_key], capture_output=True)
+    subprocess.run(["sudo","chown", f"kali:kali", out_crt, out_key], capture_output=True)
     return jsonify({"ok": True, "crt": out_crt, "key": out_key,
                     "cert": _nebula_cert_info(out_crt)})
 
@@ -1686,7 +1690,10 @@ def api_nebula_cert_delete(name):
     for ext in (".crt", ".key"):
         path = os.path.join(NEBULA_CERTS_DIR, safe + ext)
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except PermissionError:
+                subprocess.run(["sudo","rm","-f", path], capture_output=True)
     return jsonify({"ok": True})
 
 @app.route("/api/nebula/certs/<name>/download")
