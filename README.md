@@ -122,19 +122,48 @@ Desde `http://3.143.18.161:8040` → pestaña **🌐 Nebula VPN**:
 ### Instalación en Nodo Cliente
 
 ```bash
-# En el nodo cliente (Linux):
+# En el nodo cliente (Linux/macOS):
 sudo mkdir -p /etc/nebula
-# Copiar archivos del bundle:
-sudo cp empresa-router01.crt empresa-router01.key ca.crt /etc/nebula/
+# Copiar archivos del bundle descargado desde la Web UI:
+sudo cp <nombre>.crt <nombre>.key ca.crt /etc/nebula/
 
 # Descargar nebula para la plataforma del cliente:
 # https://github.com/slackhq/nebula/releases
 
+# macOS — limpiar rutas previas antes de iniciar:
+sudo pkill -f nebula 2>/dev/null; true
+sudo route delete -net 192.168.100.0/24 2>/dev/null; true
+
 # Iniciar Nebula:
-sudo nebula -config /etc/nebula/empresa-router01_config.yaml
+sudo nebula -config /etc/nebula/<nombre>_config.yaml
 
 # Verificar conexión:
 ping 192.168.100.1   # lighthouse
+```
+
+> **macOS:** el archivo `config.yaml` descargado ya incluye `tun.dev: utun` (requerido por Darwin).
+> **Linux:** cambiar `dev: utun` → `dev: nebula0` si se prefiere.
+
+### Instalación del Servicio de Routing (Servidor)
+
+Si el servidor tiene Tailscale con `RouteAll: true`, la subnet Nebula `192.168.100.0/24`
+puede ser capturada por la tabla de routing de Tailscale (tabla 52), impidiendo que las
+respuestas ICMP/TCP vuelvan al cliente por el túnel Nebula correcto.
+
+Instalar el servicio de prioridad de routing:
+
+```bash
+# Copiar el archivo al servidor:
+sudo cp nebula-routing.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now nebula-routing.service
+systemctl is-active nebula-routing.service   # → active
+```
+
+Esto añade reglas ip en prioridad 100 (antes de la tabla 52 de Tailscale):
+```
+100: from all to 192.168.100.0/24 lookup main
+100: from 192.168.100.0/24 lookup main
 ```
 
 ### Integración con el Scanner
@@ -150,6 +179,20 @@ Al configurar un cliente con **Tipo VPN = Nebula** en el sidebar:
 | Puerto | Protocolo | Uso |
 |---|---|---|
 | 4242 | UDP | Lighthouse — coordinación y datos |
+
+### Troubleshooting Nebula
+
+| Síntoma | Causa | Solución |
+|---|---|---|
+| `WARN: interface name must be utun[0-9]+` | macOS requiere `utun`, no `nebula0` | El config.yaml descargado ya usa `dev: utun` |
+| `FATA: failed to write route.RouteMessage: file exists` | Ruta `192.168.100.0/24` de sesión anterior | `sudo route delete -net 192.168.100.0/24` antes de arrancar |
+| `ping 192.168.100.1` timeout (cliente) pero el servidor SÍ hace ping al cliente | Tailscale captura la subnet Nebula en tabla 52 | Instalar `nebula-routing.service` en el servidor |
+| `CA no encontrada` en Web UI | CA en `/opt/nebula/`, no en `/etc/nebula/` | Usar botón "Inicializar CA" o apuntar `NEBULA_CERTS_DIR` a `/opt/nebula/` |
+| `PermissionError: ca.key` al emitir cert | `ca.key` es `root:root 600` | El código usa `sudo nebula-cert sign` automáticamente |
+| ZIP descarga vacío / 500 | `ca.crt` era `root:root 600` | Aplicado: `sudo chmod 644 /opt/nebula/ca.crt` |
+| `certificate expires after signing certificate` | Duración del cert > tiempo restante de la CA | El backend auto-recorta la duración al límite de la CA |
+
+---
 
 ### Comparativa VPN
 
@@ -247,13 +290,14 @@ Acceder en `http://3.143.18.161:3000` (admin/admin).
 ## Estructura de Archivos
 
 ```
-├── web_scanner.py            # App principal (Flask + HTML/JS/CSS)
-├── deploy.sh                 # Script de despliegue automatizado
-├── nebula-setup.sh           # Instalación y configuración del lighthouse Nebula
-├── nebula-cert-manager.sh    # Gestión de certificados Nebula (issue/list/bundle/revoke)
-├── generar_manual.py         # Generador de manual PDF
-├── vuln_scanner.py           # Versión legacy del scanner (GUI Tkinter)
-├── logo_datacom.png          # Logo corporativo para PDFs
+├── web_scanner.py               # App principal (Flask + HTML/JS/CSS)
+├── deploy.sh                    # Script de despliegue automatizado
+├── nebula-setup.sh              # Instalación y configuración del lighthouse Nebula
+├── nebula-cert-manager.sh       # Gestión de certificados Nebula (issue/list/bundle/revoke)
+├── nebula-routing.service       # Systemd: reglas de routing para Nebula (prioridad sobre Tailscale)
+├── generar_manual.py            # Generador de manual PDF
+├── vuln_scanner.py              # Versión legacy del scanner (GUI Tkinter)
+├── logo_datacom.png             # Logo corporativo para PDFs
 ├── reporte_vulnerabilidades.html  # Reporte HTML de ejemplo
 └── README.md
 ```

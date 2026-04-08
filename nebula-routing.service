@@ -1,0 +1,13 @@
+[Unit]
+Description=Nebula overlay routing rules (priority over Tailscale table 52)
+After=network.target nebula.service
+Wants=nebula.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip rule add to 192.168.100.0/24 table main priority 100 2>/dev/null; ip rule add from 192.168.100.0/24 table main priority 100 2>/dev/null; true'
+ExecStop=/bin/sh -c 'ip rule del to 192.168.100.0/24 table main priority 100 2>/dev/null; ip rule del from 192.168.100.0/24 table main priority 100 2>/dev/null; true'
+
+[Install]
+WantedBy=multi-user.target
