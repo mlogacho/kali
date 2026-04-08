@@ -11,12 +11,21 @@ from flask import Flask, render_template_string, request, jsonify, Response, str
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-CLIENTS_FILE = "/opt/scanner/clients.json"
-UPLOAD_DIR   = "/opt/scanner/vpn_configs"
-SCANS_DIR    = "/opt/scanner/scans"
+CLIENTS_FILE     = "/opt/scanner/clients.json"
+UPLOAD_DIR       = "/opt/scanner/vpn_configs"
+SCANS_DIR        = "/opt/scanner/scans"
+NEBULA_BIN       = "/opt/nebula/nebula"
+NEBULA_CERT_BIN  = "/opt/nebula/nebula-cert"
+NEBULA_CERTS_DIR = "/etc/nebula/certs"
+NEBULA_CONFIG_DIR= "/etc/nebula"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(SCANS_DIR,  exist_ok=True)
+# /etc/nebula lo crea nebula-setup.sh (requiere root); aquí sólo intentamos sin fallar
+try:
+    os.makedirs(NEBULA_CERTS_DIR, exist_ok=True)
+except PermissionError:
+    pass
 if not os.path.exists(CLIENTS_FILE):
     with open(CLIENTS_FILE, "w") as f:
         json.dump({}, f)
@@ -1375,12 +1384,14 @@ def api_clients_save():
         vpn_path = os.path.join(UPLOAD_DIR, f"{safe_name}{ext}")
         vpn_file.save(vpn_path)
     clients[name] = {
-        "network":  data.get("network", "").strip(),
-        "desc":     data.get("desc", "").strip(),
-        "vpn_path": vpn_path,
-        "vpn_type": data.get("vpn_type", "OpenVPN"),
-        "vpn_user": data.get("vpn_user", "").strip(),
-        "vpn_pass": data.get("vpn_pass", "").strip(),
+        "network":       data.get("network", "").strip(),
+        "desc":          data.get("desc", "").strip(),
+        "vpn_path":      vpn_path,
+        "vpn_type":      data.get("vpn_type", "OpenVPN"),
+        "vpn_user":      data.get("vpn_user", "").strip(),
+        "vpn_pass":      data.get("vpn_pass", "").strip(),
+        "nebula_ip":     data.get("nebula_ip", "").strip(),
+        "nebula_groups": data.get("nebula_groups", "clients").strip(),
     }
     save_clients(clients)
     return jsonify({"ok": True})
@@ -1419,11 +1430,23 @@ def _vpn_connect_bg(name, c):
         else:
             cmd = ["sudo","openvpn","--config",vpn_path,"--daemon",
                    "--log","/tmp/openvpn_scanner.log"]
+        subprocess.run(cmd, capture_output=True)
         iface = "tun0"
+    elif vpn_type == "Nebula":
+        # Nebula no tiene --daemon flag; lo lanzamos como proceso desacoplado
+        config = vpn_path or f"{NEBULA_CONFIG_DIR}/config.yaml"
+        import shlex
+        subprocess.Popen(
+            ["sudo", NEBULA_BIN, "-config", config],
+            stdout=open("/tmp/nebula_scanner.log", "a"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        iface = "nebula0"
     else:
         cmd = ["sudo","wg-quick","up",vpn_path]
+        subprocess.run(cmd, capture_output=True)
         iface = "wg0"
-    subprocess.run(cmd, capture_output=True)
     for _ in range(20):
         time.sleep(2)
         r = subprocess.run(["ip","a","show",iface], capture_output=True, text=True)
@@ -1434,15 +1457,18 @@ def _vpn_connect_bg(name, c):
 
 @app.route("/api/vpn/disconnect", methods=["POST"])
 def api_vpn_disconnect():
-    if vpn_state["iface"] == "tun0":
+    iface = vpn_state.get("iface", "")
+    c = load_clients().get(vpn_state.get("client", ""), {})
+    if iface == "tun0":
         subprocess.run(["sudo","pkill","openvpn"], capture_output=True)
+    elif iface in ("nebula0", "nebula1") or c.get("vpn_type") == "Nebula":
+        subprocess.run(["sudo","pkill","-f", NEBULA_BIN], capture_output=True)
     else:
-        c = load_clients().get(vpn_state["client"], {})
         subprocess.run(["sudo","wg-quick","down", c.get("vpn_path","")], capture_output=True)
     vpn_state.update({"active": False, "client": "", "iface": ""})
     return jsonify({"ok": True})
 
-VPN_IFACES = ["tailscale0", "tun0", "tun1", "wg0", "wg1", "ppp0", "nordlynx"]
+VPN_IFACES = ["tailscale0", "tun0", "tun1", "wg0", "wg1", "nebula0", "nebula1", "ppp0", "nordlynx"]
 
 def _detect_vpn_ifaces():
     """Devuelve lista de interfaces VPN activas con sus IPs."""
@@ -1494,7 +1520,184 @@ def api_vpn_status():
         return jsonify({**vpn_state, "ip": detected[0]["ip"], "autodetected": True})
     return jsonify(vpn_state)
 
-# ── API: Ping ─────────────────────────────────────────────────────────────────
+# ── API: Nebula ────────────────────────────────────────────────────────────────
+
+def _nebula_cert_info(cert_file: str) -> dict:
+    """Devuelve metadatos de un certificado Nebula usando nebula-cert print."""
+    info = {"name": os.path.basename(cert_file).replace(".crt", ""), "file": cert_file,
+            "ip": "", "groups": [], "not_after": "", "is_ca": False}
+    if not os.path.exists(NEBULA_CERT_BIN):
+        return info
+    r = subprocess.run([NEBULA_CERT_BIN, "print", "-path", cert_file],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("ip:"):
+            info["ip"] = line.split(":",1)[1].strip()
+        elif line.startswith("groups:"):
+            raw = line.split(":",1)[1].strip().strip("[]")
+            info["groups"] = [g.strip() for g in raw.split(",") if g.strip()]
+        elif line.startswith("not after:"):
+            info["not_after"] = line.split(":",1)[1].strip()
+        elif "is ca: true" in line.lower():
+            info["is_ca"] = True
+    return info
+
+@app.route("/api/nebula/status")
+def api_nebula_status():
+    """Estado del proceso nebula y la interfaz nebula0."""
+    proc = subprocess.run(["pgrep","-f", NEBULA_BIN], capture_output=True, text=True)
+    running = proc.returncode == 0
+    iface_r = subprocess.run(["ip","a","show","nebula0"], capture_output=True, text=True)
+    iface_up = "inet " in iface_r.stdout
+    ip = next((l.strip() for l in iface_r.stdout.splitlines() if "inet " in l), "")
+    ca_ok = os.path.exists(os.path.join(NEBULA_CERTS_DIR, "ca.crt"))
+    return jsonify({"running": running, "iface_up": iface_up, "ip": ip, "ca_ok": ca_ok,
+                    "nebula_bin": os.path.exists(NEBULA_BIN)})
+
+@app.route("/api/nebula/certs")
+def api_nebula_certs():
+    """Lista todos los certificados emitidos (excluye CA)."""
+    certs = []
+    for f in sorted(os.listdir(NEBULA_CERTS_DIR)):
+        if f.endswith(".crt") and f != "ca.crt":
+            info = _nebula_cert_info(os.path.join(NEBULA_CERTS_DIR, f))
+            if not info["is_ca"]:
+                certs.append(info)
+    return jsonify(certs)
+
+@app.route("/api/nebula/generate", methods=["POST"])
+def api_nebula_generate():
+    """Emite un nuevo certificado Nebula para un nodo cliente."""
+    data   = request.json or {}
+    name   = re.sub(r"[^a-zA-Z0-9_-]", "_", data.get("name","").strip())
+    nip    = data.get("nebula_ip","").strip()
+    groups = data.get("groups","clients").strip()
+    dur    = data.get("duration","8760h").strip()   # 1 año por defecto
+
+    if not name or not nip:
+        return jsonify({"error": "name y nebula_ip son obligatorios"}), 400
+    ca_crt = os.path.join(NEBULA_CERTS_DIR, "ca.crt")
+    ca_key = os.path.join(NEBULA_CERTS_DIR, "ca.key")
+    if not os.path.exists(ca_crt) or not os.path.exists(ca_key):
+        return jsonify({"error": "CA no encontrada. Ejecuta nebula-setup.sh primero."}), 400
+    if not os.path.exists(NEBULA_CERT_BIN):
+        return jsonify({"error": f"nebula-cert no encontrado en {NEBULA_CERT_BIN}"}), 400
+
+    out_crt = os.path.join(NEBULA_CERTS_DIR, f"{name}.crt")
+    out_key = os.path.join(NEBULA_CERTS_DIR, f"{name}.key")
+    cmd = [NEBULA_CERT_BIN, "sign",
+           "-ca-crt", ca_crt, "-ca-key", ca_key,
+           "-name", name, "-ip", nip,
+           "-groups", groups,
+           "-duration", dur,
+           "-out-crt", out_crt, "-out-key", out_key]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return jsonify({"error": r.stderr or "Error generando certificado"}), 500
+    return jsonify({"ok": True, "crt": out_crt, "key": out_key,
+                    "cert": _nebula_cert_info(out_crt)})
+
+@app.route("/api/nebula/certs/<name>", methods=["DELETE"])
+def api_nebula_cert_delete(name):
+    """Elimina el par crt/key de un nodo."""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    for ext in (".crt", ".key"):
+        path = os.path.join(NEBULA_CERTS_DIR, safe + ext)
+        if os.path.exists(path):
+            os.remove(path)
+    return jsonify({"ok": True})
+
+@app.route("/api/nebula/certs/<name>/download")
+def api_nebula_cert_download(name):
+    """Descarga un bundle ZIP con crt + key + CA + config.yaml del nodo."""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    crt  = os.path.join(NEBULA_CERTS_DIR, safe + ".crt")
+    key  = os.path.join(NEBULA_CERTS_DIR, safe + ".key")
+    ca   = os.path.join(NEBULA_CERTS_DIR, "ca.crt")
+    if not os.path.exists(crt):
+        return jsonify({"error": "Certificado no encontrado"}), 404
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(crt, f"{safe}.crt")
+        if os.path.exists(key):
+            z.write(key, f"{safe}.key")
+        if os.path.exists(ca):
+            z.write(ca, "ca.crt")
+        # Incluir config YAML de cliente
+        z.writestr(f"{safe}_config.yaml", _nebula_client_config_yaml(safe))
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip",
+                     as_attachment=True, download_name=f"nebula_{safe}.zip")
+
+@app.route("/api/nebula/config/<name>")
+def api_nebula_config(name):
+    """Devuelve la config YAML de cliente como texto plano."""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    return app.response_class(_nebula_client_config_yaml(safe),
+                               mimetype="text/plain")
+
+def _nebula_client_config_yaml(name: str) -> str:
+    """Genera una config YAML Nebula mínima para un nodo cliente."""
+    server_ip = "3.143.18.161"
+    return f"""# Nebula config — nodo: {name}
+# Generado por Kali VPN Vulnerability Scanner
+
+pki:
+  ca: /etc/nebula/ca.crt
+  cert: /etc/nebula/{name}.crt
+  key: /etc/nebula/{name}.key
+
+static_host_map:
+  "192.168.100.1/24": ["{server_ip}:4242"]
+
+lighthouse:
+  am_lighthouse: false
+  interval: 60
+  hosts:
+    - "192.168.100.1"
+
+listen:
+  host: 0.0.0.0
+  port: 0
+
+punchy:
+  punch: true
+
+relay:
+  am_relay: false
+  use_relays: false
+
+tun:
+  disabled: false
+  dev: nebula0
+  drop_local_broadcast: false
+  drop_multicast: false
+  tx_queue: 500
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
+firewall:
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    - port: any
+      proto: icmp
+      host: any
+    - port: any
+      proto: any
+      group: clients
+"""
 
 @app.route("/api/ping", methods=["POST"])
 def api_ping():
@@ -1979,7 +2182,7 @@ select option{background:var(--bg3)}
 <header>
   <div>
     <h1>&#x26A1; Kali VPN Vulnerability Scanner</h1>
-    <span>nmap &bull; vulners &bull; nikto &bull; OpenVPN &bull; WireGuard</span>
+    <span>nmap &bull; vulners &bull; nikto &bull; OpenVPN &bull; WireGuard &bull; Nebula</span>
   </div>
   <div style="margin-left:auto;display:flex;gap:10px;align-items:center">
     <div id="vpnBadge" class="badge-vpn off" onclick="openVpnModal()">&#x25CF; VPN Inactiva</div>
@@ -2020,24 +2223,41 @@ select option{background:var(--bg3)}
         </div>
         <div class="form-group">
           <label>Tipo VPN</label>
-          <select id="cf_vpntype" name="vpn_type">
+          <select id="cf_vpntype" name="vpn_type" onchange="onVpnTypeChange()">
             <option>Tailscale</option>
             <option>OpenVPN</option>
             <option>WireGuard</option>
+            <option>Nebula</option>
           </select>
         </div>
-        <div class="form-group">
-          <label>Config VPN (.ovpn / .conf)</label>
-          <input type="file" id="cf_vpnfile" name="vpn_config" accept=".ovpn,.conf">
-        </div>
-        <div class="row">
-          <div class="form-group">
-            <label>Usuario VPN</label>
-            <input id="cf_vpnuser" name="vpn_user" placeholder="(opcional)">
+        <!-- Campos Nebula (visibles sólo cuando vpn_type=Nebula) -->
+        <div id="nebula_fields" style="display:none">
+          <div class="row">
+            <div class="form-group">
+              <label>IP Nebula del nodo (CIDR)</label>
+              <input id="cf_nebula_ip" name="nebula_ip" placeholder="192.168.100.10/24">
+            </div>
+            <div class="form-group">
+              <label>Grupos Nebula</label>
+              <input id="cf_nebula_groups" name="nebula_groups" placeholder="clients" value="clients">
+            </div>
           </div>
+        </div>
+        <!-- Campos OpenVPN/WireGuard (ocultos para Nebula) -->
+        <div id="classic_vpn_fields">
           <div class="form-group">
-            <label>Contraseña VPN</label>
-            <input id="cf_vpnpass" name="vpn_pass" type="password">
+            <label>Config VPN (.ovpn / .conf / .yaml)</label>
+            <input type="file" id="cf_vpnfile" name="vpn_config" accept=".ovpn,.conf,.yaml">
+          </div>
+          <div class="row">
+            <div class="form-group">
+              <label>Usuario VPN</label>
+              <input id="cf_vpnuser" name="vpn_user" placeholder="(opcional)">
+            </div>
+            <div class="form-group">
+              <label>Contraseña VPN</label>
+              <input id="cf_vpnpass" name="vpn_pass" type="password">
+            </div>
           </div>
         </div>
         <div style="display:flex;gap:8px;margin-top:4px">
@@ -2055,6 +2275,7 @@ select option{background:var(--bg3)}
       <div class="tab" id="tab-btn-map"      onclick="showTab('map',this);onMapTabOpen()">&#x1F5A7; Mapa de Red</div>
       <div class="tab" id="tab-btn-capture"  onclick="showTab('capture',this);loadCapIfaces()">&#x1F4E1; Captura de Tráfico</div>
       <div class="tab" id="tab-btn-ids"      onclick="showTab('ids',this)">&#x1F6E1; IDS Suricata</div>
+      <div class="tab" id="tab-btn-nebula"   onclick="showTab('nebula',this);loadNebulaTab()">&#x1F300; Nebula VPN</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -2379,6 +2600,77 @@ select option{background:var(--bg3)}
     </div>
   </div>
 </div>
+
+<!-- ── NEBULA TAB ─────────────────────────────────────────────────────────── -->
+<div class="tab-content" id="tab-nebula" style="flex-direction:column;overflow:auto;padding:20px;gap:18px">
+
+  <!-- Estado del servidor Nebula -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="color:var(--blue);font-size:.95rem;margin:0">&#x1F300; Estado Nebula en el Servidor</h3>
+      <button class="btn btn-gray btn-sm" onclick="loadNebulaStatus()">&#x21BB; Refrescar</button>
+    </div>
+    <div id="nebulaStatusGrid" style="display:flex;gap:16px;flex-wrap:wrap">
+      <div class="stat-block"><div class="stat-label">Proceso</div><div id="ns_proc" class="stat-value">—</div></div>
+      <div class="stat-block"><div class="stat-label">Interfaz nebula0</div><div id="ns_iface" class="stat-value">—</div></div>
+      <div class="stat-block"><div class="stat-label">IP Overlay</div><div id="ns_ip" class="stat-value" style="font-size:.9rem">—</div></div>
+      <div class="stat-block"><div class="stat-label">CA</div><div id="ns_ca" class="stat-value">—</div></div>
+      <div class="stat-block"><div class="stat-label">Binario</div><div id="ns_bin" class="stat-value">—</div></div>
+    </div>
+  </div>
+
+  <!-- Generar Certificado -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px">
+    <h3 style="color:var(--blue);font-size:.95rem;margin:0 0 12px">&#x1F4DC; Emitir Certificado de Cliente</h3>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div class="form-group" style="min-width:160px">
+        <label>Nombre del nodo</label>
+        <input id="ncg_name" placeholder="empresa-router01">
+      </div>
+      <div class="form-group" style="min-width:170px">
+        <label>IP Nebula (CIDR)</label>
+        <input id="ncg_ip" placeholder="192.168.100.10/24">
+      </div>
+      <div class="form-group" style="min-width:140px">
+        <label>Grupos</label>
+        <input id="ncg_groups" placeholder="clients" value="clients">
+      </div>
+      <div class="form-group" style="min-width:110px">
+        <label>Duración</label>
+        <select id="ncg_dur">
+          <option value="8760h">1 año</option>
+          <option value="17520h">2 años</option>
+          <option value="43800h">5 años</option>
+          <option value="720h">30 días</option>
+        </select>
+      </div>
+      <button class="btn btn-green" onclick="nebulaGenCert()">&#x2795; Generar</button>
+    </div>
+    <div id="ncg_msg" style="margin-top:8px;font-size:.83rem;color:var(--dim)"></div>
+  </div>
+
+  <!-- Tabla de certificados -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px;flex:1">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="color:var(--blue);font-size:.95rem;margin:0">&#x1F4C1; Certificados Emitidos</h3>
+      <button class="btn btn-gray btn-sm" onclick="loadNebulaCerts()">&#x21BB; Refrescar</button>
+    </div>
+    <div id="nebulaCertsWrap" style="overflow-x:auto">
+      <table class="history-table" style="min-width:700px">
+        <thead>
+          <tr>
+            <th>Nodo</th><th>IP Overlay</th><th>Grupos</th><th>Expira</th><th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody id="nebulaCertsBody">
+          <tr><td colspan="5" style="color:var(--dim);text-align:center">Cargando...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+<!-- ── FIN NEBULA TAB ──────────────────────────────────────────────────────── -->
 
 <div class="statusbar">
   <span id="statusText">Listo.</span>
@@ -2831,15 +3123,18 @@ function renderVpnCombo(clients) {
 function selectClient(name, c, item) {
   document.querySelectorAll('.client-item').forEach(i => i.classList.remove('active'));
   item.classList.add('active');
-  document.getElementById('cf_name').value    = name;
-  document.getElementById('cf_network').value = c.network  || '';
-  document.getElementById('cf_desc').value    = c.desc     || '';
-  document.getElementById('cf_vpntype').value = c.vpn_type || 'OpenVPN';
-  document.getElementById('cf_vpnuser').value = c.vpn_user || '';
-  document.getElementById('cf_vpnpass').value = c.vpn_pass || '';
+  document.getElementById('cf_name').value          = name;
+  document.getElementById('cf_network').value       = c.network       || '';
+  document.getElementById('cf_desc').value          = c.desc          || '';
+  document.getElementById('cf_vpntype').value       = c.vpn_type      || 'OpenVPN';
+  document.getElementById('cf_vpnuser').value       = c.vpn_user      || '';
+  document.getElementById('cf_vpnpass').value       = c.vpn_pass      || '';
+  document.getElementById('cf_nebula_ip').value     = c.nebula_ip     || '';
+  document.getElementById('cf_nebula_groups').value = c.nebula_groups || 'clients';
   document.getElementById('clientFormTitle').textContent = 'Editar: ' + name;
   document.getElementById('selClient').value  = name;
   document.getElementById('inTarget').value   = c.network  || '';
+  onVpnTypeChange();
 }
 
 function onClientSelect() {
@@ -3536,6 +3831,92 @@ function resetMapView() {
   const svg = d3.select('#networkSvg');
   svg.transition().duration(500)
     .call(_mapZoom.transform, d3.zoomIdentity.translate(c.clientWidth/2, c.clientHeight/2).scale(1));
+}
+
+// ── Nebula VPN Tab ────────────────────────────────────────────────────────────
+
+function onVpnTypeChange() {
+  const t = document.getElementById('cf_vpntype').value;
+  const isNebula = (t === 'Nebula');
+  document.getElementById('nebula_fields').style.display    = isNebula ? '' : 'none';
+  document.getElementById('classic_vpn_fields').style.display = isNebula ? 'none' : '';
+}
+
+async function loadNebulaTab() {
+  await loadNebulaStatus();
+  await loadNebulaCerts();
+}
+
+async function loadNebulaStatus() {
+  try {
+    const r = await fetch('/api/nebula/status');
+    const d = await r.json();
+    const yn = (v, okCls, noCls) => `<span style="font-weight:700;color:${v ? 'var(--green)' : 'var(--red)'}">${v ? '✓' : '✗'}</span>`;
+    document.getElementById('ns_proc').innerHTML  = yn(d.running);
+    document.getElementById('ns_iface').innerHTML = yn(d.iface_up);
+    document.getElementById('ns_ip').textContent  = d.ip || '—';
+    document.getElementById('ns_ca').innerHTML    = yn(d.ca_ok);
+    document.getElementById('ns_bin').innerHTML   = yn(d.nebula_bin);
+  } catch(e) { console.error('nebula status', e); }
+}
+
+async function loadNebulaCerts() {
+  const tbody = document.getElementById('nebulaCertsBody');
+  try {
+    const r = await fetch('/api/nebula/certs');
+    const certs = await r.json();
+    if (!certs.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim);text-align:center">Sin certificados emitidos.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = certs.map(c => `
+      <tr>
+        <td style="font-family:'Courier New',monospace;color:var(--blue)">${esc(c.name)}</td>
+        <td style="font-family:'Courier New',monospace">${esc(c.ip||'—')}</td>
+        <td>${(c.groups||[]).map(g=>`<span class="badge" style="background:var(--bg4);color:var(--fg)">${esc(g)}</span>`).join(' ')}</td>
+        <td style="color:var(--dim);font-size:.8rem">${esc(c.not_after||'—')}</td>
+        <td style="display:flex;gap:6px">
+          <a href="/api/nebula/certs/${encodeURIComponent(c.name)}/download"
+             class="btn btn-blue btn-sm" title="Descargar bundle">&#x2B07; ZIP</a>
+          <a href="/api/nebula/config/${encodeURIComponent(c.name)}"
+             class="btn btn-gray btn-sm" target="_blank" title="Ver config YAML">YAML</a>
+          <button class="btn btn-red btn-sm"
+             onclick="nebulaRevokeCert('${esc(c.name)}')">&#x1F5D1; Revocar</button>
+        </td>
+      </tr>`).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="5" style="color:var(--red)">${e}</td></tr>`;
+  }
+}
+
+async function nebulaGenCert() {
+  const name   = document.getElementById('ncg_name').value.trim();
+  const ip     = document.getElementById('ncg_ip').value.trim();
+  const groups = document.getElementById('ncg_groups').value.trim();
+  const dur    = document.getElementById('ncg_dur').value;
+  const msg    = document.getElementById('ncg_msg');
+  if (!name || !ip) { msg.style.color='var(--red)'; msg.textContent='Nombre e IP son obligatorios.'; return; }
+  msg.style.color='var(--dim)'; msg.textContent='Generando certificado...';
+  try {
+    const r = await fetch('/api/nebula/generate', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, nebula_ip: ip, groups, duration: dur})
+    });
+    const j = await r.json();
+    if (j.error) { msg.style.color='var(--red)'; msg.textContent=j.error; return; }
+    msg.style.color='var(--green)';
+    msg.textContent=`✓ Certificado "${j.cert.name}" emitido (${j.cert.ip}) — descárgalo desde la tabla.`;
+    document.getElementById('ncg_name').value='';
+    document.getElementById('ncg_ip').value='';
+    await loadNebulaCerts();
+  } catch(e) { msg.style.color='var(--red)'; msg.textContent=String(e); }
+}
+
+async function nebulaRevokeCert(name) {
+  if (!confirm(`¿Revocar y eliminar el certificado de "${name}"?`)) return;
+  await fetch('/api/nebula/certs/'+encodeURIComponent(name), {method:'DELETE'});
+  setStatus(`Certificado "${name}" eliminado.`);
+  await loadNebulaCerts();
 }
 </script>
 </body>
