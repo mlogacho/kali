@@ -64,7 +64,7 @@ if [ ! -f "$CERTS_DIR/server.crt" ]; then
         -name   "kali-lighthouse" \
         -ip     "$SERVER_NEBULA_IP" \
         -groups "lighthouse,servers" \
-        -duration 87600h \
+        -duration 8760h \
         -out-crt "$CERTS_DIR/server.crt" \
         -out-key "$CERTS_DIR/server.key"
     chmod 600 "$CERTS_DIR/server.key"
@@ -178,6 +178,21 @@ if systemctl is-active --quiet nebula; then
     info "Servicio nebula ACTIVO"
 else
     warn "Servicio nebula no está activo. Revisa: journalctl -u nebula -n 30"
+fi
+
+# ── 8. Habilitar reenvío IP y NAT hacia 192.168.1.0/24 ───────────────────────
+info "Habilitando IP forwarding..."
+sysctl -w net.ipv4.ip_forward=1
+grep -q '^net.ipv4.ip_forward' /etc/sysctl.conf \
+    && sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf \
+    || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+info "Configurando iptables MASQUERADE para 192.168.1.0/24..."
+iptables -t nat -C POSTROUTING -s 192.168.100.0/24 -d 192.168.1.0/24 -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s 192.168.100.0/24 -d 192.168.1.0/24 -j MASQUERADE
+# Guardar reglas iptables si iptables-save está disponible
+if command -v iptables-save &>/dev/null && [ -d /etc/iptables ]; then
+    iptables-save > /etc/iptables/rules.v4 && info "Reglas iptables guardadas en /etc/iptables/rules.v4"
 fi
 
 # ── Resumen ───────────────────────────────────────────────────────────────────

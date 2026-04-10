@@ -34,3 +34,4 @@ build/
 # PDFs generados (mantener solo los de referencia)
 # Descomenta si NO quieres los PDFs en el repo:
 # *.pdf
+nebula_*.zip

@@ -16,8 +16,8 @@ UPLOAD_DIR       = "/opt/scanner/vpn_configs"
 SCANS_DIR        = "/opt/scanner/scans"
 NEBULA_BIN       = "/opt/nebula/nebula"
 NEBULA_CERT_BIN  = "/opt/nebula/nebula-cert"
-NEBULA_CERTS_DIR = "/opt/nebula"        # CA y certs viven aquí (nebula-setup los crea aquí)
-NEBULA_CONFIG_DIR= "/opt/nebula"
+NEBULA_CERTS_DIR = "/etc/nebula/certs"  # CA y certs generados por nebula-setup.sh
+NEBULA_CONFIG_DIR= "/etc/nebula"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(SCANS_DIR,  exist_ok=True)
@@ -1753,6 +1753,13 @@ def api_nebula_cert_delete(name):
                 subprocess.run(["sudo","rm","-f", path], capture_output=True)
     return jsonify({"ok": True})
 
+def _sudo_read(path: str) -> bytes | None:
+    """Lee un archivo que puede requerir permisos de root usando sudo."""
+    r = subprocess.run(["sudo", "cat", path], capture_output=True)
+    if r.returncode == 0:
+        return r.stdout
+    return None
+
 @app.route("/api/nebula/certs/<name>/download")
 def api_nebula_cert_download(name):
     """Descarga un bundle ZIP con crt + key + CA + config.yaml del nodo."""
@@ -1765,16 +1772,45 @@ def api_nebula_cert_download(name):
     import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.write(crt, f"{safe}.crt")
-        if os.path.exists(key):
-            z.write(key, f"{safe}.key")
-        if os.path.exists(ca):
-            z.write(ca, "ca.crt")
-        # Incluir config YAML de cliente
+        crt_data = _sudo_read(crt)
+        if crt_data:
+            z.writestr(f"{safe}.crt", crt_data)
+        key_data = _sudo_read(key)
+        if key_data:
+            z.writestr(f"{safe}.key", key_data)
+        ca_data = _sudo_read(ca)
+        if ca_data:
+            z.writestr("ca.crt", ca_data)
         z.writestr(f"{safe}_config.yaml", _nebula_client_config_yaml(safe))
     buf.seek(0)
     return send_file(buf, mimetype="application/zip",
                      as_attachment=True, download_name=f"nebula_{safe}.zip")
+
+@app.route("/api/nebula/announce", methods=["POST"])
+def api_nebula_announce():
+    """Nodo cliente anuncia sus subnets locales; el servidor agrega rutas ip hacia él."""
+    data      = request.json or {}
+    nebula_ip = data.get("nebula_ip", "").strip()
+    subnets   = data.get("subnets", [])
+    if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', nebula_ip):
+        return jsonify({"error": "nebula_ip inválida"}), 400
+    if not nebula_ip.startswith("192.168.100."):
+        return jsonify({"error": "IP fuera del rango Nebula"}), 403
+    added, errors = [], []
+    for subnet in subnets[:15]:
+        subnet = subnet.strip()
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$', subnet):
+            continue
+        if subnet.startswith("192.168.100.") or subnet.startswith("127."):
+            continue
+        r = subprocess.run(
+            ["sudo", "ip", "route", "replace", subnet, "via", nebula_ip, "dev", "nebula0"],
+            capture_output=True, text=True)
+        if r.returncode == 0:
+            added.append(subnet)
+        else:
+            errors.append(f"{subnet}: {r.stderr.strip()}")
+    return jsonify({"ok": True, "added": added, "errors": errors})
 
 @app.route("/api/nebula/config/<name>")
 def api_nebula_config(name):
@@ -1818,17 +1854,11 @@ relay:
 
 tun:
   disabled: false
-  # macOS: debe ser utun o utun[0-9]+  |  Linux: puede ser nebula0 o cualquier nombre
-  dev: utun
+  dev: nebula0
   drop_local_broadcast: false
   drop_multicast: false
   tx_queue: 500
   mtu: 1300
-  # Para exponer tu red local al servidor Kali, descomenta y ajusta:
-  # unsafe_routes:
-  #   - route: 10.11.121.0/24   # tu subnet local
-  #     via: <TU_IP_NEBULA>      # tu IP en la VPN Nebula (ej: 192.168.100.12)
-  #     mtu: 1300
 
 logging:
   level: info
@@ -1850,6 +1880,13 @@ firewall:
     - port: any
       proto: any
       host: any
+
+# ── Exponer tu red local al servidor Kali ─────────────────────────────────────
+# Ejecuta el script incluido en el bundle para registrar tus subnets automáticamente:
+#   Linux/macOS : sudo bash announce.sh
+#   Windows     : PowerShell (como Admin) > .\\announce.ps1
+# Esto habilita el reenvío IP en tu máquina y notifica al servidor Kali
+# para que pueda escanear tu red local sin configuración adicional.
 """
 
 @app.route("/api/ping", methods=["POST"])

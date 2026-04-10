@@ -129,7 +129,7 @@ pki:
   key: /etc/nebula/${name}.key
 
 static_host_map:
-  "${SERVER_NEBULA_IP}/24": ["${server_pub}:${LISTEN_PORT}"]
+  "${SERVER_NEBULA_IP}": ["${server_pub}:${LISTEN_PORT}"]
 
 lighthouse:
   am_lighthouse: false
@@ -176,6 +176,11 @@ firewall:
     - port: any
       proto: any
       group: clients
+
+# ── Exponer tu red local al servidor Kali ─────────────────────────────────────
+# Ejecuta el script incluido en el bundle para registrar tus subnets:
+#   Linux/macOS : sudo bash announce.sh
+#   Windows     : PowerShell (como Admin) > .\announce.ps1
 YAML
 }
 
@@ -195,6 +200,87 @@ cmd_bundle() {
     [ -f "$key" ] && cp "$key" "$outdir/${name}.key" && chmod 600 "$outdir/${name}.key"
     [ -f "$ca"  ] && cp "$ca"  "$outdir/ca.crt"
     cmd_config "$name" > "$outdir/${name}_config.yaml"
+
+    # ── announce.sh (Linux / macOS) ──────────────────────────────────────────
+    cat > "$outdir/announce.sh" <<'ANNOUNCE_SH'
+#!/bin/bash
+# Registra las subnets locales de este nodo en el servidor Kali
+# Uso: sudo bash announce.sh
+set -e
+KALI_URL="http://3.143.18.161:8040"
+NEBULA_IF="nebula0"
+
+MY_NEBULA_IP=$(ip addr show "$NEBULA_IF" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+[ -z "$MY_NEBULA_IP" ] && { echo "[!] $NEBULA_IF no está activa. Arranca Nebula primero."; exit 1; }
+
+# Habilitar reenvío IP
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+# MASQUERADE: el tráfico del overlay Nebula sale con nuestra IP local
+iptables -t nat -C POSTROUTING -s 192.168.100.0/24 ! -o nebula0 -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -s 192.168.100.0/24 ! -o nebula0 -j MASQUERADE
+
+# Obtener subnets locales (excluye nebula, loopback y rutas host /32)
+SUBNETS=$(ip route show | awk '$1~/\// && $1!~/^192\.168\.100\.|^127\./ {print $1}' | sort -u | head -10)
+
+[ -z "$SUBNETS" ] && { echo "[!] No se encontraron subnets locales."; exit 1; }
+
+# Construir JSON
+JSON="{\"nebula_ip\":\"$MY_NEBULA_IP\",\"subnets\":["
+first=1
+for s in $SUBNETS; do
+  [ $first -eq 0 ] && JSON+=","
+  JSON+="\"$s\""
+  first=0
+done
+JSON+="]}"
+
+echo "[*] Registrando en Kali: $JSON"
+curl -sf -X POST "$KALI_URL/api/nebula/announce" \
+  -H "Content-Type: application/json" -d "$JSON" && echo "[+] Rutas registradas OK" || echo "[!] Error al contactar Kali"
+ANNOUNCE_SH
+    chmod +x "$outdir/announce.sh"
+
+    # ── announce.ps1 (Windows) ───────────────────────────────────────────────
+    cat > "$outdir/announce.ps1" <<'ANNOUNCE_PS1'
+# Registra las subnets locales de este nodo en el servidor Kali
+# Ejecutar como Administrador: PowerShell -ExecutionPolicy Bypass -File announce.ps1
+$KaliUrl   = "http://3.143.18.161:8040"
+$NebulaIf  = "nebula0"
+
+$NebulaIP = (Get-NetIPAddress -InterfaceAlias $NebulaIf -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+if (-not $NebulaIP) { Write-Host "[!] $NebulaIf no está activa. Arranca Nebula primero." ; exit 1 }
+
+# Habilitar reenvío IP (requiere Admin)
+try {
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" `
+        -Name "IPEnableRouter" -Value 1 -ErrorAction Stop
+} catch { Write-Host "[!] No se pudo habilitar IPEnableRouter: $_" }
+
+# NAT: tráfico del overlay Nebula sale con nuestra IP local
+$existingNat = Get-NetNat -Name "NebulaNAT" -ErrorAction SilentlyContinue
+if (-not $existingNat) {
+    try { New-NetNat -Name "NebulaNAT" -InternalIPInterfaceAddressPrefix "192.168.100.0/24" | Out-Null
+          Write-Host "[+] NAT NebulaNAT creado" }
+    catch { Write-Host "[!] No se pudo crear NAT: $_" }
+}
+
+# Obtener subnets locales (excluye nebula, loopback, /32)
+$subnets = Get-NetRoute -AddressFamily IPv4 |
+    Where-Object { $_.NextHop -eq "0.0.0.0" -and $_.PrefixLength -lt 32 -and
+                   $_.DestinationPrefix -notmatch "^127\.|^192\.168\.100\." } |
+    Select-Object -ExpandProperty DestinationPrefix | Select-Object -First 10
+
+if (-not $subnets) { Write-Host "[!] No se encontraron subnets locales." ; exit 1 }
+
+$body = @{ nebula_ip = $NebulaIP; subnets = @($subnets) } | ConvertTo-Json
+Write-Host "[*] Registrando en Kali: $body"
+try {
+    $resp = Invoke-RestMethod -Uri "$KaliUrl/api/nebula/announce" -Method Post `
+                               -Body $body -ContentType "application/json"
+    Write-Host "[+] Rutas registradas: $($resp.added -join ', ')"
+} catch { Write-Host "[!] Error al contactar Kali: $_" }
+ANNOUNCE_PS1
 
     title "Bundle generado en: $outdir"
     ls -lh "$outdir"

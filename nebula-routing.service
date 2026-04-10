@@ -6,8 +6,15 @@ Wants=nebula.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'ip rule add to 192.168.100.0/24 table main priority 100 2>/dev/null; ip rule add from 192.168.100.0/24 table main priority 100 2>/dev/null; true'
-ExecStop=/bin/sh -c 'ip rule del to 192.168.100.0/24 table main priority 100 2>/dev/null; ip rule del from 192.168.100.0/24 table main priority 100 2>/dev/null; true'
+ExecStart=/bin/sh -c '\
+  sysctl -w net.ipv4.ip_forward=1; \
+  ip rule add to 192.168.100.0/24 table main priority 100 2>/dev/null; \
+  ip rule add from 192.168.100.0/24 table main priority 100 2>/dev/null; \
+  true'
+ExecStop=/bin/sh -c '\
+  ip rule del to 192.168.100.0/24 table main priority 100 2>/dev/null; \
+  ip rule del from 192.168.100.0/24 table main priority 100 2>/dev/null; \
+  true'
 
 [Install]
 WantedBy=multi-user.target
