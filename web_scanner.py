@@ -1786,6 +1786,142 @@ def api_nebula_cert_download(name):
     return send_file(buf, mimetype="application/zip",
                      as_attachment=True, download_name=f"nebula_{safe}.zip")
 
+# ── ffuf jobs state ────────────────────────────────────────────────────────────
+ffuf_jobs: dict[str, dict] = {}
+
+@app.route("/api/ffuf/start", methods=["POST"])
+def api_ffuf_start():
+    data = request.json or {}
+    url      = data.get("url", "").strip()
+    wordlist = data.get("wordlist", "/usr/share/wordlists/dirb/common.txt").strip()
+    method   = data.get("method", "GET").strip().upper()
+    threads  = min(int(data.get("threads", 40)), 200)
+    timeout  = min(int(data.get("timeout", 10)), 60)
+    ext      = data.get("extensions", "").strip()
+    headers  = data.get("headers", "").strip()
+    cookies  = data.get("cookies", "").strip()
+    postdata = data.get("postdata", "").strip()
+    fc       = data.get("fc", "").strip()
+    fs       = data.get("fs", "").strip()
+    fw       = data.get("fw", "").strip()
+    fl       = data.get("fl", "").strip()
+    mc       = data.get("mc", "").strip()
+    mr       = data.get("mr", "").strip()
+    auto_fp  = bool(data.get("auto_fp", True))
+
+    # Validación básica
+    if not url or "FUZZ" not in url:
+        return jsonify({"error": "URL debe contener FUZZ como marcador"}), 400
+    if not re.match(r'^https?://', url):
+        return jsonify({"error": "URL debe comenzar con http:// o https://"}), 400
+    if not os.path.exists(wordlist):
+        return jsonify({"error": f"Wordlist no encontrada: {wordlist}"}), 400
+
+    # Construir comando ffuf
+    cmd = ["ffuf", "-u", url, "-w", wordlist,
+           "-t", str(threads), "-timeout", str(timeout),
+           "-noninteractive", "-json"]
+
+    if method != "GET":
+        cmd += ["-X", method]
+    if ext:
+        cmd += ["-e", "." + ext.replace(",", ",.").lstrip(".")]
+    if headers:
+        for h in headers.split(";"):
+            h = h.strip()
+            if h:
+                cmd += ["-H", h]
+    if cookies:
+        cmd += ["-b", cookies]
+    if postdata:
+        cmd += ["-d", postdata]
+    if fc:
+        cmd += ["-fc", fc]
+    if fs:
+        cmd += ["-fs", fs]
+    if fw:
+        cmd += ["-fw", fw]
+    if fl:
+        cmd += ["-fl", fl]
+    if mc:
+        cmd += ["-mc", mc]
+    if mr:
+        cmd += ["-mr", mr]
+    if auto_fp:
+        cmd += ["-ac"]   # auto-calibration: detecta y filtra respuestas baseline (falsos positivos)
+
+    job_id = str(uuid.uuid4())
+    ffuf_jobs[job_id] = {
+        "cmd": cmd, "running": True, "results": [],
+        "raw_lines": [], "error": None, "progress": "", "proc": None
+    }
+
+    def _run(jid, cmd):
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            ffuf_jobs[jid]["proc"] = proc
+            for line in proc.stdout:
+                line = line.rstrip()
+                ffuf_jobs[jid]["raw_lines"].append(line)
+                # ffuf con -json emite un JSON final al terminar; parsear línea a línea
+                if line.startswith("{"):
+                    try:
+                        obj = json.loads(line)
+                        # JSON final con clave "results"
+                        if "results" in obj:
+                            for r in obj["results"]:
+                                ffuf_jobs[jid]["results"].append({
+                                    "status":   r.get("status", 0),
+                                    "url":      r.get("url", ""),
+                                    "length":   r.get("length", 0),
+                                    "words":    r.get("words", 0),
+                                    "lines":    r.get("lines", 0),
+                                    "duration": r.get("duration", 0),
+                                })
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                # Progreso: línea de estado que ffuf imprime al stderr redirigido
+                if "req/sec" in line or "Progress:" in line:
+                    ffuf_jobs[jid]["progress"] = line.strip()
+            proc.wait()
+            if proc.returncode not in (0, -15):
+                ffuf_jobs[jid]["error"] = f"ffuf salió con código {proc.returncode}"
+        except FileNotFoundError:
+            ffuf_jobs[jid]["error"] = "ffuf no encontrado. Instala: sudo apt install ffuf"
+        except Exception as e:
+            ffuf_jobs[jid]["error"] = str(e)
+        finally:
+            ffuf_jobs[jid]["running"] = False
+
+    t = threading.Thread(target=_run, args=(job_id, cmd), daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/api/ffuf/stop/<job_id>", methods=["POST"])
+def api_ffuf_stop(job_id):
+    job = ffuf_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+    proc = job.get("proc")
+    if proc and job["running"]:
+        proc.terminate()
+    job["running"] = False
+    return jsonify({"ok": True})
+
+@app.route("/api/ffuf/results/<job_id>")
+def api_ffuf_results(job_id):
+    job = ffuf_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+    return jsonify({
+        "running":   job["running"],
+        "results":   job["results"],
+        "raw_lines": job["raw_lines"][-300:],   # últimas 300 líneas
+        "error":     job["error"],
+        "progress":  job["progress"],
+    })
+
 @app.route("/api/nebula/announce", methods=["POST"])
 def api_nebula_announce():
     """Nodo cliente anuncia sus subnets locales; el servidor agrega rutas ip hacia él."""
@@ -2466,6 +2602,7 @@ select option{background:var(--bg3)}
       <div class="tab" id="tab-btn-capture"  onclick="showTab('capture',this);loadCapIfaces()">&#x1F4E1; Captura de Tráfico</div>
       <div class="tab" id="tab-btn-ids"      onclick="showTab('ids',this)">&#x1F6E1; IDS Suricata</div>
       <div class="tab" id="tab-btn-nebula"   onclick="showTab('nebula',this);loadNebulaTab()">&#x1F300; Nebula VPN</div>
+      <div class="tab" id="tab-btn-fuzz"     onclick="showTab('fuzz',this)">&#x1F4A5; Pentesting Externo</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -2792,6 +2929,145 @@ select option{background:var(--bg3)}
 </div>
 
 <!-- ── NEBULA TAB ─────────────────────────────────────────────────────────── -->
+<div class="tab-content" id="tab-fuzz" style="flex-direction:column;overflow:auto;padding:20px;gap:18px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+    <h2 style="margin:0;font-size:1rem;color:var(--blue)">&#x1F4A5; Pentesting Externo — Fuzzing Web (ffuf)</h2>
+    <span id="fuzz-status-badge" style="font-size:.78rem;color:var(--dim)"></span>
+  </div>
+
+  <!-- Config panel -->
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;background:var(--bg2);border-radius:10px;padding:16px">
+    <div class="form-group">
+      <label>URL objetivo <span style="color:var(--red)">*</span></label>
+      <input id="fz-url" placeholder="https://ejemplo.com/FUZZ" style="width:100%">
+      <span style="font-size:.72rem;color:var(--dim)">Usa <code>FUZZ</code> como marcador de posición</span>
+    </div>
+    <div class="form-group">
+      <label>Wordlist</label>
+      <select id="fz-wl" style="width:100%">
+        <option value="/usr/share/wordlists/dirb/common.txt">dirb/common (4k)</option>
+        <option value="/usr/share/wordlists/dirb/big.txt">dirb/big (20k)</option>
+        <option value="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt">raft-medium-dirs (30k)</option>
+        <option value="/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt">raft-large-dirs (62k)</option>
+        <option value="/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt">dirbuster-medium (220k)</option>
+        <option value="/usr/share/seclists/Fuzzing/LFI/LFI-Jhaddix.txt">LFI – Jhaddix</option>
+        <option value="/usr/share/seclists/Fuzzing/SQLi/Generic-SQLi.txt">SQLi – Generic</option>
+        <option value="/usr/share/seclists/Fuzzing/XSS/XSS-Jhaddix.txt">XSS – Jhaddix</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Extensiones (opcional)</label>
+      <input id="fz-ext" placeholder="php,html,js,txt" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label>Método HTTP</label>
+      <select id="fz-method" style="width:100%">
+        <option>GET</option><option>POST</option><option>PUT</option><option>HEAD</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Threads</label>
+      <input id="fz-threads" type="number" value="40" min="1" max="200" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label>Timeout por req (seg)</label>
+      <input id="fz-timeout" type="number" value="10" min="1" max="60" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label>Cabeceras extra (opcional)</label>
+      <input id="fz-headers" placeholder="Authorization: Bearer token123" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label>Cookies (opcional)</label>
+      <input id="fz-cookies" placeholder="session=abc123" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label>POST body (solo POST)</label>
+      <input id="fz-postdata" placeholder="user=FUZZ&pass=test" style="width:100%">
+    </div>
+  </div>
+
+  <!-- Filtros anti-falsos positivos -->
+  <div style="background:var(--bg2);border:1px solid #9a5700;border-radius:10px;padding:16px">
+    <div style="font-size:.8rem;font-weight:700;color:#f0a500;margin-bottom:10px">&#x26A0; Filtros anti-falsos positivos</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px">
+      <div class="form-group">
+        <label>Filtrar códigos HTTP</label>
+        <input id="fz-fc" placeholder="404,400,403" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">Ocultar respuestas con estos códigos</span>
+      </div>
+      <div class="form-group">
+        <label>Filtrar por tamaño (bytes)</label>
+        <input id="fz-fs" placeholder="ej: 1234" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">Ocultar respuestas de este tamaño exacto</span>
+      </div>
+      <div class="form-group">
+        <label>Filtrar por palabras</label>
+        <input id="fz-fw" placeholder="ej: 23" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">Ocultar respuestas con N palabras</span>
+      </div>
+      <div class="form-group">
+        <label>Filtrar por líneas</label>
+        <input id="fz-fl" placeholder="ej: 9" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">Ocultar respuestas con N líneas</span>
+      </div>
+      <div class="form-group">
+        <label>Matcher códigos (solo mostrar)</label>
+        <input id="fz-mc" placeholder="200,201,301,302" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">Solo mostrar estos códigos</span>
+      </div>
+      <div class="form-group">
+        <label>Matcher regex en respuesta</label>
+        <input id="fz-mr" placeholder="ej: admin|dashboard" style="width:100%">
+      </div>
+      <div class="form-group" style="grid-column:span 2">
+        <label>Auto-detectar falsos positivos</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:6px">
+          <input type="checkbox" id="fz-auto-fp" checked>
+          <span style="font-size:.82rem">Enviar primero petición de calibración y filtrar automáticamente respuestas idénticas</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Controls -->
+  <div style="display:flex;gap:10px;align-items:center">
+    <button class="btn btn-red" onclick="startFuzz()">&#x25B6; Lanzar ffuf</button>
+    <button class="btn btn-gray" id="fz-stop-btn" onclick="stopFuzz()" disabled>&#x25A0; Detener</button>
+    <button class="btn btn-gray" onclick="clearFuzz()">Limpiar</button>
+    <span id="fz-progress" style="font-size:.8rem;color:var(--dim)"></span>
+  </div>
+
+  <!-- Results table -->
+  <div style="background:var(--bg2);border-radius:10px;overflow:hidden">
+    <div style="padding:10px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--bg4)">
+      <span style="font-size:.85rem;font-weight:700;color:var(--blue)">Resultados</span>
+      <span id="fz-count" style="font-size:.78rem;color:var(--dim)">0 hallazgos</span>
+    </div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:.82rem">
+        <thead>
+          <tr style="background:var(--bg3)">
+            <th style="padding:7px 12px;text-align:left">Código</th>
+            <th style="padding:7px 12px;text-align:left">URL</th>
+            <th style="padding:7px 12px;text-align:right">Tamaño</th>
+            <th style="padding:7px 12px;text-align:right">Palabras</th>
+            <th style="padding:7px 12px;text-align:right">Líneas</th>
+            <th style="padding:7px 12px;text-align:right">RT (ms)</th>
+          </tr>
+        </thead>
+        <tbody id="fz-results-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Raw output -->
+  <div>
+    <div style="font-size:.78rem;color:var(--dim);margin-bottom:4px">Salida raw (ffuf)</div>
+    <pre id="fz-raw" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:8px;padding:12px;font-size:.75rem;max-height:260px;overflow:auto;white-space:pre-wrap"></pre>
+  </div>
+</div>
+
 <div class="tab-content" id="tab-nebula" style="flex-direction:column;overflow:auto;padding:20px;gap:18px">
 
   <!-- Estado del servidor Nebula -->
@@ -4230,6 +4506,125 @@ async function nebulaRevokeCert(name) {
   await fetch('/api/nebula/certs/'+encodeURIComponent(name), {method:'DELETE'});
   setStatus(`Certificado "${name}" eliminado.`);
   await loadNebulaCerts();
+}
+
+// ── Pentesting Externo — ffuf ─────────────────────────────────────────────────
+let fuzzJobId = null;
+let fuzzResults = [];
+
+function codeColor(code) {
+  const c = parseInt(code);
+  if (c >= 200 && c < 300) return 'var(--green)';
+  if (c >= 300 && c < 400) return 'var(--yellow)';
+  if (c >= 400 && c < 500) return 'var(--red)';
+  if (c >= 500) return '#ff8800';
+  return 'var(--dim)';
+}
+
+async function startFuzz() {
+  const url     = document.getElementById('fz-url').value.trim();
+  if (!url) { alert('URL objetivo requerida (con FUZZ como marcador)'); return; }
+  if (!url.includes('FUZZ')) { alert('La URL debe contener la palabra FUZZ como marcador de posición'); return; }
+
+  const payload = {
+    url,
+    wordlist:  document.getElementById('fz-wl').value,
+    extensions:document.getElementById('fz-ext').value.trim(),
+    method:    document.getElementById('fz-method').value,
+    threads:   parseInt(document.getElementById('fz-threads').value) || 40,
+    timeout:   parseInt(document.getElementById('fz-timeout').value) || 10,
+    headers:   document.getElementById('fz-headers').value.trim(),
+    cookies:   document.getElementById('fz-cookies').value.trim(),
+    postdata:  document.getElementById('fz-postdata').value.trim(),
+    fc:        document.getElementById('fz-fc').value.trim(),
+    fs:        document.getElementById('fz-fs').value.trim(),
+    fw:        document.getElementById('fz-fw').value.trim(),
+    fl:        document.getElementById('fz-fl').value.trim(),
+    mc:        document.getElementById('fz-mc').value.trim(),
+    mr:        document.getElementById('fz-mr').value.trim(),
+    auto_fp:   document.getElementById('fz-auto-fp').checked
+  };
+
+  fuzzResults = [];
+  document.getElementById('fz-results-body').innerHTML = '';
+  document.getElementById('fz-raw').textContent = '';
+  document.getElementById('fz-count').textContent = '0 hallazgos';
+  document.getElementById('fz-progress').textContent = 'Iniciando…';
+  document.getElementById('fz-stop-btn').disabled = false;
+
+  try {
+    const res = await fetch('/api/ffuf/start', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
+    });
+    const d = await res.json();
+    if (!res.ok) { alert('Error: ' + (d.error||'desconocido')); return; }
+    fuzzJobId = d.job_id;
+    pollFuzz();
+  } catch(e) { alert('Error iniciando ffuf: ' + e); }
+}
+
+async function stopFuzz() {
+  if (!fuzzJobId) return;
+  await fetch('/api/ffuf/stop/' + fuzzJobId, {method:'POST'});
+  document.getElementById('fz-stop-btn').disabled = true;
+  document.getElementById('fz-progress').textContent = 'Detenido.';
+}
+
+function clearFuzz() {
+  fuzzResults = [];
+  fuzzJobId = null;
+  document.getElementById('fz-results-body').innerHTML = '';
+  document.getElementById('fz-raw').textContent = '';
+  document.getElementById('fz-count').textContent = '0 hallazgos';
+  document.getElementById('fz-progress').textContent = '';
+  document.getElementById('fz-stop-btn').disabled = true;
+  document.getElementById('fuzz-status-badge').textContent = '';
+}
+
+async function pollFuzz() {
+  if (!fuzzJobId) return;
+  try {
+    const res = await fetch('/api/ffuf/results/' + fuzzJobId);
+    const d   = await res.json();
+
+    // Actualizar raw
+    const rawEl = document.getElementById('fz-raw');
+    rawEl.textContent = (d.raw_lines || []).join('\n');
+    rawEl.scrollTop = rawEl.scrollHeight;
+
+    // Añadir filas nuevas a la tabla
+    const tbody = document.getElementById('fz-results-body');
+    const existing = tbody.querySelectorAll('tr').length;
+    const hits = d.results || [];
+    for (let i = existing; i < hits.length; i++) {
+      const h = hits[i];
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid var(--bg4)';
+      const color = codeColor(h.status);
+      tr.innerHTML = `
+        <td style="padding:6px 12px;font-weight:700;color:${color}">${h.status}</td>
+        <td style="padding:6px 12px"><a href="${h.url}" target="_blank" style="color:var(--blue);word-break:break-all">${h.url}</a></td>
+        <td style="padding:6px 12px;text-align:right;color:var(--dim)">${h.length}</td>
+        <td style="padding:6px 12px;text-align:right;color:var(--dim)">${h.words}</td>
+        <td style="padding:6px 12px;text-align:right;color:var(--dim)">${h.lines}</td>
+        <td style="padding:6px 12px;text-align:right;color:var(--dim)">${h.duration}</td>`;
+      tbody.appendChild(tr);
+    }
+    document.getElementById('fz-count').textContent = hits.length + ' hallazgos';
+
+    if (d.running) {
+      document.getElementById('fz-progress').textContent = `Procesando… ${d.progress||''}`;
+      document.getElementById('fuzz-status-badge').textContent = '🔄 Corriendo';
+      setTimeout(pollFuzz, 1500);
+    } else {
+      document.getElementById('fz-progress').textContent = d.error ? '✗ ' + d.error : '✓ Completado';
+      document.getElementById('fuzz-status-badge').textContent = d.error ? '✗ Error' : '✓ Listo';
+      document.getElementById('fz-stop-btn').disabled = true;
+    }
+  } catch(e) {
+    document.getElementById('fz-progress').textContent = 'Error polling: ' + e;
+    setTimeout(pollFuzz, 3000);
+  }
 }
 </script>
 </body>
