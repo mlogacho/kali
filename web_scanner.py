@@ -5,7 +5,7 @@ Corre en el servidor Kali en el puerto 8040.
 Acceder desde: http://<kali-ip>:8040
 """
 
-import os, json, re, datetime, subprocess, threading, time, uuid, io
+import os, json, re, datetime, subprocess, threading, time, uuid, io, ipaddress
 from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context, send_file
 
 app = Flask(__name__)
@@ -34,23 +34,27 @@ if not os.path.exists(CLIENTS_FILE):
 active_scans: dict[str, dict] = {}
 network_maps: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
+# Probe (sonda) state — registered probes and their scan results
+registered_probes: dict[str, dict] = {}   # nebula_ip → {name, subnets, last_seen, ...}
+probe_scan_results: dict[str, dict] = {}  # probe_ip → {hosts: [...], timestamp, status}
 
 SCAN_PROFILES = {
-    "Descubrimiento (hosts vivos)":      "nmap -sT -T4 --open -p 22,80,443,445,3306,3389,8080,8443,21,25,110,8000 {target}",
-    "Puertos top-1000":                   "nmap -sT -Pn -T4 --open {target}",
-    "Puertos completos (1-65535)":        "nmap -sT -Pn -T4 -p- --open {target}",
-    "Info HTTP/SSH/FTP":                  "nmap -sT -Pn -T4 --script http-title,http-headers,ssh-hostkey,ftp-anon {target}",
-    "Vulnerabilidades NSE":               "nmap -sT -Pn -T4 --script 'vuln and not ssl-heartbleed and not ssl-poodle and not sslv2-drown and not ssl-ccs-injection and not ssl-cert-intaddr and not ssl-known-key and not tls-ticketbleed' {target}",
-    "Vuln + Info HTTP/SSH (completo)":    "nmap -sT -Pn -T4 --script 'vuln and not ssl-heartbleed and not ssl-poodle and not sslv2-drown and not ssl-ccs-injection and not ssl-cert-intaddr and not ssl-known-key and not tls-ticketbleed',http-title,http-headers,ssh-hostkey {target}",
-    "CVEs con CVSS (vulners)":            "nmap -sT -Pn -T4 --script vulners --script-args mincvss=5.0 {target}",
+    "Descubrimiento (hosts vivos)":      "nmap -sn -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 {target}",
+    "Escaneo rápido (puertos comunes)":   "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 -p 22,80,443,445,3306,3389,8080,8443,21,25,110,8000 {target}",
+    "Puertos top-1000":                   "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 {target}",
+    "Puertos completos (1-65535)":        "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 -p- {target}",
+    "Info HTTP/SSH/FTP":                  "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 --script http-title,http-headers,ssh-hostkey,ftp-anon {target}",
+    "Vulnerabilidades NSE":               "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 --script 'vuln and not ssl-heartbleed and not ssl-poodle and not sslv2-drown and not ssl-ccs-injection and not ssl-cert-intaddr and not ssl-known-key and not tls-ticketbleed' {target}",
+    "Vuln + Info HTTP/SSH (completo)":    "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 --script 'vuln and not ssl-heartbleed and not ssl-poodle and not sslv2-drown and not ssl-ccs-injection and not ssl-cert-intaddr and not ssl-known-key and not tls-ticketbleed',http-title,http-headers,ssh-hostkey {target}",
+    "CVEs con CVSS (vulners)":            "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 --script vulners --script-args mincvss=5.0 {target}",
     "Web / HTTP (nikto)":                 "nikto -h {target}",
-    "SMB vulnerabilidades":               "nmap -sT -Pn -p445 --script 'smb-vuln*' -T4 {target}",
-    "SSL/TLS — red/subred (nmap)":        "nmap -sT -Pn --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
+    "SMB vulnerabilidades":               "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -p445 --script 'smb-vuln*' -T4 {target}",
+    "SSL/TLS — red/subred (nmap)":        "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 --script ssl-enum-ciphers,ssl-cert,ssl-dh-params -p 443,8443,8080,8888,8000 -T4 {target}",
     "SSL/TLS — host único (sslscan)":     "sslscan --no-colour {target}",
     # ── Fase 2: Enumeración de servicios ──────────────────────────────────────
     "Enum SMB completo (enum4linux)":     "enum4linux -a {target}",
     "SMB shares anónimo (smbclient)":     "smbclient -L //{target} -N",
-    "Banner grabbing (puertos clave)":    "nmap -sT -Pn -T4 --script=banner -p 21,22,23,25,80,110,143,443,3389,8080 {target}",
+    "Banner grabbing (puertos clave)":    "nmap -sT -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 --script=banner -p 21,22,23,25,80,110,143,443,3389,8080 {target}",
     "SNMP walk — community public":       "snmpwalk -v2c -c public -t 10 {target}",
     "SNMP walk — community private":      "snmpwalk -v2c -c private -t 10 {target}",
     # ── Fase 3: Análisis de aplicaciones web ──────────────────────────────────
@@ -153,8 +157,8 @@ def _parse_hosts_from_lines(lines: list) -> list:
             cur["ports"].append(f"{pm.group(1)}/{pm.group(2)}")
     if cur:
         hosts.append(cur)
-    # Only return hosts with at least one confirmed open port
-    return [h for h in hosts if h["ports"]]
+    # Return all discovered hosts, even if no ports are open
+    return hosts
 
 
 # ── PDF Generation ─────────────────────────────────────────────────────────────
@@ -667,7 +671,21 @@ def generate_executive_html_report(scan: dict) -> str:
         <div class="host-score">Puntuación de riesgo: {h['_score']}</div>
         <div class="host-services">{''.join(svc_tag(ps) for ps in h.get('ports',[])[:8])}</div>
       </div>""" for h in top6) or \
-      '<div style="color:#8A94A6;font-size:13px;padding:12px 0;">No se detectaron hosts con servicios activos.</div>'
+      '<div style="color:#8A94A6;font-size:13px;padding:12px 0;">No se detectaron hosts prioritarios relevantes.</div>'
+
+    def _sort_ip(h):
+        try: return [int(p) for p in h['ip'].split('.')]
+        except: return [0,0,0,0]
+
+    inventory_rows = "".join(f"""
+      <tr>
+        <td style="font-family:monospace;font-weight:600;">{e(h['ip'])}</td>
+        <td>{e(h.get('hostname') or '—')}</td>
+        <td style="font-family:monospace;color:#5C6B8A;">{e(h.get('mac') or '—')}</td>
+        <td>{e(h.get('vendor') or '—')}</td>
+        <td style="color:#185FA5;">{e(", ".join(h.get('ports',[])) or '—')}</td>
+      </tr>""" for h in sorted(hosts, key=_sort_ip))
+
 
     action_items = "".join(f"""
       <li class="action-item {css}">
@@ -784,6 +802,10 @@ body{{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
 .footer-confidential{{font-size:10px;color:#8A94A6;text-align:right;max-width:260px;line-height:1.5}}
 .confidential-badge{{display:inline-block;background:#1A1A2E;color:#fff;font-size:9px;font-weight:700;
                     letter-spacing:.15em;text-transform:uppercase;padding:2px 8px;border-radius:3px;margin-bottom:4px}}
+.inventory-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px;}}
+.inventory-table th{{text-align:left;background:#E8ECF2;padding:10px 12px;color:#5C6B8A;font-weight:700;text-transform:uppercase;letter-spacing:.05em;}}
+.inventory-table td{{padding:10px 12px;border-bottom:1px solid #E0E6EF;color:#1A1A2E;}}
+.inventory-table tr:nth-child(even){{background:#FAFBFD;}}
 @media print{{
   body{{background:#fff}}
   .page{{box-shadow:none;border-radius:0;margin:0}}
@@ -848,6 +870,26 @@ body{{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
     <section class="section">
       <div class="section-title">Hosts Prioritarios</div>
       <div class="hosts-grid">{host_cards}</div>
+    </section>
+
+    <section class="section">
+      <div class="section-title">Inventario de Red Descubierto</div>
+      <div style="overflow-x:auto;">
+        <table class="inventory-table">
+          <thead>
+            <tr>
+              <th>IP</th>
+              <th>Hostname</th>
+              <th>Dirección MAC</th>
+              <th>Fabricante</th>
+              <th>Puertos Abiertos</th>
+            </tr>
+          </thead>
+          <tbody>
+            {inventory_rows}
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section class="section">
@@ -1548,7 +1590,7 @@ def api_nebula_setup():
     """Inicializa la PKI Nebula: descarga binario (si falta) y genera CA + cert del servidor."""
     data      = request.json or {}
     ca_name   = data.get("ca_name", "Datacom Security Nebula CA")
-    server_ip = data.get("server_ip", "192.168.100.1/24")
+    server_ip = data.get("server_ip", "10.255.255.1/24")
     dur       = data.get("duration", "87600h")
 
     def generate():
@@ -1690,7 +1732,7 @@ def api_nebula_generate():
     # Validar formato IP básico antes de llamar nebula-cert
     ip_re = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
     if not ip_re.match(nip):
-        return jsonify({"error": f"IP inválida: '{nip}'. Formato esperado: 192.168.100.10/24"}), 400
+        return jsonify({"error": f"IP inválida: '{nip}'. Formato esperado: 10.255.255.10/24"}), 400
 
     ca_crt = os.path.join(NEBULA_CERTS_DIR, "ca.crt")
     ca_key = os.path.join(NEBULA_CERTS_DIR, "ca.key")
@@ -1785,6 +1827,119 @@ def api_nebula_cert_download(name):
     buf.seek(0)
     return send_file(buf, mimetype="application/zip",
                      as_attachment=True, download_name=f"nebula_{safe}.zip")
+
+# ── Chisel tunnel state ───────────────────────────────────────────────────────
+CHISEL_BIN      = "/usr/local/bin/chisel"
+CHISEL_PORT     = 8888
+CHISEL_SOCKS_PORT = 1080
+chisel_proc: dict = {"proc": None, "pid": None, "clients": []}
+chisel_scan_jobs: dict[str, dict] = {}
+
+@app.route("/api/chisel/status")
+def api_chisel_status():
+    proc = chisel_proc.get("proc")
+    running = proc is not None and proc.poll() is None
+    clients = chisel_proc.get("clients", [])
+    return jsonify({
+        "running": running,
+        "pid":     proc.pid if running else None,
+        "port":    CHISEL_PORT,
+        "socks_port": CHISEL_SOCKS_PORT,
+        "clients": clients,
+    })
+
+@app.route("/api/chisel/start", methods=["POST"])
+def api_chisel_start():
+    proc = chisel_proc.get("proc")
+    if proc and proc.poll() is None:
+        return jsonify({"ok": True, "pid": proc.pid, "already": True})
+    try:
+        cmd = [CHISEL_BIN, "server", "--port", str(CHISEL_PORT),
+               "--reverse", "--socks5"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        chisel_proc["proc"] = p
+        chisel_proc["clients"] = []
+        return jsonify({"ok": True, "pid": p.pid})
+    except FileNotFoundError:
+        return jsonify({"error": f"chisel no encontrado en {CHISEL_BIN}. Instálalo primero."}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/chisel/stop", methods=["POST"])
+def api_chisel_stop():
+    proc = chisel_proc.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+        chisel_proc["proc"] = None
+        return jsonify({"ok": True})
+    return jsonify({"ok": True, "already_stopped": True})
+
+@app.route("/api/chisel/scan", methods=["POST"])
+def api_chisel_scan():
+    """Lanza nmap a través de proxychains por el túnel SOCKS5 de chisel."""
+    data   = request.json or {}
+    target = data.get("target", "").strip()
+    ports  = data.get("ports", "22,80,443,445,3389,8080,8443").strip()
+    if not target:
+        return jsonify({"error": "target requerido"}), 400
+    job_id = str(uuid.uuid4())
+    chisel_scan_jobs[job_id] = {"running": True, "lines": [], "error": None}
+
+    def _run(jid, tgt, prt):
+        try:
+            cmd = ["proxychains", "-q", "nmap", "-sT", "-Pn", "-T4",
+                   "--open", "-p", prt, tgt]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            chisel_scan_jobs[jid]["proc"] = proc
+            for line in proc.stdout:
+                chisel_scan_jobs[jid]["lines"].append(line.rstrip())
+            proc.wait()
+            if proc.returncode not in (0, 1):
+                chisel_scan_jobs[jid]["error"] = f"nmap retornó código {proc.returncode}"
+        except FileNotFoundError:
+            chisel_scan_jobs[jid]["error"] = "proxychains o nmap no encontrado"
+        except Exception as e:
+            chisel_scan_jobs[jid]["error"] = str(e)
+        finally:
+            chisel_scan_jobs[jid]["running"] = False
+
+    threading.Thread(target=_run, args=(job_id, target, ports), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/api/chisel/scan_results/<job_id>")
+def api_chisel_scan_results(job_id):
+    job = chisel_scan_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+    return jsonify({
+        "running": job["running"],
+        "lines":   job["lines"][-500:],
+        "error":   job["error"],
+    })
+
+@app.route("/api/chisel/scan_stop/<job_id>", methods=["POST"])
+def api_chisel_scan_stop(job_id):
+    job = chisel_scan_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job no encontrado"}), 404
+    proc = job.get("proc")
+    if proc and job["running"]:
+        proc.terminate()
+    job["running"] = False
+    return jsonify({"ok": True})
+
+@app.route("/api/chisel/log")
+def api_chisel_log():
+    try:
+        out = subprocess.check_output(
+            ["sudo", "cat", "/tmp/chisel.log"],
+            stderr=subprocess.STDOUT, text=True, timeout=5
+        )
+    except Exception as e:
+        out = str(e)
+    return jsonify({"log": out})
 
 # ── ffuf jobs state ────────────────────────────────────────────────────────────
 ffuf_jobs: dict[str, dict] = {}
@@ -1922,31 +2077,307 @@ def api_ffuf_results(job_id):
         "progress":  job["progress"],
     })
 
+@app.route("/api/probe/install")
+def api_probe_install():
+    """Sirve el script de instalación de la sonda."""
+    try:
+        with open("/opt/scanner/probe-gateway.sh", "r") as f:
+            return Response(f.read(), mimetype="text/x-shellscript")
+    except:
+        # Fallback si no está en /opt/scanner
+        try:
+            with open("probe-gateway.sh", "r") as f:
+                return Response(f.read(), mimetype="text/x-shellscript")
+        except:
+            return "Script no encontrado en el servidor.", 404
+
+@app.route("/api/probe/agent")
+def api_probe_agent():
+    """Sirve el script del agente de escaneo local."""
+    for path in ["/opt/scanner/probe-agent.sh", "probe-agent.sh"]:
+        try:
+            with open(path, "r") as f:
+                return Response(f.read(), mimetype="text/x-shellscript")
+        except FileNotFoundError:
+            continue
+    return "probe-agent.sh no encontrado.", 404
+
+@app.route("/api/probe/install.ps1")
+def api_probe_install_ps1():
+    """Sirve el script de instalación de la sonda para Windows (PowerShell)."""
+    try:
+        with open("/opt/scanner/probe-gateway.ps1", "r") as f:
+            return Response(f.read(), mimetype="text/plain")
+    except:
+        try:
+            with open("probe-gateway.ps1", "r") as f:
+                return Response(f.read(), mimetype="text/plain")
+        except:
+            return "Script PowerShell no encontrado.", 404
+
+# ── Probe (Sonda) API ──────────────────────────────────────────────────────────
+
+@app.route("/api/probe/register", methods=["POST"])
+def api_probe_register():
+    """Probe se registra con el servidor indicando nombre y subnets disponibles."""
+    data = request.json or {}
+    nebula_ip = data.get("nebula_ip", "").strip()
+    name = data.get("name", "").strip() or nebula_ip
+    subnets = data.get("subnets", [])
+    if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', nebula_ip):
+        return jsonify({"error": "nebula_ip inválida"}), 400
+    registered_probes[nebula_ip] = {
+        "name": name, "nebula_ip": nebula_ip, "subnets": subnets,
+        "last_seen": now_str(), "status": "online",
+    }
+    return jsonify({"ok": True, "probe": registered_probes[nebula_ip]})
+
+@app.route("/api/probe/list")
+def api_probe_list():
+    """Lista todas las sondas registradas."""
+    return jsonify({"probes": list(registered_probes.values())})
+
+@app.route("/api/probe/scan-results", methods=["POST"])
+def api_probe_scan_results():
+    """Probe envía sus resultados de escaneo local (arp-scan, nbtscan, nmap)."""
+    data = request.json or {}
+    nebula_ip = data.get("nebula_ip", "").strip()
+    hosts = data.get("hosts", [])
+    subnet = data.get("subnet", "").strip()
+    if not nebula_ip:
+        return jsonify({"error": "nebula_ip requerida"}), 400
+    # Update probe last_seen
+    if nebula_ip in registered_probes:
+        registered_probes[nebula_ip]["last_seen"] = now_str()
+    probe_scan_results[nebula_ip] = {
+        "hosts": hosts, "subnet": subnet,
+        "timestamp": now_str(), "status": "done",
+        "probe_name": registered_probes.get(nebula_ip, {}).get("name", nebula_ip),
+    }
+    return jsonify({"ok": True, "received": len(hosts)})
+
+@app.route("/api/probe/scan-results/<nebula_ip>")
+def api_probe_get_results(nebula_ip):
+    """Obtiene los resultados de escaneo de una sonda específica."""
+    r = probe_scan_results.get(nebula_ip)
+    if not r:
+        return jsonify({"error": "Sin resultados para esta sonda"}), 404
+    return jsonify(r)
+
+@app.route("/api/probe/all-results")
+def api_probe_all_results():
+    """Combina resultados de todas las sondas en una tabla unificada."""
+    all_hosts = []
+    for pip, res in probe_scan_results.items():
+        for h in res.get("hosts", []):
+            h["probe"] = res.get("probe_name", pip)
+            h["probe_ip"] = pip
+            all_hosts.append(h)
+    return jsonify({"hosts": all_hosts, "probe_count": len(probe_scan_results)})
+
+@app.route("/api/network/probe-scan", methods=["POST"])
+def api_network_probe_scan():
+    """Inicia escaneo de red usando la sonda local en vez de escaneo remoto.
+    Si hay una sonda registrada para el subnet solicitado, usa sus resultados.
+    Si no hay sonda, hace fallback al escaneo nmap remoto normal."""
+    data = request.json or {}
+    target = data.get("target", "").strip()
+    if not target:
+        return jsonify({"error": "target requerido"}), 400
+    if not re.match(r'^[\w./:@\-]+$', target):
+        return jsonify({"error": "target inválido"}), 400
+    # Check if any probe covers this subnet
+    probe_ip = None
+    for pip, p in registered_probes.items():
+        for s in p.get("subnets", []):
+            if _subnet_contains(s, target) or s == target:
+                probe_ip = pip
+                break
+        if probe_ip:
+            break
+    map_id = str(uuid.uuid4())[:8]
+    network_maps[map_id] = {
+        "done": False, "status": "Iniciando...",
+        "nodes": [], "edges": [], "target": target,
+        "mode": "probe" if probe_ip else "remote",
+    }
+    if probe_ip and probe_ip in probe_scan_results:
+        # Use cached probe results directly
+        threading.Thread(
+            target=_build_map_from_probe, args=(map_id, probe_ip, target),
+            daemon=True
+        ).start()
+    else:
+        # Fallback: remote nmap scan
+        threading.Thread(target=_run_network_map, args=(map_id, target), daemon=True).start()
+    return jsonify({"map_id": map_id, "mode": "probe" if probe_ip else "remote"})
+
+def _subnet_contains(subnet_cidr: str, target: str) -> bool:
+    """Verifica si un target IP/CIDR está dentro de un subnet."""
+    try:
+        net = ipaddress.ip_network(subnet_cidr, strict=False)
+        # target could be a single IP or CIDR
+        if '/' in target:
+            tgt = ipaddress.ip_network(target, strict=False)
+            return tgt.subnet_of(net) or tgt == net
+        else:
+            return ipaddress.ip_address(target) in net
+    except:
+        return False
+
+def _build_map_from_probe(map_id: str, probe_ip: str, target: str):
+    """Construye el mapa de red a partir de resultados de la sonda."""
+    state = network_maps[map_id]
+    try:
+        state["status"] = f"Usando datos de sonda {probe_ip}..."
+        res = probe_scan_results.get(probe_ip, {})
+        hosts = []
+        for h in res.get("hosts", []):
+            node = {
+                "ip": h.get("ip", ""),
+                "hostname": h.get("hostname", ""),
+                "mac": h.get("mac", ""),
+                "vendor": h.get("vendor", ""),
+                "ports": h.get("ports", []),
+                "status": h.get("status", "up"),
+            }
+            node["type"] = _classify_node(node)
+            hosts.append(node)
+        # Classify and build edges
+        gateways = [h["ip"] for h in hosts if h["type"] == "gateway"]
+        if not gateways and hosts:
+            hosts[0]["type"] = "gateway"
+            gateways = [hosts[0]["ip"]]
+        edges = []
+        if gateways:
+            for h in hosts:
+                if h["ip"] not in gateways:
+                    edges.append({"source": gateways[0], "target": h["ip"]})
+        for i in range(len(gateways) - 1):
+            edges.append({"source": gateways[i], "target": gateways[i + 1]})
+        state["nodes"] = hosts
+        state["edges"] = edges
+        state["status"] = "done"
+        state["summary"] = f"{len(hosts)} hosts (vía sonda {probe_ip})"
+    except Exception as e:
+        state["status"] = f"error: {e}"
+    finally:
+        state["done"] = True
+
+
 @app.route("/api/nebula/announce", methods=["POST"])
 def api_nebula_announce():
-    """Nodo cliente anuncia sus subnets locales; el servidor agrega rutas ip hacia él."""
+    """Nodo cliente anuncia sus subnets locales; agrega unsafe_routes a Nebula y rutas Linux."""
     data      = request.json or {}
     nebula_ip = data.get("nebula_ip", "").strip()
     subnets   = data.get("subnets", [])
+    name      = data.get("name", "").strip() or nebula_ip
     if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', nebula_ip):
         return jsonify({"error": "nebula_ip inválida"}), 400
-    if not nebula_ip.startswith("192.168.100."):
+    if not nebula_ip.startswith("10.255.255."):
         return jsonify({"error": "IP fuera del rango Nebula"}), 403
-    added, errors = [], []
+    # Also register as probe
+    valid_subnets = []
     for subnet in subnets[:15]:
         subnet = subnet.strip()
         if not re.match(r'^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$', subnet):
             continue
-        if subnet.startswith("192.168.100.") or subnet.startswith("127."):
+        if subnet.startswith("10.255.255.") or subnet.startswith("127."):
             continue
+        valid_subnets.append(subnet)
+    registered_probes[nebula_ip] = {
+        "name": name, "nebula_ip": nebula_ip, "subnets": valid_subnets,
+        "last_seen": now_str(), "status": "online",
+    }
+    added, errors = [], []
+    # 1. Add Linux kernel routes
+    for subnet in valid_subnets:
         r = subprocess.run(
             ["sudo", "ip", "route", "replace", subnet, "via", nebula_ip, "dev", "nebula0"],
             capture_output=True, text=True)
         if r.returncode == 0:
             added.append(subnet)
         else:
-            errors.append(f"{subnet}: {r.stderr.strip()}")
-    return jsonify({"ok": True, "added": added, "errors": errors})
+            r2 = subprocess.run(
+                ["sudo", "ip", "route", "replace", subnet, "dev", "nebula0"],
+                capture_output=True, text=True)
+            if r2.returncode == 0:
+                added.append(subnet)
+            else:
+                errors.append(f"{subnet}: {r.stderr.strip()}")
+    # 2. Update Nebula config with unsafe_routes for these subnets
+    _update_nebula_unsafe_routes(nebula_ip, valid_subnets)
+    return jsonify({"ok": True, "added": added, "errors": errors, "probe_registered": True})
+
+
+def _update_nebula_unsafe_routes(via_ip: str, subnets: list):
+    """Agrega unsafe_routes al config.yaml de Nebula del servidor y reinicia."""
+    try:
+        import yaml
+    except ImportError:
+        print("[!] PyYAML not installed, using fallback for unsafe_routes")
+        _update_nebula_unsafe_routes_fallback(via_ip, subnets)
+        return
+    config_path = "/etc/nebula/config.yaml"
+    try:
+        raw = subprocess.run(["sudo", "cat", config_path],
+                             capture_output=True, text=True).stdout
+        if not raw:
+            return
+        cfg = yaml.safe_load(raw) or {}
+        tun = cfg.setdefault("tun", {})
+        existing = tun.get("unsafe_routes", [])
+        # Merge new routes without duplicates
+        existing_set = {(r.get("route"), r.get("via")) for r in existing}
+        for subnet in subnets:
+            if (subnet, via_ip) not in existing_set:
+                existing.append({"route": subnet, "via": via_ip, "mtu": 1300})
+        tun["unsafe_routes"] = existing
+        # Write back
+        new_yaml = yaml.dump(cfg, default_flow_style=False, sort_keys=False)
+        tmp = f"/tmp/nebula_config_{uuid.uuid4().hex[:8]}.yaml"
+        with open(tmp, "w") as f:
+            f.write(new_yaml)
+        subprocess.run(["sudo", "cp", tmp, config_path], check=True)
+        subprocess.run(["sudo", "chmod", "600", config_path])
+        os.unlink(tmp)
+        # Restart Nebula to apply
+        subprocess.run(["sudo", "systemctl", "restart", "nebula"], capture_output=True)
+    except Exception as e:
+        print(f"[!] Error updating Nebula unsafe_routes: {e}")
+
+
+def _update_nebula_unsafe_routes_fallback(via_ip: str, subnets: list):
+    """Fallback sin PyYAML: append unsafe_routes al final del config."""
+    config_path = "/etc/nebula/config.yaml"
+    try:
+        raw = subprocess.run(["sudo", "cat", config_path],
+                             capture_output=True, text=True).stdout
+        if not raw:
+            return
+        lines_to_add = []
+        for subnet in subnets:
+            marker = f"route: {subnet}"
+            if marker in raw:
+                continue
+            lines_to_add.append(f'    - route: {subnet}\n      via: {via_ip}\n      mtu: 1300')
+        if not lines_to_add:
+            return
+        if "unsafe_routes:" not in raw:
+            raw += "\ntun:\n  unsafe_routes:\n"
+        insertion = "\n".join(lines_to_add) + "\n"
+        # Append after unsafe_routes:
+        raw = raw.replace("unsafe_routes:", "unsafe_routes:\n" + insertion, 1)
+        tmp = f"/tmp/nebula_config_{uuid.uuid4().hex[:8]}.yaml"
+        with open(tmp, "w") as f:
+            f.write(raw)
+        subprocess.run(["sudo", "cp", tmp, config_path], check=True)
+        subprocess.run(["sudo", "chmod", "600", config_path])
+        os.unlink(tmp)
+        subprocess.run(["sudo", "systemctl", "restart", "nebula"], capture_output=True)
+    except Exception as e:
+        print(f"[!] Fallback unsafe_routes error: {e}")
+
 
 @app.route("/api/nebula/config/<name>")
 def api_nebula_config(name):
@@ -1967,13 +2398,13 @@ pki:
   key: /etc/nebula/{name}.key
 
 static_host_map:
-  "192.168.100.1": ["{server_ip}:4242"]
+  "10.255.255.1": ["{server_ip}:4242"]
 
 lighthouse:
   am_lighthouse: false
   interval: 60
   hosts:
-    - "192.168.100.1"
+    - "10.255.255.1"
 
 listen:
   host: 0.0.0.0
@@ -2500,6 +2931,19 @@ select option{background:var(--bg3)}
           text-align:center;color:var(--dim);pointer-events:none;user-select:none}
 #mapEmpty .em-icon{font-size:3rem;margin-bottom:10px}
 #mapEmpty .em-text{font-size:1rem;color:var(--fg);margin-bottom:6px}
+.inv-th{text-align:left;padding:10px 12px;color:var(--dim);font-weight:700;
+        font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;
+        border-bottom:2px solid var(--bg4);user-select:none}
+#hostTableBody tr{border-bottom:1px solid var(--bg4);transition:background .1s}
+#hostTableBody tr:hover{background:var(--bg3)}
+#hostTableBody td{padding:8px 12px;color:var(--fg);font-size:.84rem;vertical-align:middle}
+.host-status-up{color:var(--green);font-size:1.1rem}
+.host-status-down{color:var(--red);font-size:1.1rem}
+.host-mac{font-family:'Courier New',monospace;color:var(--yellow);font-size:.82rem}
+.host-ports{display:flex;flex-wrap:wrap;gap:3px}
+.host-port-badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:.72rem;
+                 font-family:'Courier New',monospace;border:1px solid var(--blue);color:var(--blue)}
+.host-type-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72rem;font-weight:600}
 #mapEmpty .em-sub{font-size:.82rem}
 </style>
 </head>
@@ -2561,7 +3005,7 @@ select option{background:var(--bg3)}
           <div class="row">
             <div class="form-group">
               <label>IP Nebula del nodo (CIDR)</label>
-              <input id="cf_nebula_ip" name="nebula_ip" placeholder="192.168.100.10/24">
+              <input id="cf_nebula_ip" name="nebula_ip" placeholder="10.255.255.10/24">
             </div>
             <div class="form-group">
               <label>Grupos Nebula</label>
@@ -2603,6 +3047,7 @@ select option{background:var(--bg3)}
       <div class="tab" id="tab-btn-ids"      onclick="showTab('ids',this)">&#x1F6E1; IDS Suricata</div>
       <div class="tab" id="tab-btn-nebula"   onclick="showTab('nebula',this);loadNebulaTab()">&#x1F300; Nebula VPN</div>
       <div class="tab" id="tab-btn-fuzz"     onclick="showTab('fuzz',this)">&#x1F4A5; Pentesting Externo</div>
+      <div class="tab" id="tab-btn-chisel"   onclick="showTab('chisel',this);loadChiselStatus()">&#x1F50C; T&uacute;nel Chisel</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -2726,7 +3171,7 @@ select option{background:var(--bg3)}
     <div class="tab-content" id="tab-map">
       <div class="map-toolbar">
         <span style="font-weight:700;color:var(--blue);white-space:nowrap;font-size:.9rem">&#x1F5A7; Mapa de Red</span>
-        <input id="mapTarget" placeholder="Subnet (ej: 10.11.121.0/24)"
+        <input id="mapTarget" placeholder="Subnet (ej: 192.168.10.0/24)"
                style="max-width:240px;padding:5px 10px;background:var(--bg3);
                       border:1px solid var(--bg4);color:var(--fg);border-radius:6px;
                       outline:none;font-size:.88rem;font-family:inherit"
@@ -2734,7 +3179,15 @@ select option{background:var(--bg3)}
                onfocus="this.style.borderColor='var(--blue)'"
                onblur="this.style.borderColor='var(--bg4)'">
         <button class="btn btn-blue btn-sm" id="btnMapScan" onclick="startNetworkMap()">&#x25B6; Escanear</button>
+        <button class="btn btn-green btn-sm" id="btnProbeScan" onclick="startProbeScan()">&#x1F4E1; Sonda Local</button>
         <button class="btn btn-gray btn-sm" id="btnMapReset" onclick="resetMapView()">&#x21BA; Reset</button>
+        <select id="mapViewMode" onchange="toggleMapView(this.value)"
+                style="background:var(--bg3);color:var(--fg);border:1px solid var(--bg4);
+                       border-radius:6px;padding:4px 8px;font-size:.82rem">
+          <option value="graph">Vista Grafo</option>
+          <option value="table">Vista Tabla</option>
+          <option value="both">Ambas</option>
+        </select>
         <span id="mapStatus" style="color:var(--dim);font-size:.8rem"></span>
         <div class="map-legend">
           <div class="leg-item"><div class="leg-dot" style="background:#8b1a1a;border-color:#f85149"></div>Gateway/FW</div>
@@ -2745,6 +3198,7 @@ select option{background:var(--bg3)}
           <div class="leg-item"><div class="leg-dot" style="background:#161b22;border-color:#6e7681"></div>Desconocido</div>
         </div>
       </div>
+      <!-- Graph view -->
       <div id="mapContainer">
         <svg id="networkSvg" style="width:100%;height:100%"></svg>
         <div id="nodeTooltip" class="node-tooltip" style="display:none">
@@ -2758,6 +3212,23 @@ select option{background:var(--bg3)}
             <span style="color:var(--blue);font-size:.78rem">Tip: arrastra nodos · scroll = zoom · doble-click = reset</span>
           </div>
         </div>
+      </div>
+      <!-- Host inventory table (Advanced IP Scanner style) -->
+      <div id="hostTableContainer" style="display:none;overflow:auto;background:#090d13;border-top:1px solid var(--bg4)">
+        <table id="hostInventoryTable" style="width:100%;border-collapse:collapse;font-size:.84rem">
+          <thead>
+            <tr style="background:var(--bg2);position:sticky;top:0;z-index:2">
+              <th class="inv-th" style="width:50px">Estado</th>
+              <th class="inv-th" onclick="sortHostTable('hostname')" style="cursor:pointer">Nombre &#x25B4;&#x25BE;</th>
+              <th class="inv-th" onclick="sortHostTable('ip')" style="cursor:pointer">IP &#x25B4;&#x25BE;</th>
+              <th class="inv-th" onclick="sortHostTable('vendor')" style="cursor:pointer">Fabricante &#x25B4;&#x25BE;</th>
+              <th class="inv-th">Direcci&oacute;n MAC</th>
+              <th class="inv-th">Puertos</th>
+              <th class="inv-th">Tipo</th>
+            </tr>
+          </thead>
+          <tbody id="hostTableBody"></tbody>
+        </table>
       </div>
     </div>
 
@@ -2935,13 +3406,21 @@ select option{background:var(--bg3)}
     <span id="fuzz-status-badge" style="font-size:.78rem;color:var(--dim)"></span>
   </div>
 
+  <!-- URL objetivo destacada -->
+  <div style="background:var(--bg2);border:1px solid var(--blue);border-radius:10px;padding:14px 16px;display:flex;gap:12px;align-items:flex-end">
+    <div class="form-group" style="flex:1;margin:0">
+      <label style="color:var(--blue);font-weight:700">URL objetivo <span style="color:var(--red)">*</span></label>
+      <input id="fz-url" placeholder="https://ejemplo.com/FUZZ  — usa FUZZ como marcador de posición" style="width:100%;font-size:.9rem">
+    </div>
+    <button class="btn btn-red" onclick="startFuzz()" style="flex-shrink:0;height:36px">&#x25B6; Lanzar ffuf</button>
+    <button class="btn btn-gray" id="fz-stop-btn" onclick="stopFuzz()" disabled style="flex-shrink:0;height:36px">&#x25A0; Detener</button>
+    <button class="btn btn-gray" onclick="clearFuzz()" style="flex-shrink:0;height:36px">Limpiar</button>
+    <button class="btn" id="fz-dl-btn" onclick="downloadFuzzReport()" disabled style="flex-shrink:0;height:36px;background:#1a3a1a;color:#4caf50;border:1px solid #4caf50">&#x2B07; Descargar reporte</button>
+    <span id="fz-progress" style="font-size:.8rem;color:var(--dim);align-self:center"></span>
+  </div>
+
   <!-- Config panel -->
   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;background:var(--bg2);border-radius:10px;padding:16px">
-    <div class="form-group">
-      <label>URL objetivo <span style="color:var(--red)">*</span></label>
-      <input id="fz-url" placeholder="https://ejemplo.com/FUZZ" style="width:100%">
-      <span style="font-size:.72rem;color:var(--dim)">Usa <code>FUZZ</code> como marcador de posición</span>
-    </div>
     <div class="form-group">
       <label>Wordlist</label>
       <select id="fz-wl" style="width:100%">
@@ -3030,14 +3509,6 @@ select option{background:var(--bg3)}
     </div>
   </div>
 
-  <!-- Controls -->
-  <div style="display:flex;gap:10px;align-items:center">
-    <button class="btn btn-red" onclick="startFuzz()">&#x25B6; Lanzar ffuf</button>
-    <button class="btn btn-gray" id="fz-stop-btn" onclick="stopFuzz()" disabled>&#x25A0; Detener</button>
-    <button class="btn btn-gray" onclick="clearFuzz()">Limpiar</button>
-    <span id="fz-progress" style="font-size:.8rem;color:var(--dim)"></span>
-  </div>
-
   <!-- Results table -->
   <div style="background:var(--bg2);border-radius:10px;overflow:hidden">
     <div style="padding:10px 14px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--bg4)">
@@ -3066,6 +3537,102 @@ select option{background:var(--bg3)}
     <div style="font-size:.78rem;color:var(--dim);margin-bottom:4px">Salida raw (ffuf)</div>
     <pre id="fz-raw" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:8px;padding:12px;font-size:.75rem;max-height:260px;overflow:auto;white-space:pre-wrap"></pre>
   </div>
+</div>
+
+<!-- ╔══════════════════════════════════════════════════════╗ -->
+<!-- ║                 CHISEL TUNNEL TAB                   ║ -->
+<!-- ╚══════════════════════════════════════════════════════╝ -->
+<div class="tab-content" id="tab-chisel" style="flex-direction:column;overflow:auto;padding:20px;gap:18px">
+
+  <!-- Estado del servidor Chisel -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="color:var(--blue);font-size:.95rem;margin:0">&#x1F50C; Estado del Servidor Chisel (Kali)</h3>
+      <button class="btn btn-gray btn-sm" onclick="loadChiselStatus()">&#x21BB; Refrescar</button>
+    </div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px">
+      <div class="stat-block"><div class="stat-label">Servidor</div><div id="cs-running" class="stat-value">—</div></div>
+      <div class="stat-block"><div class="stat-label">PID</div><div id="cs-pid" class="stat-value">—</div></div>
+      <div class="stat-block"><div class="stat-label">Puerto</div><div id="cs-port" class="stat-value">—</div></div>
+      <div class="stat-block"><div class="stat-label">SOCKS5 local</div><div id="cs-socks" class="stat-value">—</div></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button id="cs-start-btn" class="btn btn-green btn-sm" onclick="chiselStart()">&#x25B6; Iniciar Servidor</button>
+      <button id="cs-stop-btn"  class="btn btn-red btn-sm"   onclick="chiselStop()">&#x25A0; Detener</button>
+    </div>
+  </div>
+
+  <!-- Instrucciones para el cliente Windows (Sofia) -->
+  <div style="background:var(--bg2);border:1px solid #1a4a1a;border-radius:10px;padding:16px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <span style="font-size:1rem">&#x1F5A5;</span>
+      <h3 style="color:#3fb950;font-size:.9rem;margin:0">Instrucciones para el cliente Windows (Sofia-Soria)</h3>
+    </div>
+    <p style="font-size:.8rem;color:var(--dim);margin:0 0 10px 0">Ejecutar en <b>PowerShell como Administrador</b> en el equipo del cliente:</p>
+
+    <!-- Paso 1 -->
+    <div style="margin-bottom:12px">
+      <div style="font-size:.78rem;font-weight:700;color:#f0a500;margin-bottom:4px">Paso 1 — Descargar chisel para Windows</div>
+      <div style="position:relative">
+        <pre id="cs-cmd1" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:6px;padding:10px 12px;font-size:.78rem;overflow-x:auto;white-space:pre-wrap;margin:0">Invoke-WebRequest -Uri "https://github.com/jpillora/chisel/releases/download/v1.10.0/chisel_1.10.0_windows_amd64.zip" -OutFile "C:\Nebula\chisel.zip"; Expand-Archive -Path "C:\Nebula\chisel.zip" -DestinationPath "C:\Nebula\" -Force</pre>
+        <button class="btn btn-gray btn-sm" style="position:absolute;top:6px;right:6px" onclick="copyCmd('cs-cmd1')">&#x1F4CB; Copiar</button>
+      </div>
+    </div>
+
+    <!-- Paso 2 -->
+    <div>
+      <div style="font-size:.78rem;font-weight:700;color:#f0a500;margin-bottom:4px">Paso 2 — Conectar al servidor Kali y crear el túnel SOCKS5</div>
+      <div style="position:relative">
+        <pre id="cs-cmd2" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:6px;padding:10px 12px;font-size:.78rem;overflow-x:auto;white-space:pre-wrap;margin:0">C:\Nebula\chisel.exe client 10.255.255.1:8888 R:socks</pre>
+        <button class="btn btn-gray btn-sm" style="position:absolute;top:6px;right:6px" onclick="copyCmd('cs-cmd2')">&#x1F4CB; Copiar</button>
+      </div>
+      <div style="font-size:.75rem;color:var(--dim);margin-top:6px">
+        Cuando conecte correctamente, verás en el log de Kali: <code>session#1: tun: proxy#R:127.0.0.1:1080=socks</code>
+      </div>
+    </div>
+  </div>
+
+  <!-- Escaneo a través del túnel -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <span style="font-size:1rem">&#x1F50D;</span>
+      <h3 style="color:var(--blue);font-size:.9rem;margin:0">Escaneo a través del túnel SOCKS5</h3>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
+      <div class="form-group">
+        <label>Red / Host objetivo</label>
+        <input id="cs-target" value="192.168.1.0/24" placeholder="192.168.1.0/24 o 192.168.1.157" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">LAN interna del cliente (se escanea vía proxychains)</span>
+      </div>
+      <div class="form-group">
+        <label>Puertos</label>
+        <input id="cs-ports" value="22,80,443,445,3389,8080,8443,21,25,3306" placeholder="22,80,443,3389,8080" style="width:100%">
+        <span style="font-size:.72rem;color:var(--dim)">Separados por coma</span>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button id="cs-scan-btn" class="btn btn-blue btn-sm" onclick="chiselScan()">&#x1F50D; Escanear LAN</button>
+      <button id="cs-scan-stop-btn" class="btn btn-red btn-sm" onclick="chiselScanStop()" disabled>&#x25A0; Detener escaneo</button>
+      <span id="cs-scan-status" style="font-size:.82rem;color:var(--dim)"></span>
+      <span id="cs-scan-badge" style="font-size:.75rem;padding:2px 8px;border-radius:4px;background:var(--bg3)"></span>
+    </div>
+  </div>
+
+  <!-- Output del escaneo -->
+  <div>
+    <div style="font-size:.78rem;color:var(--dim);margin-bottom:4px">Salida del escaneo (nmap a través de proxychains)</div>
+    <pre id="cs-output" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:8px;padding:12px;font-size:.75rem;min-height:200px;max-height:500px;overflow:auto;white-space:pre-wrap"></pre>
+  </div>
+
+  <!-- Log chisel -->
+  <div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <div style="font-size:.78rem;color:var(--dim)">Log del servidor Chisel</div>
+      <button class="btn btn-gray btn-sm" onclick="refreshChiselLog()">&#x21BB; Refrescar log</button>
+    </div>
+    <pre id="cs-log" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:8px;padding:12px;font-size:.75rem;max-height:200px;overflow:auto;white-space:pre-wrap">— sin log aún —</pre>
+  </div>
+
 </div>
 
 <div class="tab-content" id="tab-nebula" style="flex-direction:column;overflow:auto;padding:20px;gap:18px">
@@ -3098,7 +3665,7 @@ select option{background:var(--bg3)}
       </div>
       <div class="form-group" style="min-width:170px">
         <label>IP del servidor (lighthouse)</label>
-        <input id="ni_server_ip" value="192.168.100.1/24">
+        <input id="ni_server_ip" value="10.255.255.1/24">
       </div>
       <div class="form-group" style="min-width:110px">
         <label>Duración CA</label>
@@ -3125,7 +3692,7 @@ select option{background:var(--bg3)}
       </div>
       <div class="form-group" style="min-width:180px">
         <label>IP Nebula (CIDR) <span style="color:var(--dim);font-weight:400;font-size:.72rem">— se agrega /24 si se omite</span></label>
-        <input id="ncg_ip" placeholder="192.168.100.10/24"
+        <input id="ncg_ip" placeholder="10.255.255.10/24"
                onblur="fixCIDR(this)" oninput="this.style.borderColor=''">
       </div>
       <div class="form-group" style="min-width:140px">
@@ -4129,6 +4696,7 @@ async function startNetworkMap() {
       sse.close(); btn.disabled = false;
       setMapStatus(d.summary || (d.nodes.length + ' hosts activos'), false);
       renderNetworkGraph(d.nodes, d.edges);
+      renderHostTable(d.nodes);
     } else if (d.error) {
       sse.close(); btn.disabled = false;
       setMapStatus('Error: '+d.error, false);
@@ -4328,6 +4896,112 @@ function resetMapView() {
   const svg = d3.select('#networkSvg');
   svg.transition().duration(500)
     .call(_mapZoom.transform, d3.zoomIdentity.translate(c.clientWidth/2, c.clientHeight/2).scale(1));
+}
+
+// ── Host Inventory Table (Advanced IP Scanner style) ─────────────────────────
+let _lastMapNodes = [];
+let _hostSortCol = 'ip', _hostSortAsc = true;
+
+function toggleMapView(mode) {
+  const graph = document.getElementById('mapContainer');
+  const table = document.getElementById('hostTableContainer');
+  if (mode === 'graph') {
+    graph.style.display = ''; table.style.display = 'none';
+    graph.style.flex = '1';
+  } else if (mode === 'table') {
+    graph.style.display = 'none'; table.style.display = '';
+    table.style.flex = '1'; table.style.maxHeight = '100%';
+  } else {
+    graph.style.display = ''; graph.style.flex = '1';
+    table.style.display = ''; table.style.maxHeight = '45%'; table.style.flex = 'none';
+  }
+}
+
+function renderHostTable(nodes) {
+  _lastMapNodes = nodes;
+  const tbody = document.getElementById('hostTableBody');
+  if (!nodes.length) { tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--dim);padding:20px">Sin hosts detectados</td></tr>'; return; }
+  // Show table container
+  const mode = document.getElementById('mapViewMode').value;
+  if (mode !== 'graph') document.getElementById('hostTableContainer').style.display = '';
+  // Sort
+  const sorted = [...nodes].sort((a,b) => {
+    let va = a[_hostSortCol] || '', vb = b[_hostSortCol] || '';
+    if (_hostSortCol === 'ip') {
+      const pa = va.split('.').map(Number), pb = vb.split('.').map(Number);
+      for (let i=0;i<4;i++) { if (pa[i]!==pb[i]) return _hostSortAsc ? pa[i]-pb[i] : pb[i]-pa[i]; }
+      return 0;
+    }
+    va = va.toString().toLowerCase(); vb = vb.toString().toLowerCase();
+    return _hostSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+  });
+  const typeCfg = {
+    gateway:{bg:'#3a1a1a',fg:'#f85149',label:'Gateway'},
+    web:{bg:'#1a2a4a',fg:'#58a6ff',label:'Web'},
+    windows:{bg:'#3a2800',fg:'#f0883e',label:'Windows'},
+    linux:{bg:'#0e2a1a',fg:'#3fb950',label:'Linux'},
+    database:{bg:'#2a1a4a',fg:'#bc8cff',label:'DB'},
+    unknown:{bg:'var(--bg3)',fg:'var(--dim)',label:'?'},
+  };
+  tbody.innerHTML = sorted.map(h => {
+    const tc = typeCfg[h.type] || typeCfg.unknown;
+    const ports = (h.ports||[]).map(p => `<span class="host-port-badge">${p.port}/${p.service}</span>`).join('');
+    const status = (h.status === 'up' || h.ports?.length > 0 || !h.status)
+      ? '<span class="host-status-up">&#x25CF;</span>'
+      : '<span class="host-status-down">&#x25CB;</span>';
+    return `<tr>
+      <td style="text-align:center">${status}</td>
+      <td style="font-weight:600">${esc(h.hostname || '\u2014')}</td>
+      <td style="font-family:'Courier New',monospace;font-weight:600">${esc(h.ip)}</td>
+      <td>${esc(h.vendor || '\u2014')}</td>
+      <td class="host-mac">${esc(h.mac || '\u2014')}</td>
+      <td><div class="host-ports">${ports || '<span style="color:var(--dim)">\u2014</span>'}</div></td>
+      <td><span class="host-type-badge" style="background:${tc.bg};color:${tc.fg}">${tc.label}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function sortHostTable(col) {
+  if (_hostSortCol === col) _hostSortAsc = !_hostSortAsc;
+  else { _hostSortCol = col; _hostSortAsc = true; }
+  renderHostTable(_lastMapNodes);
+}
+
+async function startProbeScan() {
+  const target = document.getElementById('mapTarget').value.trim();
+  if (!target) { document.getElementById('mapTarget').focus(); return; }
+  const btn = document.getElementById('btnProbeScan');
+  btn.disabled = true;
+  document.getElementById('mapEmpty').style.display = 'none';
+  setMapStatus('Consultando sonda local...', true);
+  try {
+    const r = await fetch('/api/network/probe-scan', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({target})
+    });
+    const j = await r.json();
+    if (j.error) { setMapStatus('Error: '+j.error, false); btn.disabled=false; return; }
+    setMapStatus(`Modo: ${j.mode === 'probe' ? 'Sonda local' : 'Remoto'} — esperando...`, true);
+    const sse = new EventSource('/api/network/stream/'+j.map_id);
+    sse.onmessage = e => {
+      const d = JSON.parse(e.data);
+      if (d.type === 'status') {
+        setMapStatus(d.msg, true);
+      } else if (d.type === 'result') {
+        sse.close(); btn.disabled = false;
+        setMapStatus(d.summary || (d.nodes.length + ' hosts'), false);
+        renderNetworkGraph(d.nodes, d.edges);
+        renderHostTable(d.nodes);
+        // Auto-switch to both view if table was hidden
+        const sel = document.getElementById('mapViewMode');
+        if (sel.value === 'graph') { sel.value = 'both'; toggleMapView('both'); }
+      } else if (d.error) {
+        sse.close(); btn.disabled = false;
+        setMapStatus('Error: '+d.error, false);
+      }
+    };
+    sse.onerror = () => { sse.close(); btn.disabled=false; setMapStatus('Error SSE', false); };
+  } catch(e) { setMapStatus('Error de red', false); btn.disabled=false; }
 }
 
 // ── Nebula VPN Tab ────────────────────────────────────────────────────────────
@@ -4578,7 +5252,56 @@ function clearFuzz() {
   document.getElementById('fz-count').textContent = '0 hallazgos';
   document.getElementById('fz-progress').textContent = '';
   document.getElementById('fz-stop-btn').disabled = true;
+  document.getElementById('fz-dl-btn').disabled = true;
   document.getElementById('fuzz-status-badge').textContent = '';
+}
+
+function downloadFuzzReport() {
+  if (!fuzzResults.length) return;
+  const url    = document.getElementById('fz-url').value.trim();
+  const wl     = document.getElementById('fz-wl').options[document.getElementById('fz-wl').selectedIndex].text;
+  const now    = new Date().toLocaleString('es-EC');
+  const codeColor = c => c>=200&&c<300?'#4caf50':c>=300&&c<400?'#f0a500':c>=400&&c<500?'#f44336':'#ff8800';
+  const rows = fuzzResults.map(h => `
+    <tr>
+      <td style="font-weight:700;color:${codeColor(h.status)}">${h.status}</td>
+      <td><a href="${h.url}" target="_blank" style="color:#58a6ff">${h.url}</a></td>
+      <td style="text-align:right">${h.length}</td>
+      <td style="text-align:right">${h.words}</td>
+      <td style="text-align:right">${h.lines}</td>
+      <td style="text-align:right">${h.duration}</td>
+    </tr>`).join('');
+  const html = `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+<title>Reporte ffuf — ${url}</title>
+<style>
+  body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:24px}
+  h1{color:#58a6ff;font-size:1.1rem}h2{color:#8b949e;font-size:.85rem;font-weight:normal}
+  table{width:100%;border-collapse:collapse;font-size:.82rem;margin-top:16px}
+  th{background:#161b22;color:#8b949e;padding:8px 12px;text-align:left;border-bottom:1px solid #30363d}
+  td{padding:6px 12px;border-bottom:1px solid #21262d}
+  tr:hover td{background:#161b22}
+  .meta{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:.82rem;line-height:1.8}
+  .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75rem;font-weight:700}
+</style></head><body>
+<h1>&#x1F4A5; Reporte Pentesting Externo — ffuf</h1>
+<div class="meta">
+  <b>URL objetivo:</b> ${url}<br>
+  <b>Wordlist:</b> ${wl}<br>
+  <b>Hallazgos:</b> ${fuzzResults.length}<br>
+  <b>Fecha:</b> ${now}<br>
+  <b>Generado por:</b> Kali VPN Vulnerability Scanner — Datacom Security
+</div>
+<table>
+  <thead><tr><th>Código</th><th>URL</th><th>Tamaño (bytes)</th><th>Palabras</th><th>Líneas</th><th>RT (ms)</th></tr></thead>
+  <tbody>${rows}</tbody>
+</table>
+</body></html>`;
+  const blob = new Blob([html], {type:'text/html'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'ffuf_report_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.html';
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 async function pollFuzz() {
@@ -4620,11 +5343,126 @@ async function pollFuzz() {
       document.getElementById('fz-progress').textContent = d.error ? '✗ ' + d.error : '✓ Completado';
       document.getElementById('fuzz-status-badge').textContent = d.error ? '✗ Error' : '✓ Listo';
       document.getElementById('fz-stop-btn').disabled = true;
+      if (hits.length > 0) document.getElementById('fz-dl-btn').disabled = false;
     }
   } catch(e) {
     document.getElementById('fz-progress').textContent = 'Error polling: ' + e;
     setTimeout(pollFuzz, 3000);
   }
+}
+
+// ══════════════════════════════════════════════════
+//  CHISEL TUNNEL
+// ══════════════════════════════════════════════════
+let chiselScanJobId = null;
+
+async function loadChiselStatus() {
+  try {
+    const r = await fetch('/api/chisel/status');
+    const d = await r.json();
+    document.getElementById('cs-running').textContent = d.running ? '✅ Activo' : '⛔ Detenido';
+    document.getElementById('cs-running').style.color  = d.running ? '#3fb950' : '#f44336';
+    document.getElementById('cs-pid').textContent     = d.pid ?? '—';
+    document.getElementById('cs-port').textContent    = d.port + '/tcp';
+    document.getElementById('cs-socks').textContent   = '127.0.0.1:' + d.socks_port;
+    document.getElementById('cs-start-btn').disabled  = d.running;
+    document.getElementById('cs-stop-btn').disabled   = !d.running;
+  } catch(e) {
+    document.getElementById('cs-running').textContent = '? Error: ' + e;
+  }
+}
+
+async function chiselStart() {
+  document.getElementById('cs-start-btn').disabled = true;
+  try {
+    const r = await fetch('/api/chisel/start', {method:'POST'});
+    const d = await r.json();
+    if (d.error) { alert('Error: ' + d.error); return; }
+    await loadChiselStatus();
+  } catch(e) { alert('Error: ' + e); document.getElementById('cs-start-btn').disabled = false; }
+}
+
+async function chiselStop() {
+  document.getElementById('cs-stop-btn').disabled = true;
+  try {
+    await fetch('/api/chisel/stop', {method:'POST'});
+    await loadChiselStatus();
+  } catch(e) {}
+}
+
+async function chiselScan() {
+  const target = document.getElementById('cs-target').value.trim();
+  const ports  = document.getElementById('cs-ports').value.trim();
+  if (!target) { alert('Ingresa un target'); return; }
+
+  document.getElementById('cs-output').textContent = '';
+  document.getElementById('cs-scan-status').textContent = 'Iniciando…';
+  document.getElementById('cs-scan-badge').textContent  = '🔄 Corriendo';
+  document.getElementById('cs-scan-btn').disabled      = true;
+  document.getElementById('cs-scan-stop-btn').disabled = false;
+
+  try {
+    const r = await fetch('/api/chisel/scan', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({target, ports})
+    });
+    const d = await r.json();
+    if (d.error) { alert('Error: ' + d.error); return; }
+    chiselScanJobId = d.job_id;
+    pollChiselScan();
+  } catch(e) {
+    document.getElementById('cs-scan-status').textContent = 'Error: ' + e;
+    document.getElementById('cs-scan-btn').disabled = false;
+  }
+}
+
+async function pollChiselScan() {
+  if (!chiselScanJobId) return;
+  try {
+    const r = await fetch('/api/chisel/scan_results/' + chiselScanJobId);
+    const d = await r.json();
+    const out = document.getElementById('cs-output');
+    out.textContent = (d.lines || []).join('\n');
+    out.scrollTop = out.scrollHeight;
+    if (d.running) {
+      document.getElementById('cs-scan-status').textContent = 'Escaneando…';
+      setTimeout(pollChiselScan, 2000);
+    } else {
+      document.getElementById('cs-scan-badge').textContent  = d.error ? '✗ Error' : '✓ Completado';
+      document.getElementById('cs-scan-status').textContent = d.error ? '✗ ' + d.error : '✓ Escaneo completo';
+      document.getElementById('cs-scan-btn').disabled      = false;
+      document.getElementById('cs-scan-stop-btn').disabled = true;
+      chiselScanJobId = null;
+    }
+  } catch(e) {
+    setTimeout(pollChiselScan, 3000);
+  }
+}
+
+async function chiselScanStop() {
+  if (!chiselScanJobId) return;
+  await fetch('/api/chisel/scan_stop/' + chiselScanJobId, {method:'POST'});
+  document.getElementById('cs-scan-stop-btn').disabled = true;
+  document.getElementById('cs-scan-btn').disabled = false;
+  document.getElementById('cs-scan-badge').textContent = '⛔ Detenido';
+  chiselScanJobId = null;
+}
+
+async function refreshChiselLog() {
+  try {
+    const r = await fetch('/api/chisel/log');
+    const d = await r.json();
+    document.getElementById('cs-log').textContent = d.log || '— sin log —';
+  } catch(e) {}
+}
+
+function copyCmd(id) {
+  const text = document.getElementById(id).textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    const btns = document.querySelectorAll('[onclick="copyCmd(\'' + id + '\')"]');
+    btns.forEach(b => { const orig = b.textContent; b.textContent = '✓ Copiado'; setTimeout(()=>b.textContent=orig,1500); });
+  });
 }
 </script>
 </body>
