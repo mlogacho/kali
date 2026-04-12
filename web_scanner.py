@@ -6,6 +6,7 @@ Acceder desde: http://<kali-ip>:8040
 """
 
 import os, json, re, datetime, subprocess, threading, time, uuid, io, ipaddress
+import urllib.request
 from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context, send_file
 
 app = Flask(__name__)
@@ -30,13 +31,32 @@ if not os.path.exists(CLIENTS_FILE):
     with open(CLIENTS_FILE, "w") as f:
         json.dump({}, f)
 
+
+def _detect_server_public_ip() -> str:
+    """Auto-detecta la IP pública del servidor. Fallback a valor por defecto."""
+    for url in [
+        "http://169.254.169.254/latest/meta-data/public-ipv4",  # AWS EC2 metadata
+        "http://checkip.amazonaws.com",
+        "https://ifconfig.me/ip",
+    ]:
+        try:
+            resp = urllib.request.urlopen(url, timeout=3)
+            ip = resp.read().decode().strip()
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+                return ip
+        except Exception:
+            continue
+    return "3.143.18.161"
+
+SERVER_PUBLIC_IP = _detect_server_public_ip()
+
 # ── State ──────────────────────────────────────────────────────────────────────
 active_scans: dict[str, dict] = {}
 network_maps: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
 # Probe (sonda) state — registered probes and their scan results
-registered_probes: dict[str, dict] = {}   # nebula_ip → {name, subnets, last_seen, ...}
-probe_scan_results: dict[str, dict] = {}  # probe_ip → {hosts: [...], timestamp, status}
+registered_probes: dict[str, dict] = {}   # vpn_ip → {name, subnets, last_seen, ...}
+probe_scan_results: dict[str, dict] = {}  # vpn_ip → {hosts: [...], timestamp, status}
 
 SCAN_PROFILES = {
     "Descubrimiento (hosts vivos)":      "nmap -sn -PS21,22,23,53,80,110,135,139,443,445,3306,3389,8080 -T4 {target}",
@@ -1434,9 +1454,12 @@ def api_clients_save():
         "vpn_pass":      data.get("vpn_pass", "").strip(),
         "nebula_ip":     data.get("nebula_ip", "").strip(),
         "nebula_groups": data.get("nebula_groups", "clients").strip(),
+        "ts_hostname":   data.get("ts_hostname", "").strip(),
     }
     save_clients(clients)
-    return jsonify({"ok": True})
+    # Auto-configurar rutas si la interfaz VPN está activa
+    route_result = _configure_routes_for_client(name, clients[name])
+    return jsonify({"ok": True, "routes": route_result})
 
 @app.route("/api/clients/<name>", methods=["DELETE"])
 def api_clients_delete(name):
@@ -1477,7 +1500,6 @@ def _vpn_connect_bg(name, c):
     elif vpn_type == "Nebula":
         # Nebula no tiene --daemon flag; lo lanzamos como proceso desacoplado
         config = vpn_path or f"{NEBULA_CONFIG_DIR}/config.yaml"
-        import shlex
         subprocess.Popen(
             ["sudo", NEBULA_BIN, "-config", config],
             stdout=open("/tmp/nebula_scanner.log", "a"),
@@ -1485,6 +1507,11 @@ def _vpn_connect_bg(name, c):
             start_new_session=True,
         )
         iface = "nebula0"
+    elif vpn_type == "Tailscale":
+        # Tailscale se gestiona como servicio del sistema; asegurar que acepta rutas
+        subprocess.run(["sudo", "tailscale", "up", "--accept-routes"],
+                       capture_output=True, timeout=30)
+        iface = "tailscale0"
     else:
         cmd = ["sudo","wg-quick","up",vpn_path]
         subprocess.run(cmd, capture_output=True)
@@ -1494,6 +1521,8 @@ def _vpn_connect_bg(name, c):
         r = subprocess.run(["ip","a","show",iface], capture_output=True, text=True)
         if "inet " in r.stdout:
             vpn_state.update({"active": True, "client": name, "iface": iface})
+            # Auto-configurar rutas para la red interna del cliente
+            _configure_routes_for_client(name, c)
             return
     vpn_state["active"] = False
 
@@ -1505,12 +1534,81 @@ def api_vpn_disconnect():
         subprocess.run(["sudo","pkill","openvpn"], capture_output=True)
     elif iface in ("nebula0", "nebula1") or c.get("vpn_type") == "Nebula":
         subprocess.run(["sudo","pkill","-f", NEBULA_BIN], capture_output=True)
+    elif iface == "tailscale0" or c.get("vpn_type") == "Tailscale":
+        subprocess.run(["sudo","tailscale","down"], capture_output=True)
     else:
         subprocess.run(["sudo","wg-quick","down", c.get("vpn_path","")], capture_output=True)
     vpn_state.update({"active": False, "client": "", "iface": ""})
     return jsonify({"ok": True})
 
 VPN_IFACES = ["tailscale0", "tun0", "tun1", "wg0", "wg1", "nebula0", "nebula1", "ppp0", "nordlynx"]
+
+
+def _configure_routes_for_client(name: str, c: dict) -> dict:
+    """Configura rutas del kernel y VPN-específicas para la red interna de un cliente."""
+    network = c.get("network", "").strip()
+    vpn_type = c.get("vpn_type", "")
+    if not network or not re.match(r'^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$', network):
+        return {"ok": False, "reason": "sin CIDR válido"}
+
+    if vpn_type == "Nebula":
+        nebula_ip = c.get("nebula_ip", "").strip().split("/")[0]
+        if not nebula_ip:
+            return {"ok": False, "reason": "sin nebula_ip configurada"}
+        # Ruta Linux
+        r = subprocess.run(
+            ["sudo", "ip", "route", "replace", network, "via", nebula_ip, "dev", "nebula0"],
+            capture_output=True, text=True)
+        # Unsafe routes en Nebula config
+        _update_nebula_unsafe_routes(nebula_ip, [network])
+        return {"ok": r.returncode == 0, "via": nebula_ip, "dev": "nebula0"}
+
+    elif vpn_type == "Tailscale":
+        # Tailscale maneja rutas internamente cuando --accept-routes está activo
+        # y el nodo cliente anuncia la subnet via tailscale up --advertise-routes
+        subprocess.run(["sudo", "tailscale", "set", "--accept-routes"],
+                       capture_output=True, timeout=10)
+        return {"ok": True, "via": "tailscale", "dev": "tailscale0"}
+
+    elif vpn_type == "OpenVPN":
+        r = subprocess.run(["ip", "a", "show", "tun0"], capture_output=True, text=True)
+        if "inet " in r.stdout:
+            subprocess.run(["sudo", "ip", "route", "replace", network, "dev", "tun0"],
+                           capture_output=True, text=True)
+            return {"ok": True, "dev": "tun0"}
+        return {"ok": False, "reason": "tun0 no activa"}
+
+    elif vpn_type == "WireGuard":
+        r = subprocess.run(["ip", "a", "show", "wg0"], capture_output=True, text=True)
+        if "inet " in r.stdout:
+            subprocess.run(["sudo", "ip", "route", "replace", network, "dev", "wg0"],
+                           capture_output=True, text=True)
+            return {"ok": True, "dev": "wg0"}
+        return {"ok": False, "reason": "wg0 no activa"}
+
+    return {"ok": False, "reason": f"vpn_type desconocido: {vpn_type}"}
+
+
+@app.route("/api/routes/configure", methods=["POST"])
+def api_routes_configure():
+    """Configura rutas manualmente para un cliente."""
+    name = (request.json or {}).get("client", "")
+    clients = load_clients()
+    if name not in clients:
+        return jsonify({"error": "Cliente no encontrado"}), 404
+    result = _configure_routes_for_client(name, clients[name])
+    return jsonify(result)
+
+
+@app.route("/api/routes/status")
+def api_routes_status():
+    """Muestra rutas activas del kernel por interfaces VPN."""
+    r = subprocess.run(["ip", "route"], capture_output=True, text=True)
+    vpn_routes = []
+    for line in r.stdout.splitlines():
+        if any(iface in line for iface in ["nebula0", "tailscale0", "tun0", "wg0"]):
+            vpn_routes.append(line.strip())
+    return jsonify({"routes": vpn_routes})
 
 def _detect_vpn_ifaces():
     """Devuelve lista de interfaces VPN activas con sus IPs."""
@@ -1551,7 +1649,15 @@ def api_vpn_status():
                 vpn_state["active"] = False
                 vpn_state["iface"]  = ""
         ip = next((l.strip() for l in r.stdout.splitlines() if "inet " in l), "")
-        return jsonify({**vpn_state, "ip": ip})
+        # Verificar ruta a la red del cliente
+        client_data = load_clients().get(vpn_state.get("client", ""), {})
+        network = client_data.get("network", "")
+        route_ok = False
+        if network:
+            rc = subprocess.run(["ip", "route", "get", network.split("/")[0]],
+                                capture_output=True, text=True)
+            route_ok = vpn_state.get("iface", "") in rc.stdout
+        return jsonify({**vpn_state, "ip": ip, "route_ok": route_ok, "network": network})
     # Si no hay estado activo, intentar detección automática silenciosa
     detected = _detect_vpn_ifaces()
     if detected:
@@ -2077,30 +2183,32 @@ def api_ffuf_results(job_id):
         "progress":  job["progress"],
     })
 
+@app.route("/api/server/info")
+def api_server_info():
+    """Retorna IP pública y puerto del servidor para auto-configuración de probes."""
+    return jsonify({"public_ip": SERVER_PUBLIC_IP, "port": 8040})
+
+def _serve_script(filenames: list) -> Response:
+    """Lee un script shell y reemplaza la IP hardcoded con la IP detectada."""
+    for path in filenames:
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+            content = content.replace("3.143.18.161", SERVER_PUBLIC_IP)
+            return Response(content, mimetype="text/x-shellscript")
+        except FileNotFoundError:
+            continue
+    return Response("Script no encontrado.", status=404)
+
 @app.route("/api/probe/install")
 def api_probe_install():
     """Sirve el script de instalación de la sonda."""
-    try:
-        with open("/opt/scanner/probe-gateway.sh", "r") as f:
-            return Response(f.read(), mimetype="text/x-shellscript")
-    except:
-        # Fallback si no está en /opt/scanner
-        try:
-            with open("probe-gateway.sh", "r") as f:
-                return Response(f.read(), mimetype="text/x-shellscript")
-        except:
-            return "Script no encontrado en el servidor.", 404
+    return _serve_script(["/opt/scanner/probe-gateway.sh", "probe-gateway.sh"])
 
 @app.route("/api/probe/agent")
 def api_probe_agent():
     """Sirve el script del agente de escaneo local."""
-    for path in ["/opt/scanner/probe-agent.sh", "probe-agent.sh"]:
-        try:
-            with open(path, "r") as f:
-                return Response(f.read(), mimetype="text/x-shellscript")
-        except FileNotFoundError:
-            continue
-    return "probe-agent.sh no encontrado.", 404
+    return _serve_script(["/opt/scanner/probe-agent.sh", "probe-agent.sh"])
 
 @app.route("/api/probe/install.ps1")
 def api_probe_install_ps1():
@@ -2141,18 +2249,18 @@ def api_probe_list():
 def api_probe_scan_results():
     """Probe envía sus resultados de escaneo local (arp-scan, nbtscan, nmap)."""
     data = request.json or {}
-    nebula_ip = data.get("nebula_ip", "").strip()
+    vpn_ip = (data.get("vpn_ip", "") or data.get("nebula_ip", "")).strip()
     hosts = data.get("hosts", [])
     subnet = data.get("subnet", "").strip()
-    if not nebula_ip:
-        return jsonify({"error": "nebula_ip requerida"}), 400
+    if not vpn_ip:
+        return jsonify({"error": "vpn_ip requerida"}), 400
     # Update probe last_seen
-    if nebula_ip in registered_probes:
-        registered_probes[nebula_ip]["last_seen"] = now_str()
-    probe_scan_results[nebula_ip] = {
+    if vpn_ip in registered_probes:
+        registered_probes[vpn_ip]["last_seen"] = now_str()
+    probe_scan_results[vpn_ip] = {
         "hosts": hosts, "subnet": subnet,
         "timestamp": now_str(), "status": "done",
-        "probe_name": registered_probes.get(nebula_ip, {}).get("name", nebula_ip),
+        "probe_name": registered_probes.get(vpn_ip, {}).get("name", vpn_ip),
     }
     return jsonify({"ok": True, "received": len(hosts)})
 
@@ -2265,49 +2373,76 @@ def _build_map_from_probe(map_id: str, probe_ip: str, target: str):
         state["done"] = True
 
 
-@app.route("/api/nebula/announce", methods=["POST"])
-def api_nebula_announce():
-    """Nodo cliente anuncia sus subnets locales; agrega unsafe_routes a Nebula y rutas Linux."""
-    data      = request.json or {}
-    nebula_ip = data.get("nebula_ip", "").strip()
-    subnets   = data.get("subnets", [])
-    name      = data.get("name", "").strip() or nebula_ip
-    if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', nebula_ip):
-        return jsonify({"error": "nebula_ip inválida"}), 400
-    if not nebula_ip.startswith("10.255.255."):
-        return jsonify({"error": "IP fuera del rango Nebula"}), 403
-    # Also register as probe
+@app.route("/api/probe/announce", methods=["POST"])
+def api_probe_announce_universal():
+    """Anuncio universal de sonda — funciona con cualquier tipo de VPN."""
+    data = request.json or {}
+    vpn_ip = data.get("vpn_ip", "").strip()
+    vpn_type = data.get("vpn_type", "").strip().lower()
+    subnets = data.get("subnets", [])
+    name = data.get("name", "").strip() or vpn_ip
+    if not vpn_ip or not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', vpn_ip):
+        return jsonify({"error": "vpn_ip inválida"}), 400
+    # Validar y filtrar subnets
     valid_subnets = []
-    for subnet in subnets[:15]:
-        subnet = subnet.strip()
-        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$', subnet):
+    for s in subnets[:15]:
+        s = s.strip()
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$', s):
             continue
-        if subnet.startswith("10.255.255.") or subnet.startswith("127."):
+        if s.startswith("127.") or s.startswith("169.254."):
             continue
-        valid_subnets.append(subnet)
-    registered_probes[nebula_ip] = {
-        "name": name, "nebula_ip": nebula_ip, "subnets": valid_subnets,
-        "last_seen": now_str(), "status": "online",
+        valid_subnets.append(s)
+    # Registrar como sonda
+    registered_probes[vpn_ip] = {
+        "name": name, "vpn_ip": vpn_ip, "vpn_type": vpn_type,
+        "subnets": valid_subnets, "last_seen": now_str(), "status": "online",
     }
     added, errors = [], []
-    # 1. Add Linux kernel routes
-    for subnet in valid_subnets:
-        r = subprocess.run(
-            ["sudo", "ip", "route", "replace", subnet, "via", nebula_ip, "dev", "nebula0"],
-            capture_output=True, text=True)
-        if r.returncode == 0:
-            added.append(subnet)
-        else:
-            r2 = subprocess.run(
-                ["sudo", "ip", "route", "replace", subnet, "dev", "nebula0"],
+    if vpn_type == "nebula":
+        for subnet in valid_subnets:
+            r = subprocess.run(
+                ["sudo", "ip", "route", "replace", subnet, "via", vpn_ip, "dev", "nebula0"],
                 capture_output=True, text=True)
-            if r2.returncode == 0:
+            if r.returncode == 0:
                 added.append(subnet)
             else:
-                errors.append(f"{subnet}: {r.stderr.strip()}")
-    # 2. Update Nebula config with unsafe_routes for these subnets
-    _update_nebula_unsafe_routes(nebula_ip, valid_subnets)
-    return jsonify({"ok": True, "added": added, "errors": errors, "probe_registered": True})
+                r2 = subprocess.run(
+                    ["sudo", "ip", "route", "replace", subnet, "dev", "nebula0"],
+                    capture_output=True, text=True)
+                if r2.returncode == 0:
+                    added.append(subnet)
+                else:
+                    errors.append(f"{subnet}: {r.stderr.strip()}")
+        _update_nebula_unsafe_routes(vpn_ip, valid_subnets)
+    elif vpn_type == "tailscale":
+        subprocess.run(["sudo", "tailscale", "set", "--accept-routes"],
+                       capture_output=True, timeout=10)
+        added = valid_subnets
+    else:
+        # OpenVPN / WireGuard — intentar agregar ruta genérica
+        for subnet in valid_subnets:
+            for dev in ["tun0", "wg0"]:
+                r = subprocess.run(["ip", "a", "show", dev], capture_output=True, text=True)
+                if "inet " in r.stdout:
+                    subprocess.run(["sudo", "ip", "route", "replace", subnet, "dev", dev],
+                                   capture_output=True)
+                    added.append(subnet)
+                    break
+    return jsonify({"ok": True, "added": added, "errors": errors, "vpn_type": vpn_type})
+
+
+@app.route("/api/nebula/announce", methods=["POST"])
+def api_nebula_announce():
+    """Compatibilidad: redirige al endpoint universal."""
+    data = request.json or {}
+    # Adaptar campos al formato universal
+    data["vpn_ip"] = data.get("nebula_ip", "")
+    data["vpn_type"] = "nebula"
+    with app.test_request_context(
+        "/api/probe/announce", method="POST",
+        json=data, content_type="application/json"
+    ):
+        return api_probe_announce_universal()
 
 
 def _update_nebula_unsafe_routes(via_ip: str, subnets: list):
@@ -2342,7 +2477,8 @@ def _update_nebula_unsafe_routes(via_ip: str, subnets: list):
         subprocess.run(["sudo", "chmod", "600", config_path])
         os.unlink(tmp)
         # Restart Nebula to apply
-        subprocess.run(["sudo", "systemctl", "restart", "nebula"], capture_output=True)
+        # SIGHUP para recargar config sin cortar conexiones activas
+        subprocess.run(["sudo", "pkill", "-HUP", "nebula"], capture_output=True)
     except Exception as e:
         print(f"[!] Error updating Nebula unsafe_routes: {e}")
 
@@ -2374,7 +2510,8 @@ def _update_nebula_unsafe_routes_fallback(via_ip: str, subnets: list):
         subprocess.run(["sudo", "cp", tmp, config_path], check=True)
         subprocess.run(["sudo", "chmod", "600", config_path])
         os.unlink(tmp)
-        subprocess.run(["sudo", "systemctl", "restart", "nebula"], capture_output=True)
+        # SIGHUP para recargar config sin cortar conexiones activas
+        subprocess.run(["sudo", "pkill", "-HUP", "nebula"], capture_output=True)
     except Exception as e:
         print(f"[!] Fallback unsafe_routes error: {e}")
 
@@ -2388,7 +2525,7 @@ def api_nebula_config(name):
 
 def _nebula_client_config_yaml(name: str) -> str:
     """Genera una config YAML Nebula mínima para un nodo cliente."""
-    server_ip = "3.143.18.161"
+    server_ip = SERVER_PUBLIC_IP
     return f"""# Nebula config — nodo: {name}
 # Generado por Kali VPN Vulnerability Scanner
 
@@ -3013,7 +3150,17 @@ select option{background:var(--bg3)}
             </div>
           </div>
         </div>
-        <!-- Campos OpenVPN/WireGuard (ocultos para Nebula) -->
+        <!-- Campos Tailscale (visibles sólo cuando vpn_type=Tailscale) -->
+        <div id="tailscale_fields" style="display:none">
+          <div class="form-group">
+            <label>Tailscale hostname del nodo cliente</label>
+            <input id="cf_ts_hostname" name="ts_hostname" placeholder="ej: oficina-router">
+          </div>
+          <div style="font-size:.72rem;color:var(--dim);margin:-6px 0 8px 0">
+            En la sonda ejecutar: <code style="color:var(--green)">tailscale up --advertise-routes=RED_INTERNA</code>
+          </div>
+        </div>
+        <!-- Campos OpenVPN/WireGuard (ocultos para Nebula/Tailscale) -->
         <div id="classic_vpn_fields">
           <div class="form-group">
             <label>Config VPN (.ovpn / .conf / .yaml)</label>
@@ -4195,6 +4342,7 @@ function selectClient(name, c, item) {
   document.getElementById('cf_vpnpass').value       = c.vpn_pass      || '';
   document.getElementById('cf_nebula_ip').value     = c.nebula_ip     || '';
   document.getElementById('cf_nebula_groups').value = c.nebula_groups || 'clients';
+  document.getElementById('cf_ts_hostname').value    = c.ts_hostname  || '';
   document.getElementById('clientFormTitle').textContent = 'Editar: ' + name;
   document.getElementById('selClient').value  = name;
   document.getElementById('inTarget').value   = c.network  || '';
@@ -4219,7 +4367,10 @@ async function saveClient(e) {
   const r = await fetch('/api/clients', {method:'POST', body: new FormData(document.getElementById('clientFormEl'))});
   const j = await r.json();
   if (j.error) { alert(j.error); return; }
-  setStatus('Cliente guardado.');
+  let msg = 'Cliente guardado.';
+  if (j.routes && j.routes.ok) msg += ' Ruta OK (' + (j.routes.dev || j.routes.via || '') + ')';
+  else if (j.routes && j.routes.reason) msg += ' Ruta: ' + j.routes.reason;
+  setStatus(msg);
   await loadClients();
 }
 
@@ -4287,7 +4438,10 @@ async function connectVpn() {
     if (s.active) {
       clearInterval(poll);
       updateVpnBadge(s);
-      document.getElementById('vpnInfo').textContent = 'VPN activa — ' + s.ip;
+      let vmsg = 'VPN activa \u2014 ' + s.ip;
+      if (s.route_ok) vmsg += ' \u2713 Ruta OK para ' + s.network;
+      else if (s.network) vmsg += ' \u26A0 Sin ruta para ' + s.network;
+      document.getElementById('vpnInfo').textContent = vmsg;
       setStatus('VPN activa: ' + s.client);
     } else if (++tries > 25) {
       clearInterval(poll);
@@ -5008,9 +5162,10 @@ async function startProbeScan() {
 
 function onVpnTypeChange() {
   const t = document.getElementById('cf_vpntype').value;
-  const isNebula = (t === 'Nebula');
-  document.getElementById('nebula_fields').style.display    = isNebula ? '' : 'none';
-  document.getElementById('classic_vpn_fields').style.display = isNebula ? 'none' : '';
+  document.getElementById('nebula_fields').style.display     = (t === 'Nebula')    ? '' : 'none';
+  document.getElementById('tailscale_fields').style.display  = (t === 'Tailscale') ? '' : 'none';
+  document.getElementById('classic_vpn_fields').style.display =
+    (t === 'Nebula' || t === 'Tailscale') ? 'none' : '';
 }
 
 function fixCIDR(input) {

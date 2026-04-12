@@ -9,7 +9,7 @@ CERTS_DIR="/etc/nebula/certs"
 CONFIG_DIR="/etc/nebula"
 SERVICE_FILE="/etc/systemd/system/nebula.service"
 SERVER_NEBULA_IP="192.168.100.1/24"   # IP overlay del lighthouse (este servidor)
-SERVER_PUBLIC_IP="3.143.18.161"
+SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-$(curl -sf http://checkip.amazonaws.com || echo '3.143.18.161')}"
 LISTEN_PORT=4242
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'

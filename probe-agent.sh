@@ -28,8 +28,17 @@ fi
 # ── Detect OS ──
 OS=$(uname -s)
 
-# ── Detect Nebula IP ──
-detect_nebula_ip() {
+# ── Detect VPN IP (Tailscale o Nebula) ──
+detect_vpn_ip() {
+    # Intentar Tailscale primero
+    if command -v tailscale &>/dev/null; then
+        TS_IP=$(tailscale ip -4 2>/dev/null)
+        if [ -n "$TS_IP" ]; then
+            echo "$TS_IP"
+            return 0
+        fi
+    fi
+    # Intentar Nebula
     if [ "$OS" = "Darwin" ]; then
         ifconfig 2>/dev/null | grep -A2 "utun" | grep "inet 10.255.255." | awk '{print $2}' | head -1
     else
@@ -37,12 +46,12 @@ detect_nebula_ip() {
     fi
 }
 
-MY_NEBULA_IP=$(detect_nebula_ip)
-if [ -z "$MY_NEBULA_IP" ]; then
-    MY_NEBULA_IP=$(ifconfig 2>/dev/null | grep "inet 10.255.255." | awk '{print $2}' | cut -d: -f2 | head -1)
+MY_VPN_IP=$(detect_vpn_ip)
+if [ -z "$MY_VPN_IP" ]; then
+    MY_VPN_IP=$(ifconfig 2>/dev/null | grep "inet 10.255.255." | awk '{print $2}' | cut -d: -f2 | head -1)
 fi
-[ -z "$MY_NEBULA_IP" ] && { error "No se detectó IP Nebula (10.255.255.x). Nebula corriendo?"; exit 1; }
-info "IP Nebula: $MY_NEBULA_IP"
+[ -z "$MY_VPN_IP" ] && { error "No se detectó VPN activa (Tailscale ni Nebula). Ejecuta primero tu VPN."; exit 1; }
+info "IP VPN: $MY_VPN_IP"
 
 # ── Auto-detect subnet if not provided ──
 if [ -z "$SUBNET" ]; then
@@ -128,11 +137,11 @@ run_scan() {
     # ── Build final JSON ──
     # Use Python if available for reliable JSON building, otherwise awk
     if command -v python3 &>/dev/null; then
-        python3 << 'PYEOF' "$TMPDIR" "$SUBNET" "$MY_NEBULA_IP" "$KALI_API"
+        python3 << 'PYEOF' "$TMPDIR" "$SUBNET" "$MY_VPN_IP" "$KALI_API"
 import sys, json, re, os
 from urllib.request import Request, urlopen
 
-tmpdir, subnet, nebula_ip, kali_api = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+tmpdir, subnet, vpn_ip, kali_api = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 hosts = {}  # ip → host dict
 
 # Parse ARP scan
@@ -206,7 +215,7 @@ print(f"[+] Total hosts encontrados: {len(host_list)}")
 
 # Send to Kali server
 payload = json.dumps({
-    "nebula_ip": nebula_ip,
+    "vpn_ip": vpn_ip,
     "subnet": subnet,
     "hosts": host_list,
 }).encode()
@@ -225,7 +234,7 @@ PYEOF
     else
         warn "Python3 no disponible — enviando JSON básico"
         # Fallback: send what we have via curl
-        JSON_PAYLOAD="{\"nebula_ip\":\"$MY_NEBULA_IP\",\"subnet\":\"$SUBNET\",\"hosts\":[$HOSTS_JSON]}"
+        JSON_PAYLOAD="{\"vpn_ip\":\"$MY_VPN_IP\",\"subnet\":\"$SUBNET\",\"hosts\":[$HOSTS_JSON]}"
         # Remove trailing comma before ]
         JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | sed 's/,\]/]/')
         curl -sf -X POST "${KALI_API}/api/probe/scan-results" \

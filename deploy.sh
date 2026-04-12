@@ -2,7 +2,7 @@
 # Deploy Kali VPN Vulnerability Scanner al servidor AWS
 # Uso: ./deploy.sh
 
-KALI_HOST="3.143.18.161"
+KALI_HOST="${KALI_HOST:-3.143.18.161}"
 KALI_USER="kali"
 KEY="./kali-aws.pem"
 REMOTE_DIR="/opt/scanner"
