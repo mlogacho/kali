@@ -12,7 +12,7 @@ set -e
 NEBULA_CERT="/opt/nebula/nebula-cert"
 CERTS_DIR="/etc/nebula/certs"
 CONFIG_DIR="/etc/nebula"
-SERVER_PUBLIC_IP="3.143.18.161"
+SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP:-$(curl -sf http://checkip.amazonaws.com || echo '3.143.18.161')}"
 SERVER_NEBULA_IP="192.168.100.1"
 LISTEN_PORT=4242
 
@@ -207,7 +207,7 @@ cmd_bundle() {
 # Registra las subnets locales de este nodo en el servidor Kali
 # Uso: sudo bash announce.sh
 set -e
-KALI_URL="http://3.143.18.161:8040"
+KALI_URL="http://${SERVER_PUBLIC_IP}:8040"
 NEBULA_IF="nebula0"
 
 MY_NEBULA_IP=$(ip addr show "$NEBULA_IF" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
@@ -245,7 +245,7 @@ ANNOUNCE_SH
     cat > "$outdir/announce.ps1" <<'ANNOUNCE_PS1'
 # Registra las subnets locales de este nodo en el servidor Kali
 # Ejecutar como Administrador: PowerShell -ExecutionPolicy Bypass -File announce.ps1
-$KaliUrl   = "http://3.143.18.161:8040"
+$KaliUrl   = "http://${SERVER_PUBLIC_IP}:8040"
 $NebulaIf  = "nebula0"
 
 $NebulaIP = (Get-NetIPAddress -InterfaceAlias $NebulaIf -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
