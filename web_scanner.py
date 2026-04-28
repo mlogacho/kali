@@ -2200,7 +2200,23 @@ def api_nebula_setup():
         def send(msg, cls=""):
             yield f"data: {json.dumps({'msg': msg, 'cls': cls})}\n\n"
 
+        svc_user = os.environ.get("USER", "datacomerp")
         yield from send("▶ Iniciando setup de Nebula PKI...")
+
+        # ── 0. Crear directorios necesarios con sudo ─────────────────────────
+        subprocess.run(
+            ["sudo", "bash", "-c",
+             f"mkdir -p /opt/nebula {NEBULA_CERTS_DIR} && "
+             f"chown root:{svc_user} {NEBULA_CERTS_DIR} && chmod 750 {NEBULA_CERTS_DIR}"],
+            capture_output=True, text=True)
+
+        # Duración del cert del servidor: la CA debe expirar DESPUÉS del cert firmado.
+        # Restamos 720h (30 días) para evitar el error de Nebula.
+        try:
+            dur_h = int(re.match(r'(\d+)', dur).group(1))
+            dur_cert = f"{max(dur_h - 720, 720)}h"
+        except Exception:
+            dur_cert = "86880h"  # ~9 años 11 meses
 
         # ── 1. Verificar / instalar binario ──────────────────────────────────
         if not os.path.exists(NEBULA_CERT_BIN):
@@ -2208,12 +2224,14 @@ def api_nebula_setup():
             ver = "v1.9.5"
             url = f"https://github.com/slackhq/nebula/releases/download/{ver}/nebula-linux-amd64.tar.gz"
             dl = subprocess.run(
-                ["sudo","bash","-c",
-                 f"mkdir -p /opt/nebula && curl -fsSL '{url}' | tar -xz -C /opt/nebula && "
-                 f"chmod +x /opt/nebula/nebula /opt/nebula/nebula-cert"],
+                ["sudo", "bash", "-c",
+                 f"cd /tmp && curl -fsSL '{url}' -o nebula.tar.gz && "
+                 f"tar -xzf nebula.tar.gz -C /opt/nebula && "
+                 f"chmod +x /opt/nebula/nebula /opt/nebula/nebula-cert && "
+                 f"rm -f /tmp/nebula.tar.gz"],
                 capture_output=True, text=True)
             if dl.returncode != 0:
-                yield from send(f"✗ Error descargando Nebula: {dl.stderr}", "error")
+                yield from send(f"✗ Error descargando Nebula: {dl.stderr or dl.stdout}", "error")
                 yield "data: {\"done\":true,\"error\":true}\n\n"
                 return
             yield from send("✓ Nebula instalado en /opt/nebula/", "ok")
@@ -2239,7 +2257,7 @@ def api_nebula_setup():
             # ca.crt = legible por todos (se distribuye a clientes); ca.key = solo root
             subprocess.run(["sudo","chmod","644", ca_crt], capture_output=True)
             subprocess.run(["sudo","chmod","600", ca_key], capture_output=True)
-            subprocess.run(["sudo","chown","root:kali", ca_crt], capture_output=True)
+            subprocess.run(["sudo","chown",f"root:{svc_user}", ca_crt], capture_output=True)
             yield from send(f"✓ CA generada: {ca_crt}", "ok")
 
         # ── 3. Generar cert del servidor (lighthouse) ─────────────────────────
@@ -2254,7 +2272,7 @@ def api_nebula_setup():
                  "-ca-crt", ca_crt, "-ca-key", ca_key,
                  "-name", "kali-lighthouse",
                  "-ip", server_ip, "-groups", "lighthouse,servers",
-                 "-duration", dur,
+                 "-duration", dur_cert,
                  "-out-crt", srv_crt, "-out-key", srv_key],
                 capture_output=True, text=True)
             if r.returncode != 0:
@@ -2263,7 +2281,7 @@ def api_nebula_setup():
                 return
             subprocess.run(["sudo","chmod","644", srv_crt], capture_output=True)
             subprocess.run(["sudo","chmod","640", srv_key], capture_output=True)
-            subprocess.run(["sudo","chown","root:kali", srv_crt, srv_key], capture_output=True)
+            subprocess.run(["sudo","chown",f"root:{svc_user}", srv_crt, srv_key], capture_output=True)
             yield from send(f"✓ Cert servidor: {srv_crt}", "ok")
 
         yield from send("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2378,10 +2396,10 @@ def api_nebula_generate():
         err_msg = (r.stderr or r.stdout or "Error generando certificado").strip()
         first_line = err_msg.splitlines()[0] if err_msg else "Error desconocido"
         return jsonify({"error": first_line}), 500
-    # Dar permisos de lectura al usuario kali sobre el nuevo par
+    svc_user = os.environ.get("USER", "datacomerp")
     subprocess.run(["sudo","chmod","644", out_crt], capture_output=True)
     subprocess.run(["sudo","chmod","640", out_key], capture_output=True)
-    subprocess.run(["sudo","chown","kali:kali", out_crt, out_key], capture_output=True)
+    subprocess.run(["sudo","chown",f"{svc_user}:{svc_user}", out_crt, out_key], capture_output=True)
     return jsonify({"ok": True, "crt": out_crt, "key": out_key,
                     "warn": warn_msg, "cert": _nebula_cert_info(out_crt)})
 
