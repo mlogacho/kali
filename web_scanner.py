@@ -7,7 +7,7 @@ Acceder desde: http://<kali-ip>:8040
 
 import os, json, re, datetime, subprocess, threading, time, uuid, io, ipaddress
 import urllib.request
-from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context, send_file
+from flask import Flask, render_template_string, request, jsonify, Response, stream_with_context, send_file, send_from_directory
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
@@ -15,13 +15,15 @@ app.secret_key = os.urandom(32)
 CLIENTS_FILE     = "/opt/scanner/clients.json"
 UPLOAD_DIR       = "/opt/scanner/vpn_configs"
 SCANS_DIR        = "/opt/scanner/scans"
+STATIC_DIR       = "/opt/scanner/static"
 NEBULA_BIN       = "/opt/nebula/nebula"
 NEBULA_CERT_BIN  = "/opt/nebula/nebula-cert"
 NEBULA_CERTS_DIR = "/etc/nebula/certs"  # CA y certs generados por nebula-setup.sh
 NEBULA_CONFIG_DIR= "/etc/nebula"
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(SCANS_DIR,  exist_ok=True)
+os.makedirs(UPLOAD_DIR,  exist_ok=True)
+os.makedirs(SCANS_DIR,   exist_ok=True)
+os.makedirs(STATIC_DIR,  exist_ok=True)
 # /etc/nebula lo crea nebula-setup.sh (requiere root); aquí sólo intentamos sin fallar
 try:
     os.makedirs(NEBULA_CERTS_DIR, exist_ok=True)
@@ -3351,6 +3353,12 @@ td{{padding:3px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
                         headers={"Content-Disposition": f"attachment; filename={safe_fname}"})
     return "fmt inválido", 400
 
+# ── Static assets (JS libs served locally — no CDN dependency) ─────────────────
+
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    return send_from_directory(STATIC_DIR, filename)
+
 # ── Main page ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -3364,8 +3372,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kali VPN Vulnerability Scanner</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="/static/d3.min.js"></script>
+<script src="/static/chart.umd.min.js"></script>
 <style>
 :root{
   --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--bg4:#30363d;
@@ -3386,8 +3394,8 @@ header span{color:var(--dim);font-size:.82rem}
 .badge-vpn.on{background:#1a3a1a;color:var(--green)}
 .badge-vpn.off{background:#3a1a1a;color:var(--red)}
 .layout{display:flex;flex:1;overflow:hidden}
-.sidebar{width:270px;background:var(--bg2);border-right:1px solid var(--bg4);
-         display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
+.sidebar{width:280px;background:var(--bg2);border-right:1px solid var(--bg4);
+         display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto;overflow-x:hidden}
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .tabs{display:flex;border-bottom:1px solid var(--bg4);flex-shrink:0}
 .tab{padding:10px 22px;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;
@@ -3469,7 +3477,7 @@ select option{background:var(--bg3)}
        padding:24px;width:440px;max-width:95vw}
 .modal h2{color:var(--blue);margin-bottom:16px;font-size:1rem}
 .client-form{border-top:1px solid var(--bg4);padding:12px;flex-shrink:0;
-             max-height:52vh;overflow-y:auto;background:var(--bg)}
+             overflow-y:visible;background:var(--bg)}
 .client-form h3{font-size:.78rem;color:var(--dim);font-weight:700;margin-bottom:10px;text-transform:uppercase}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
