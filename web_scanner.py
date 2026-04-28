@@ -561,7 +561,104 @@ def generate_pdf_report(scan: dict) -> bytes:
     return buf.read()
 
 
-# ── Executive HTML Report ──────────────────────────────────────────────────────
+# ── Executive HTML Report (per-profile) ───────────────────────────────────────
+
+# Shared CSS injected into every executive report
+_EXEC_CSS = """
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
+     font-size:14px;line-height:1.6;background:#F4F6F9;color:#1A1A2E}
+.page{max-width:900px;margin:32px auto;background:#fff;border-radius:10px;
+      box-shadow:0 4px 24px rgba(0,0,0,.10);overflow:hidden}
+.report-header{background:linear-gradient(135deg,#0D1B2A 0%,#1B3556 100%);color:#fff;padding:36px 40px 28px}
+.header-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.header-logo{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#7BAFD4;font-weight:600}
+.report-title{font-size:22px;font-weight:700;margin:6px 0 2px;letter-spacing:-.3px}
+.report-subtitle{font-size:13px;color:#A8C4DC}
+.badges{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start}
+.badge{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;
+       letter-spacing:.06em;text-transform:uppercase;white-space:nowrap}
+.badge-vpn{background:#1E4D78;color:#7EC8E3;border:1px solid #2A6099}
+.badge-risk-critico{background:#A32D2D;color:#fff;border:1px solid #c84040}
+.badge-risk-alto{background:#854F0B;color:#fff;border:1px solid #b06a10}
+.badge-risk-moderado{background:#7D6008;color:#fff;border:1px solid #a8820a}
+.badge-risk-bajo{background:#3B6D11;color:#fff;border:1px solid #5a9e1a}
+.header-meta{margin-top:22px;display:grid;
+             grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 24px}
+.meta-label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#7BAFD4;font-weight:600}
+.meta-value{font-size:13px;color:#E8F1F8;font-weight:500}
+.report-body{padding:32px 40px}
+.section{margin-bottom:36px}
+.section-title{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.10em;
+               color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:8px;margin-bottom:18px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+@media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr)}}
+.card{border-radius:8px;padding:18px 16px 14px;text-align:center;border-width:1px;border-style:solid}
+.card-num{font-size:36px;font-weight:800;line-height:1}
+.card-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;margin-top:5px}
+.card-hosts{background:#E6F1FB;border-color:#B5D4F4;color:#185FA5}
+.card-critico{background:#FCEBEB;border-color:#F09595;color:#A32D2D}
+.card-alto{background:#FAEEDA;border-color:#FAC775;color:#854F0B}
+.card-medio{background:#E6F1FB;border-color:#B5D4F4;color:#185FA5}
+.card-bajo{background:#EAF3DE;border-color:#C0DD97;color:#3B6D11}
+.chart-wrap{padding:6px 0}
+.chart-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.chart-label{width:110px;font-size:11px;font-weight:600;text-align:right;flex-shrink:0}
+.chart-bar-bg{flex:1;background:#F0F2F6;border-radius:4px;height:26px;overflow:hidden}
+.chart-bar{height:100%;border-radius:4px;min-width:0}
+.chart-count{font-size:13px;font-weight:700;width:32px;text-align:left;flex-shrink:0}
+.bar-critico{background:#C94040}.bar-alto{background:#D4780A}
+.bar-medio{background:#2274C8}.bar-bajo{background:#4E9E1A}
+.label-critico{color:#A32D2D}.label-alto{color:#854F0B}
+.label-medio{color:#185FA5}.label-bajo{color:#3B6D11}
+.mid-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
+.host-card{border-radius:8px;border:1px solid #E0E6EF;border-left-width:5px;
+           padding:14px 16px;background:#FAFBFD}
+.host-card.risk-high{border-left-color:#C94040}
+.host-card.risk-medium{border-left-color:#D4780A}
+.host-card.risk-low{border-left-color:#2274C8}
+.host-card.risk-ok{border-left-color:#4E9E1A;background:#F6FAF0}
+.host-card.span2{grid-column:span 2}
+.host-ip{font-size:15px;font-weight:700;color:#1A1A2E;font-family:'SF Mono','Fira Code',monospace}
+.host-score{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#8A94A6;margin:2px 0 8px}
+.host-services{display:flex;flex-wrap:wrap;gap:5px}
+.service-tag{font-size:11px;padding:2px 8px;border-radius:12px;font-weight:500;
+             background:#E6EDF6;color:#3B5278}
+.service-tag.danger{background:#FCEBEB;color:#A32D2D}
+.service-tag.warn{background:#FAEEDA;color:#854F0B}
+.service-tag.ok{background:#EAF3DE;color:#3B6D11}
+.ok-box{background:#EAF3DE;border:1px solid #C0DD97;border-radius:8px;padding:16px;
+        font-size:13px;color:#3B6D11}
+.actions-list{list-style:none;display:flex;flex-direction:column;gap:10px}
+.action-item{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;
+             border-radius:8px;border-width:1px;border-style:solid}
+.action-tag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+            padding:3px 10px;border-radius:20px;white-space:nowrap;flex-shrink:0;margin-top:1px}
+.action-text{font-size:13px;line-height:1.5}
+.action-urgente{background:#FCEBEB;border-color:#F09595}
+.action-urgente .action-tag{background:#A32D2D;color:#fff}
+.action-urgente .action-text{color:#5A1515}
+.action-2semanas{background:#FAEEDA;border-color:#FAC775}
+.action-2semanas .action-tag{background:#854F0B;color:#fff}
+.action-2semanas .action-text{color:#4A2B05}
+.action-30dias{background:#E6F1FB;border-color:#B5D4F4}
+.action-30dias .action-tag{background:#185FA5;color:#fff}
+.action-30dias .action-text{color:#0D2E4E}
+.report-footer{background:#F0F2F6;border-top:1px solid #DDE2EC;padding:20px 40px;
+               display:flex;justify-content:space-between;align-items:flex-start;
+               flex-wrap:wrap;gap:12px}
+.footer-meta{font-size:11px;color:#5C6B8A;line-height:1.8}
+.footer-meta strong{color:#1A1A2E}
+.footer-confidential{font-size:10px;color:#8A94A6;text-align:right;max-width:260px;line-height:1.5}
+.confidential-badge{display:inline-block;background:#1A1A2E;color:#fff;font-size:9px;font-weight:700;
+                    letter-spacing:.15em;text-transform:uppercase;padding:2px 8px;border-radius:3px;margin-bottom:4px}
+@media print{
+  body{background:#fff}
+  .page{box-shadow:none;border-radius:0;margin:0}
+  .report-header,.card,.host-card,.action-item,.chart-bar{
+    -webkit-print-color-adjust:exact;print-color-adjust:exact}}
+"""
+
 
 def generate_executive_html_report(scan: dict) -> str:
     """Generate a management-facing executive HTML report, tailored per scan profile."""
@@ -577,30 +674,630 @@ def generate_executive_html_report(scan: dict) -> str:
     vpn_iface  = scan.get("vpn_client", "No") or "No"
     lines      = scan.get("lines",      [])
 
-    # ── Parse hosts ────────────────────────────────────────────────────────────
+    p = profile.lower()
+
+    def e(s): return _html.escape(str(s))
+
+    def _pnum(ps):
+        try: return int(ps.split("/")[0])
+        except: return 0
+
+    # ── Common: parse hosts + severity counts ──────────────────────────────────
     hosts = _parse_hosts_from_lines(lines)
 
-    # ── Count severities (skip retransmission noise) ───────────────────────────
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    sev = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for line in lines:
         if isinstance(line, str) and "retransmission" not in line.lower():
             sev = detect_severity(line)
             if sev in counts:
-                counts[sev] += 1
+                sev[_sev] += 1
 
-    # ── Overall risk badge ─────────────────────────────────────────────────────
-    if counts["CRITICAL"] > 0:
-        risk_class, risk_label = "badge-risk-critico",  "RIESGO: CRÍTICO"
-    elif counts["HIGH"] > 0:
-        risk_class, risk_label = "badge-risk-alto",     "RIESGO: ALTO"
-    elif counts["MEDIUM"] > 5:
-        risk_class, risk_label = "badge-risk-moderado", "RIESGO: MODERADO"
+    all_ports_set = {_pnum(ps) for h in hosts for ps in h.get("ports", [])}
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PROFILE-SPECIFIC DATA EXTRACTION
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── CVEs con CVSS (vulners) ────────────────────────────────────────────────
+    if "vulners" in p or "cvss" in p:
+        report_ctx = "Análisis de Vulnerabilidades con Puntuación CVSS"
+        cves, seen_cves = [], set()
+        for line in lines:
+            m = re.search(r'(CVE-\d{4}-\d+)\s+([\d.]+)', line)
+            if m and m.group(1) not in seen_cves:
+                seen_cves.add(m.group(1))
+                cves.append({"id": m.group(1), "score": float(m.group(2))})
+        cves.sort(key=lambda x: -x["score"])
+        c_crit = [c for c in cves if c["score"] >= 9.0]
+        c_high = [c for c in cves if 7.0 <= c["score"] < 9.0]
+        c_med  = [c for c in cves if 5.0 <= c["score"] < 7.0]
+        cards = [
+            {"num": len(hosts),    "label": "Hosts Analizados", "css": "card-hosts"},
+            {"num": len(c_crit),   "label": "CVEs Críticos",    "css": "card-critico"},
+            {"num": len(c_high),   "label": "CVEs Altos",       "css": "card-alto"},
+            {"num": len(c_med),    "label": "CVEs Medios",      "css": "card-medio"},
+        ]
+        chart_data = [
+            ("CRÍTICO (≥9.0)", "label-critico", "bar-critico", len(c_crit)),
+            ("ALTO (7-8.9)",   "label-alto",    "bar-alto",    len(c_high)),
+            ("MEDIO (5-6.9)",  "label-medio",   "bar-medio",   len(c_med)),
+            ("BAJO (<5.0)",    "label-bajo",    "bar-bajo",    len(cves) - len(c_crit) - len(c_high) - len(c_med)),
+        ]
+        risk_class = "badge-risk-critico" if c_crit else "badge-risk-alto" if c_high else "badge-risk-moderado" if c_med else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"    if c_crit else "RIESGO: ALTO"    if c_high else "RIESGO: MODERADO"    if c_med else "RIESGO: BAJO"
+        mid_title = "CVEs Identificados (CVSS ≥ 5.0)"
+        def _cve_border(score): return "risk-high" if score >= 9 else "risk-medium" if score >= 7 else "risk-low"
+        mid_html = "".join(
+            f'<div class="host-card {_cve_border(c["score"])}">'
+            f'<div class="host-ip">{e(c["id"])}</div>'
+            f'<div class="host-score">CVSS: {c["score"]}</div>'
+            f'<div class="host-services"><span class="service-tag {"danger" if c["score"]>=9 else "warn" if c["score"]>=7 else ""}">'
+            f'{"CRÍTICO" if c["score"]>=9 else "ALTO" if c["score"]>=7 else "MEDIO"}</span></div></div>'
+            for c in cves[:24]
+        ) or '<div class="ok-box">✓ No se detectaron CVEs con CVSS ≥ 5.0 en este escaneo.</div>'
+        actions = []
+        if c_crit: actions.append(("URGENTE", "action-urgente",
+            f"Parchear inmediatamente los {len(c_crit)} CVE(s) críticos (CVSS ≥ 9.0). Representan riesgo de compromiso total del sistema."))
+        if c_high: actions.append(("URGENTE", "action-urgente",
+            f"Remediar los {len(c_high)} CVE(s) altos (CVSS 7-8.9) en los próximos 15 días. Priorizar sistemas expuestos."))
+        if c_med: actions.append(("2 SEMANAS", "action-2semanas",
+            f"Programar el parcheo de los {len(c_med)} CVE(s) medios (CVSS 5-6.9) en el siguiente ciclo de mantenimiento."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Implementar un proceso formal de gestión de vulnerabilidades con escaneos mensuales y seguimiento por hallazgo."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Repetir el escaneo CVSS en 30 días para verificar remediación."))
+
+    # ── Banner grabbing ────────────────────────────────────────────────────────
+    elif "banner" in p:
+        report_ctx = "Inventario de Servicios y Versiones de Software"
+        _CLEARTEXT = {21, 23, 25, 110, 143, 514}
+        _EOL_KW    = ["2.2.", "2.4.1", "7.4p", "7.2p", "openssl 0.", "openssl 1.0", "apache/2.2", "iis/6", "iis/7"]
+        banner_hosts = {}
+        cur_ip = None
+        for line in lines:
+            hm = re.match(r'Nmap scan report for (.+)', line)
+            if hm:
+                s = hm.group(1).strip()
+                ipm = re.search(r'\((\d+\.\d+\.\d+\.\d+)\)', s)
+                cur_ip = ipm.group(1) if ipm else s.split()[0]
+                banner_hosts.setdefault(cur_ip, [])
+            if cur_ip:
+                pm = re.match(r'\s*(\d+)/tcp\s+open\s+(\S+)\s*(.*)', line)
+                if pm:
+                    pn = int(pm.group(1)); sn = pm.group(2); ver = pm.group(3).strip()
+                    banner_hosts[cur_ip].append({"port": pn, "service": sn, "version": ver})
+                bm = re.search(r'\|[_ ]+banner:\s*(.+)', line)
+                if bm and banner_hosts.get(cur_ip):
+                    banner_hosts[cur_ip][-1]["banner"] = bm.group(1).strip()
+        cleartext_n = sum(1 for svcs in banner_hosts.values() for s in svcs if s["port"] in _CLEARTEXT)
+        outdated_n  = sum(1 for svcs in banner_hosts.values() for s in svcs
+                          if any(k in (s.get("version","") + s.get("banner","")).lower() for k in _EOL_KW))
+        total_svcs  = sum(len(v) for v in banner_hosts.values())
+        cards = [
+            {"num": len(banner_hosts), "label": "Hosts Analizados",      "css": "card-hosts"},
+            {"num": total_svcs,        "label": "Servicios Detectados",   "css": "card-medio"},
+            {"num": cleartext_n,       "label": "Sin Cifrado",            "css": "card-critico"},
+            {"num": outdated_n,        "label": "Software Desactualizado","css": "card-alto"},
+        ]
+        chart_data = [
+            ("SIN CIFRADO",    "label-critico", "bar-critico", cleartext_n),
+            ("DESACTUALIZADO", "label-alto",    "bar-alto",    outdated_n),
+            ("SERVICIOS",      "label-medio",   "bar-medio",   total_svcs),
+            ("HOSTS",          "label-bajo",    "bar-bajo",    len(banner_hosts)),
+        ]
+        risk_class = "badge-risk-critico" if cleartext_n > 3 or outdated_n > 3 else \
+                     "badge-risk-alto"     if cleartext_n or outdated_n else \
+                     "badge-risk-moderado" if total_svcs > 10 else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO" if cleartext_n > 3 or outdated_n > 3 else \
+                     "RIESGO: ALTO"    if cleartext_n or outdated_n else \
+                     "RIESGO: MODERADO" if total_svcs > 10 else "RIESGO: BAJO"
+        mid_title = "Inventario de Servicios por Host"
+        def _btags(svcs):
+            out = ""
+            for s in svcs[:6]:
+                lbl = (s.get("version") or s["service"])[:40]
+                cls = "danger" if s["port"] in _CLEARTEXT else ""
+                out += f'<span class="service-tag {cls}">{e(lbl)}</span>'
+            return out
+        mid_html = "".join(
+            f'<div class="host-card {"risk-high" if any(s["port"] in _CLEARTEXT for s in svcs) else "risk-medium" if svcs else "risk-low"}">'
+            f'<div class="host-ip">{e(ip)}</div>'
+            f'<div class="host-score">{len(svcs)} servicio(s) identificado(s)</div>'
+            f'<div class="host-services">{_btags(svcs)}</div></div>'
+            for ip, svcs in list(banner_hosts.items())[:6] if svcs
+        ) or '<div class="ok-box">No se detectaron banners de servicio.</div>'
+        actions = []
+        if cleartext_n: actions.append(("URGENTE", "action-urgente",
+            f"Deshabilitar los {cleartext_n} servicio(s) sin cifrado (Telnet, FTP, SMTP sin TLS). Reemplazar con SSH y SFTP."))
+        if outdated_n: actions.append(("URGENTE", "action-urgente",
+            f"Actualizar el software desactualizado identificado ({outdated_n} instancia(s)). Las versiones antiguas tienen CVEs conocidos."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Deshabilitar servicios que no sean estrictamente necesarios para reducir la superficie de ataque."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Mantener un inventario formal de activos y servicios actualizado con cada cambio de infraestructura."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir el escaneo de banners en 30 días para verificar actualizaciones."))
+
+    # ── Hashcat / John ─────────────────────────────────────────────────────────
+    elif "hashcat" in p or "john" in p:
+        report_ctx = "Auditoría de Contraseñas — Análisis de Hashes"
+        cracked = []; total_hashes = 0
+        for line in lines:
+            ls = line.strip()
+            if "hashcat" in p:
+                pm = re.search(r'Progress\.+:\s*(\d+)/(\d+)', ls)
+                if pm: total_hashes = int(pm.group(2))
+                if ':' in ls and len(ls) > 10 and not ls.startswith(('[','Session','Status','Hash','Time','Speed','Recovered','Progress','Rejected','Restore','Started','Stopped','Guess')):
+                    parts = ls.rsplit(':', 1)
+                    if len(parts) == 2 and parts[1].strip() and len(parts[0]) >= 16:
+                        cracked.append({"hash": parts[0][-24:], "password": parts[1].strip()})
+            else:
+                jm = re.search(r'^(\S+)\s+\((.+?)\)\s*$', ls)
+                if jm and not ls.startswith('['):
+                    cracked.append({"hash": jm.group(2), "password": jm.group(1)})
+        if not total_hashes: total_hashes = max(len(cracked) + 5, 10)
+        not_cracked = max(total_hashes - len(cracked), 0)
+        crack_pct   = int(len(cracked) / total_hashes * 100) if total_hashes else 0
+        _WEAK_KW = ["123", "password", "abc", "admin", "qwerty", "1234", "pass", "test", "user", "letme"]
+        weak_n = sum(1 for c in cracked if any(k in c["password"].lower() for k in _WEAK_KW) or len(c["password"]) < 8)
+        cards = [
+            {"num": total_hashes,    "label": "Hashes Procesados", "css": "card-hosts"},
+            {"num": len(cracked),    "label": "Contraseñas Rotas", "css": "card-critico"},
+            {"num": not_cracked,     "label": "No Descifradas",    "css": "card-bajo"},
+            {"num": f"{crack_pct}%", "label": "Tasa de Éxito",    "css": "card-alto"},
+        ]
+        chart_data = [
+            ("DESCIFRADAS", "label-critico", "bar-critico", len(cracked)),
+            ("DÉBILES",     "label-alto",    "bar-alto",    weak_n),
+            ("RESTANTES",   "label-medio",   "bar-medio",   not_cracked),
+            ("TOTAL",       "label-bajo",    "bar-bajo",    total_hashes),
+        ]
+        risk_class = "badge-risk-critico" if len(cracked) and crack_pct > 50 else \
+                     "badge-risk-alto"     if cracked else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO" if len(cracked) and crack_pct > 50 else \
+                     "RIESGO: ALTO"    if cracked else "RIESGO: BAJO"
+        mid_title = "Contraseñas Descifradas"
+        def _pwd_row(c):
+            is_weak = len(c["password"]) < 8 or any(k in c["password"].lower() for k in _WEAK_KW)
+            _weak_span = '<span class="service-tag danger">Débil</span>' if is_weak else ""
+            return (f'<div class="host-card {"risk-high" if is_weak else "risk-medium"}">'
+                    f'<div class="host-ip" style="font-size:12px;">{e(c["hash"][:28])}…</div>'
+                    f'<div class="host-score">{len(c["password"])} caracteres</div>'
+                    f'<div class="host-services"><span class="service-tag {"danger" if is_weak else "warn"}">{e(c["password"][:30])}</span>'
+                    f'{_weak_span}</div></div>')
+        mid_html = "".join(_pwd_row(c) for c in cracked[:12]) or \
+            '<div class="ok-box">✓ No se lograron descifrar contraseñas. Las políticas de hash parecen robustas.</div>'
+        actions = []
+        if cracked: actions.append(("URGENTE", "action-urgente",
+            f"Forzar el cambio inmediato de las {len(cracked)} contraseña(s) comprometidas y verificar accesos no autorizados en los logs."))
+        if weak_n: actions.append(("URGENTE", "action-urgente",
+            f"Implementar políticas de contraseñas más estrictas: mínimo 12 caracteres, mayúsculas, números y símbolos. Se encontraron {weak_n} contraseña(s) trivialmente débiles."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Habilitar autenticación de doble factor (2FA/MFA) en todos los sistemas críticos."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Migrar el almacenamiento de contraseñas a algoritmos modernos: bcrypt, Argon2 o PBKDF2 (no MD5/SHA sin sal)."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir la auditoría de contraseñas en 30 días para verificar la remediación."))
+
+    # ── Hydra (fuerza bruta de credenciales) ───────────────────────────────────
+    elif "hydra" in p:
+        report_ctx = "Auditoría de Credenciales — Prueba de Acceso Remoto"
+        successes = []; attempts = 0
+        for line in lines:
+            sm = re.search(r'\[(\d+)\]\[([^\]]+)\]\s+host:\s+(\S+)\s+login:\s+(\S+)\s+password:\s+(\S+)', line)
+            if sm: successes.append({"port": sm.group(1), "service": sm.group(2),
+                                     "host": sm.group(3), "login": sm.group(4), "password": sm.group(5)})
+            if "login:" in line.lower() and "password:" in line.lower(): attempts += 1
+        hosts_atk = len({s["host"] for s in successes} | {target})
+        svcs_atk  = len({s["service"] for s in successes}) or 1
+        cards = [
+            {"num": hosts_atk,       "label": "Hosts Atacados",      "css": "card-hosts"},
+            {"num": len(successes),  "label": "Credenciales Válidas", "css": "card-critico"},
+            {"num": svcs_atk,        "label": "Servicios Probados",   "css": "card-alto"},
+            {"num": attempts or "—", "label": "Intentos Realizados",  "css": "card-medio"},
+        ]
+        chart_data = [
+            ("EXITOSOS",  "label-critico", "bar-critico", len(successes)),
+            ("SERVICIOS", "label-alto",    "bar-alto",    svcs_atk),
+            ("HOSTS",     "label-medio",   "bar-medio",   hosts_atk),
+            ("INTENTOS",  "label-bajo",    "bar-bajo",    min(attempts, 9999)),
+        ]
+        risk_class = "badge-risk-critico" if successes else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"    if successes else "RIESGO: BAJO"
+        mid_title = "Credenciales Comprometidas"
+        mid_html = "".join(
+            f'<div class="host-card risk-high"><div class="host-ip">{e(s["host"])}</div>'
+            f'<div class="host-score">Servicio: {e(s["service"])} — Puerto {e(s["port"])}</div>'
+            f'<div class="host-services"><span class="service-tag danger">Usuario: {e(s["login"])}</span>'
+            f'<span class="service-tag warn">Contraseña: {e(s["password"])}</span></div></div>'
+            for s in successes[:12]
+        ) or '<div class="ok-box">✓ No se encontraron credenciales válidas. Los controles de acceso parecen adecuados.</div>'
+        actions = []
+        if successes:
+            actions.append(("URGENTE", "action-urgente",
+                f"Bloquear INMEDIATAMENTE las {len(successes)} cuenta(s) comprometidas y forzar reset de contraseña. Revisar logs para detectar accesos previos no autorizados."))
+            actions.append(("URGENTE", "action-urgente",
+                "Implementar bloqueo de cuenta después de 5 intentos fallidos (account lockout). Esto habría prevenido este ataque."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Habilitar autenticación de doble factor (2FA) en todos los servicios de acceso remoto: SSH, RDP, FTP, VPN."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Implementar un IDS/SIEM que alerte sobre múltiples intentos fallidos de inicio de sesión."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir la auditoría de credenciales en 30 días para verificar los controles implementados."))
+
+    # ── Nikto (web) ────────────────────────────────────────────────────────────
+    elif "nikto" in p:
+        report_ctx = "Seguridad de Aplicaciones Web (Nikto)"
+        nk_all = []
+        for line in lines:
+            ls = line.strip()
+            if ls.startswith('+ ') and len(ls) > 3: nk_all.append(ls[2:])
+        nk_vuln = [f for f in nk_all if any(k in f.lower() for k in ["osvdb","cve-","vuln","inject","rce","sql"])]
+        nk_path = [f for f in nk_all if "/" in f and not any(k in f.lower() for k in ["osvdb","cve-"])]
+        cards = [
+            {"num": len(nk_all),      "label": "Hallazgos Totales", "css": "card-hosts"},
+            {"num": sev["CRITICAL"] + sev["HIGH"], "label": "Críticos/Altos", "css": "card-critico"},
+            {"num": len(nk_vuln),     "label": "OSVDB/CVE",         "css": "card-alto"},
+            {"num": len(nk_path),     "label": "Rutas Expuestas",   "css": "card-medio"},
+        ]
+        chart_data = [
+            ("CRÍTICOS",  "label-critico", "bar-critico", sev["CRITICAL"]),
+            ("ALTOS",     "label-alto",    "bar-alto",    sev["HIGH"]),
+            ("MEDIOS",    "label-medio",   "bar-medio",   sev["MEDIUM"]),
+            ("BAJOS",     "label-bajo",    "bar-bajo",    sev["LOW"]),
+        ]
+        risk_class = "badge-risk-critico" if sev["CRITICAL"] else \
+                     "badge-risk-alto"     if sev["HIGH"] or len(nk_vuln) > 3 else \
+                     "badge-risk-moderado" if nk_all else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"  if sev["CRITICAL"] else \
+                     "RIESGO: ALTO"     if sev["HIGH"] or len(nk_vuln) > 3 else \
+                     "RIESGO: MODERADO" if nk_all else "RIESGO: BAJO"
+        mid_title = "Hallazgos Web (Nikto)"
+        def _nk_cls(f):
+            fl = f.lower()
+            if any(k in fl for k in ["vuln","rce","sql","inject","osvdb","cve"]): return ("risk-high","danger")
+            if any(k in fl for k in ["admin","backup","config","password","login",".git",".env"]): return ("risk-medium","warn")
+            return ("risk-low","")
+        mid_html = "".join(
+            f'<div class="host-card {_nk_cls(f)[0]} span2"><div class="host-services">'
+            f'<span class="service-tag {_nk_cls(f)[1]}">{e(f[:130])}</span></div></div>'
+            for f in nk_all[:16]
+        ) or '<div class="ok-box">No se detectaron hallazgos web significativos.</div>'
+        actions = []
+        if nk_vuln: actions.append(("URGENTE", "action-urgente",
+            f"Remediar los {len(nk_vuln)} hallazgo(s) con referencias OSVDB/CVE. Actualizar el servidor web y todos sus componentes."))
+        if nk_path: actions.append(("2 SEMANAS", "action-2semanas",
+            f"Restringir el acceso a {len(nk_path)} ruta(s) expuestas: paneles de administración, archivos de configuración y backups."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Implementar un Web Application Firewall (WAF) para proteger contra SQLi, XSS y path traversal."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Configurar cabeceras de seguridad HTTP: Content-Security-Policy, X-Frame-Options, Strict-Transport-Security."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir el escaneo web en 30 días para verificar la remediación."))
+
+    # ── Gobuster (enumeración de directorios) ──────────────────────────────────
+    elif "gobuster" in p:
+        report_ctx = "Enumeración de Rutas y Recursos Web (Gobuster)"
+        _SENS_KW = [".git", ".env", ".bak", "admin", "backup", "config", "password", "passwd", ".sql",
+                    "phpmyadmin", "wp-admin", "manager", "console", "debug"]
+        gb_paths = []
+        for line in lines:
+            m = re.search(r'(/\S+)\s+\(Status:\s*(\d+)\)', line)
+            if m: gb_paths.append({"path": m.group(1), "status": int(m.group(2))})
+        sens = [p2 for p2 in gb_paths if any(k in p2["path"].lower() for k in _SENS_KW)]
+        ok200 = [p2 for p2 in gb_paths if p2["status"] == 200]
+        cards = [
+            {"num": len(gb_paths), "label": "Rutas Encontradas",    "css": "card-hosts"},
+            {"num": len(ok200),    "label": "Acceso Directo (200)", "css": "card-alto"},
+            {"num": len(sens),     "label": "Rutas Sensibles",      "css": "card-critico"},
+            {"num": len(gb_paths) - len(ok200), "label": "Redirecciones", "css": "card-medio"},
+        ]
+        chart_data = [
+            ("SENSIBLES",   "label-critico", "bar-critico", len(sens)),
+            ("ACCESO 200",  "label-alto",    "bar-alto",    len(ok200)),
+            ("OTRAS",       "label-medio",   "bar-medio",   len(gb_paths) - len(ok200)),
+            ("TOTAL",       "label-bajo",    "bar-bajo",    len(gb_paths)),
+        ]
+        risk_class = "badge-risk-critico" if sens else \
+                     "badge-risk-alto"     if len(ok200) > 20 else \
+                     "badge-risk-moderado" if gb_paths else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"  if sens else \
+                     "RIESGO: ALTO"     if len(ok200) > 20 else \
+                     "RIESGO: MODERADO" if gb_paths else "RIESGO: BAJO"
+        mid_title = "Rutas y Recursos Expuestos"
+        show = [p2 for p2 in gb_paths if p2 in sens] + [p2 for p2 in gb_paths if p2 not in sens and p2["status"] == 200]
+        def _gb_card(p2):
+            sens_span = '<span class="service-tag danger">Ruta sensible</span>' if p2 in sens else ""
+            rc = "risk-high" if p2 in sens else "risk-medium"
+            return (f'<div class="host-card {rc}">'
+                    f'<div class="host-ip" style="font-size:12px;font-family:monospace">{e(p2["path"])}</div>'
+                    f'<div class="host-score">HTTP {p2["status"]}</div>'
+                    f'<div class="host-services">{sens_span}<span class="service-tag">Acceso confirmado</span></div></div>')
+        mid_html = "".join(_gb_card(p2) for p2 in show[:18]) or '<div class="ok-box">No se encontraron rutas accesibles.</div>'
+        actions = []
+        if sens: actions.append(("URGENTE", "action-urgente",
+            f"Eliminar o proteger inmediatamente las {len(sens)} ruta(s) sensibles (.git, .env, backups, admin). Exponen código fuente y credenciales."))
+        if len(ok200) > 10: actions.append(("2 SEMANAS", "action-2semanas",
+            f"Revisar las {len(ok200)} rutas con acceso directo (HTTP 200): eliminar innecesarias y proteger con autenticación las que correspondan."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Configurar el servidor web para devolver errores genéricos (404) sin revelar información sobre la estructura interna."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Verificar en el pipeline de despliegue que archivos sensibles (.env, .git) no queden expuestos en producción."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir la enumeración de directorios en 30 días."))
+
+    # ── SQLMap ─────────────────────────────────────────────────────────────────
+    elif "sqlmap" in p:
+        report_ctx = "Análisis de Inyección SQL (SQLMap)"
+        sqli_params, sqli_dbs, sqli_tables = [], [], []
+        for line in lines:
+            vm = re.search(r"parameter '?([^']+)'? (?:is vulnerable|appears to be injectable)", line, re.I)
+            if vm and vm.group(1) not in sqli_params: sqli_params.append(vm.group(1))
+            dm = re.search(r"Database:\s+(\S+)", line, re.I)
+            if dm and dm.group(1) not in sqli_dbs: sqli_dbs.append(dm.group(1))
+            tm = re.search(r"Table:\s+(\S+)", line, re.I)
+            if tm and tm.group(1) not in sqli_tables: sqli_tables.append(tm.group(1))
+        cards = [
+            {"num": len(sqli_params), "label": "Parámetros Vuln.",    "css": "card-critico"},
+            {"num": len(sqli_dbs),    "label": "Bases de Datos",      "css": "card-alto"},
+            {"num": len(sqli_tables), "label": "Tablas Expuestas",    "css": "card-medio"},
+            {"num": len(hosts) or 1,  "label": "Objetivos Analizados","css": "card-hosts"},
+        ]
+        chart_data = [
+            ("PARAMS VULN", "label-critico", "bar-critico", len(sqli_params)),
+            ("BASES DATOS", "label-alto",    "bar-alto",    len(sqli_dbs)),
+            ("TABLAS",      "label-medio",   "bar-medio",   len(sqli_tables)),
+            ("OBJETIVOS",   "label-bajo",    "bar-bajo",    len(hosts) or 1),
+        ]
+        risk_class = "badge-risk-critico" if sqli_params else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"    if sqli_params else "RIESGO: BAJO"
+        mid_title = "Parámetros Vulnerables a Inyección SQL"
+        mid_html = (
+            "".join(f'<div class="host-card risk-high"><div class="host-ip">{e(pp)}</div>'
+                    f'<div class="host-score">Parámetro vulnerable a SQL Injection</div>'
+                    f'<div class="host-services"><span class="service-tag danger">SQLi confirmado</span></div></div>'
+                    for pp in sqli_params[:12]) +
+            "".join(f'<div class="host-card risk-medium"><div class="host-ip">{e(db)}</div>'
+                    f'<div class="host-score">Base de datos expuesta</div>'
+                    f'<div class="host-services"><span class="service-tag warn">Base de datos</span></div></div>'
+                    for db in sqli_dbs[:6])
+        ) or '<div class="ok-box">✓ No se detectaron parámetros vulnerables a inyección SQL.</div>'
+        actions = []
+        if sqli_params:
+            actions.append(("URGENTE", "action-urgente",
+                f"Corregir INMEDIATAMENTE los {len(sqli_params)} parámetro(s) vulnerables a SQLi. Un atacante puede extraer, modificar o eliminar toda la base de datos."))
+            actions.append(("URGENTE", "action-urgente",
+                "Reemplazar consultas SQL dinámicas con Prepared Statements. Es la única mitigación definitiva contra SQL Injection."))
+        if sqli_dbs: actions.append(("URGENTE", "action-urgente",
+            f"Verificar que ningún dato de las {len(sqli_dbs)} base(s) expuesta(s) fue exfiltrado. Revisar logs de acceso."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Implementar un WAF para filtrar intentos de SQLi antes de que lleguen a la aplicación."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Auditar el código completo de la aplicación buscando todas las consultas SQL dinámicas."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir el análisis SQLMap en 30 días para confirmar la remediación."))
+
+    # ── SMB (vulnerabilidades, enum4linux, smbclient) ──────────────────────────
+    elif any(k in p for k in ["smb", "enum4linux", "smbclient"]):
+        report_ctx = "Seguridad de Compartición de Archivos Windows (SMB)"
+        smb_vulns, smb_shares = [], []
+        for line in lines:
+            if "vulnerable" in line.lower():
+                vm = re.search(r'(smb-vuln-\S+|ms\d{2}-\d{3})', line, re.I)
+                if vm and vm.group(1).upper() not in smb_vulns: smb_vulns.append(vm.group(1).upper())
+            sm = re.search(r'Sharename\s+Type', line); sm2 = re.search(r'^\s+(\w+)\s+Disk\s', line)
+            if sm2 and not sm and sm2.group(1) not in smb_shares: smb_shares.append(sm2.group(1))
+        has_eternal = any("MS17" in v or "ETERNAL" in v for v in smb_vulns)
+        has_ms08    = any("MS08" in v for v in smb_vulns)
+        cards = [
+            {"num": len(hosts),      "label": "Hosts Analizados",    "css": "card-hosts"},
+            {"num": len(smb_vulns),  "label": "Vulnerabilidades SMB", "css": "card-critico"},
+            {"num": len(smb_shares), "label": "Recursos Compartidos", "css": "card-alto"},
+            {"num": sev["MEDIUM"],   "label": "Hallazgos Medios",     "css": "card-medio"},
+        ]
+        chart_data = [
+            ("VULN CRÍTICAS", "label-critico", "bar-critico", len(smb_vulns)),
+            ("COMPARTIDOS",   "label-alto",    "bar-alto",    len(smb_shares)),
+            ("HOSTS",         "label-medio",   "bar-medio",   len(hosts)),
+            ("MEDIOS",        "label-bajo",    "bar-bajo",    sev["MEDIUM"]),
+        ]
+        risk_class = "badge-risk-critico" if smb_vulns else "badge-risk-moderado" if smb_shares else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"    if smb_vulns else "RIESGO: MODERADO"    if smb_shares else "RIESGO: BAJO"
+        mid_title = "Vulnerabilidades y Recursos SMB"
+        mid_html = (
+            "".join(
+                '<div class="host-card risk-high"><div class="host-ip">' + e(v) + '</div>'
+                '<div class="host-score">Vulnerabilidad SMB confirmada</div>'
+                '<div class="host-services">'
+                + ('<span class="service-tag danger">EternalBlue / WannaCry</span>' if "MS17" in v or "ETERNAL" in v else "")
+                + ('<span class="service-tag danger">MS08-067 / Conficker</span>' if "MS08" in v else "")
+                + '<span class="service-tag danger">CRÍTICO</span></div></div>'
+                for v in smb_vulns[:6]) +
+            "".join(f'<div class="host-card risk-medium"><div class="host-ip">{e(s)}</div>'
+                    f'<div class="host-score">Recurso compartido SMB</div>'
+                    f'<div class="host-services"><span class="service-tag warn">Compartido</span></div></div>'
+                    for s in smb_shares[:6])
+        ) or '<div class="ok-box">No se detectaron vulnerabilidades SMB conocidas.</div>'
+        actions = []
+        if has_eternal: actions.append(("URGENTE", "action-urgente",
+            "Parchear INMEDIATAMENTE MS17-010 (EternalBlue). Es la vulnerabilidad de WannaCry/NotPetya. Sin parche cualquier sistema en la red puede ser comprometido."))
+        if has_ms08: actions.append(("URGENTE", "action-urgente",
+            "Parchear MS08-067. Permite ejecución remota de código sin autenticación. Los sistemas afectados deben ser desconectados hasta su remediación."))
+        if smb_vulns and not has_eternal and not has_ms08: actions.append(("URGENTE", "action-urgente",
+            f"Aplicar parches para las {len(smb_vulns)} vulnerabilidad(es) SMB y desactivar SMBv1 inmediatamente."))
+        if smb_shares: actions.append(("2 SEMANAS", "action-2semanas",
+            f"Revisar los {len(smb_shares)} recurso(s) compartido(s): eliminar accesos anónimos y aplicar mínimo privilegio."))
+        actions.append(("2 SEMANAS", "action-2semanas",
+            "Deshabilitar SMBv1 en toda la organización. Usar solo SMBv2/v3 con firmas digitales habilitadas."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir el escaneo SMB en 30 días para confirmar remediación."))
+
+    # ── SSL/TLS ────────────────────────────────────────────────────────────────
+    elif any(k in p for k in ["ssl", "tls", "sslscan"]):
+        report_ctx = "Análisis de Seguridad SSL/TLS"
+        weak_ciphers, weak_protos, expired = [], [], []
+        for line in lines:
+            wc = re.search(r'\b(RC4|DES|NULL|EXPORT|MD5|ADH|Heartbleed|POODLE)\b', line, re.I)
+            if wc and wc.group(0) not in weak_ciphers: weak_ciphers.append(wc.group(0))
+            for proto in ["SSLv2", "SSLv3", "TLSv1.0", "TLSv1 "]:
+                if proto.lower() in line.lower() and proto not in weak_protos: weak_protos.append(proto.strip())
+            if re.search(r'expir|vencid', line, re.I): expired.append(line.strip()[:80])
+        cards = [
+            {"num": len(hosts) or 1,   "label": "Hosts Analizados",    "css": "card-hosts"},
+            {"num": len(weak_ciphers), "label": "Cifrados Débiles",    "css": "card-critico"},
+            {"num": len(expired),      "label": "Certs. Vencidos",     "css": "card-alto"},
+            {"num": len(weak_protos),  "label": "Protocolos Obsoletos","css": "card-medio"},
+        ]
+        chart_data = [
+            ("CIFRADOS DÉBILES", "label-critico", "bar-critico", len(weak_ciphers)),
+            ("CERTS VENCIDOS",   "label-alto",    "bar-alto",    len(expired)),
+            ("PROT. OBSOLETOS",  "label-medio",   "bar-medio",   len(weak_protos)),
+            ("HOSTS",            "label-bajo",    "bar-bajo",    len(hosts) or 1),
+        ]
+        risk_class = "badge-risk-critico" if len(weak_ciphers) > 3 or expired else \
+                     "badge-risk-alto"     if weak_ciphers or weak_protos else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO" if len(weak_ciphers) > 3 or expired else \
+                     "RIESGO: ALTO"    if weak_ciphers or weak_protos else "RIESGO: BAJO"
+        mid_title = "Problemas de Configuración SSL/TLS"
+        mid_html = (
+            "".join(f'<div class="host-card risk-high"><div class="host-ip">{e(c)}</div>'
+                    f'<div class="host-score">Cifrado débil o inseguro</div>'
+                    f'<div class="host-services"><span class="service-tag danger">Vulnerable</span></div></div>'
+                    for c in weak_ciphers[:8]) +
+            "".join(f'<div class="host-card risk-medium"><div class="host-ip">{e(pp)}</div>'
+                    f'<div class="host-score">Protocolo obsoleto habilitado</div>'
+                    f'<div class="host-services"><span class="service-tag warn">Inseguro</span></div></div>'
+                    for pp in weak_protos[:6])
+        ) or '<div class="ok-box">✓ No se detectaron problemas críticos de SSL/TLS.</div>'
+        actions = []
+        if weak_ciphers: actions.append(("URGENTE", "action-urgente",
+            f"Deshabilitar los {len(weak_ciphers)} cifrado(s) débiles: {', '.join(weak_ciphers[:5])}. Usar solo TLS 1.2/1.3 con suites modernas."))
+        if expired: actions.append(("URGENTE", "action-urgente",
+            f"Renovar los {len(expired)} certificado(s) vencidos. Implementar renovación automática (Let's Encrypt)."))
+        if weak_protos: actions.append(("2 SEMANAS", "action-2semanas",
+            f"Deshabilitar protocolos obsoletos: {', '.join(weak_protos[:5])}. Permiten ataques de degradación (POODLE, BEAST)."))
+        actions.append(("30 DÍAS", "action-30dias",
+            "Aplicar la configuración recomendada por Mozilla SSL Configuration Generator para obtener configuración moderna."))
+        actions.append(("30 DÍAS", "action-30dias", "Repetir el análisis SSL/TLS en 30 días para verificar la configuración."))
+
+    # ── SNMP ───────────────────────────────────────────────────────────────────
+    elif "snmp" in p:
+        report_ctx = "Auditoría de Protocolo SNMP"
+        snmp_desc, snmp_oids = [], []
+        for line in lines:
+            if "sysDescr" in line:     snmp_desc.append(line.split("=")[-1].strip()[:80])
+            elif "=" in line and len(line.strip()) > 10 and "No Such" not in line:
+                snmp_oids.append(line.strip()[:80])
+        has_public = any("public" in ln.lower() for ln in lines)
+        cards = [
+            {"num": len(snmp_desc) or 1, "label": "Dispositivos SNMP", "css": "card-hosts"},
+            {"num": len(snmp_oids),      "label": "OIDs Expuestos",    "css": "card-critico"},
+            {"num": "public" if has_public else "—", "label": "Community String", "css": "card-alto"},
+            {"num": sev["HIGH"],         "label": "Datos Sensibles",   "css": "card-medio"},
+        ]
+        chart_data = [
+            ("OIDs",     "label-critico", "bar-critico", len(snmp_oids)),
+            ("SISTEMAS", "label-alto",    "bar-alto",    len(snmp_desc)),
+            ("ALTOS",    "label-medio",   "bar-medio",   sev["HIGH"]),
+            ("MEDIOS",   "label-bajo",    "bar-bajo",    sev["MEDIUM"]),
+        ]
+        risk_class = "badge-risk-alto" if snmp_oids else "badge-risk-bajo"
+        risk_label = "RIESGO: ALTO"    if snmp_oids else "RIESGO: BAJO"
+        mid_title = "Información Expuesta vía SNMP"
+        mid_html = (
+            "".join(f'<div class="host-card risk-medium span2"><div class="host-ip">Información del sistema</div>'
+                    f'<div class="host-services"><span class="service-tag warn">{e(d[:100])}</span></div></div>'
+                    for d in snmp_desc[:3]) +
+            "".join(f'<div class="host-card risk-low"><div class="host-score" style="font-size:11px;word-break:break-all">{e(o[:100])}</div></div>'
+                    for o in snmp_oids[:12])
+        ) or '<div class="ok-box">No se obtuvo información vía SNMP.</div>'
+        actions = [
+            ("URGENTE", "action-urgente",
+             "Cambiar las community strings de SNMP de los valores por defecto ('public', 'private'). Los valores predeterminados permiten a cualquier atacante leer la configuración del dispositivo."),
+            ("URGENTE", "action-urgente",
+             "Restringir el acceso SNMP por firewall/ACL: solo las IPs de sistemas de monitoreo autorizados deben poder consultar SNMP."),
+            ("2 SEMANAS", "action-2semanas",
+             "Migrar a SNMPv3 con autenticación y cifrado. SNMPv1/v2c transmiten las community strings en texto claro."),
+            ("30 DÍAS", "action-30dias",
+             "Desactivar SNMP en todos los dispositivos que no lo requieran estrictamente para monitoreo."),
+            ("30 DÍAS", "action-30dias", "Repetir el escaneo SNMP en 30 días para confirmar el acceso ha sido restringido."),
+        ]
+
+    # ── Default: descubrimiento, puertos, NSE vuln, general ───────────────────
     else:
-        risk_class, risk_label = "badge-risk-bajo",     "RIESGO: BAJO"
+        report_ctx = "Análisis de Superficie de Ataque"
+        _PS = {23:3, 21:3, 5900:3, 3389:3, 3306:3, 1433:3, 25:2, 110:2, 143:2, 514:2, 111:2, 80:1, 22:1, 443:1}
+        _SL = {21:"FTP (sin cifrado)", 22:"Acceso SSH", 23:"Telnet (sin cifrado)", 25:"Correo SMTP",
+               80:"Web HTTP", 110:"Correo POP3", 111:"RPC", 143:"Correo IMAP", 443:"Web HTTPS",
+               445:"Compartición SMB", 514:"Acceso Shell", 1433:"MSSQL", 3306:"MySQL",
+               3389:"Escritorio Remoto (RDP)", 5432:"PostgreSQL", 5900:"VNC",
+               8080:"Web HTTP alt.", 8443:"Web HTTPS alt."}
+        _DG = {23,21,3389,5900,1433,3306,5432}; _WN = {25,110,143,514,111,445}
+        for h in hosts: h["_score"] = sum(_PS.get(_pnum(ps), 0) for ps in h.get("ports",[]))
+        top6 = sorted(hosts, key=lambda h: -h.get("_score",0))[:6]
+        cards = [
+            {"num": len(hosts),    "label": "Hosts Activos", "css": "card-hosts"},
+            {"num": sev["CRITICAL"],"label": "Críticos",     "css": "card-critico"},
+            {"num": sev["HIGH"],    "label": "Altos",        "css": "card-alto"},
+            {"num": sev["MEDIUM"],  "label": "Medios",       "css": "card-medio"},
+        ]
+        chart_data = [
+            ("CRÍTICO", "label-critico","bar-critico", sev["CRITICAL"]),
+            ("ALTO",    "label-alto",   "bar-alto",    sev["HIGH"]),
+            ("MEDIO",   "label-medio",  "bar-medio",   sev["MEDIUM"]),
+            ("BAJO",    "label-bajo",   "bar-bajo",    sev["LOW"]),
+        ]
+        risk_class = "badge-risk-critico"  if sev["CRITICAL"] else \
+                     "badge-risk-alto"     if sev["HIGH"]     else \
+                     "badge-risk-moderado" if sev["MEDIUM"]>5 else "badge-risk-bajo"
+        risk_label = "RIESGO: CRÍTICO"  if sev["CRITICAL"] else \
+                     "RIESGO: ALTO"     if sev["HIGH"]     else \
+                     "RIESGO: MODERADO" if sev["MEDIUM"]>5 else "RIESGO: BAJO"
+        mid_title = "Hosts Prioritarios"
+        def _stag(ps):
+            pp=_pnum(ps); l=_SL.get(pp,ps)
+            c=" danger" if pp in _DG else (" warn" if pp in _WN else "")
+            return f'<span class="service-tag{c}">{e(l)}</span>'
+        def _rc(sc): return "risk-high" if sc>=6 else "risk-medium" if sc>=3 else "risk-low"
+        mid_html = "".join(
+            f'<div class="host-card {_rc(h.get("_score",0))}">'
+            f'<div class="host-ip">{e(h["ip"])}</div>'
+            f'<div class="host-score">Puntuación de riesgo: {h.get("_score",0)}</div>'
+            f'<div class="host-services">{"".join(_stag(ps) for ps in h.get("ports",[])[:8])}</div></div>'
+            for h in top6
+        ) or '<div class="ok-box">No se detectaron hosts con servicios activos.</div>'
+        actions = []
+        if all_ports_set & {21,23}: actions.append(("URGENTE","action-urgente",
+            "Deshabilitar Telnet y FTP — reemplazar con SSH y SFTP."))
+        if 3389 in all_ports_set: actions.append(("URGENTE","action-urgente",
+            "Proteger RDP con doble factor y restringir su acceso."))
+        if all_ports_set & {3306,1433,5432}: actions.append(("URGENTE","action-urgente",
+            "Restringir bases de datos por cortafuegos de red interno."))
+        if 5900 in all_ports_set: actions.append(("2 SEMANAS","action-2semanas",
+            "Auditar VNC — verificar contraseña fuerte y acceso restringido."))
+        if all_ports_set & {445,139}: actions.append(("2 SEMANAS","action-2semanas",
+            "Revisar compartición SMB — vector frecuente de ransomware."))
+        actions.append(("30 DÍAS","action-30dias",
+            "Repetir el escaneo en 30 días para verificar remediación de hallazgos."))
 
-    # ── Bar chart widths (% of max) ────────────────────────────────────────────
-    max_c = max(counts.values(), default=1) or 1
-    pct   = {k: max(round(v / max_c * 100), 2) if v > 0 else 0 for k, v in counts.items()}
+    # ═══════════════════════════════════════════════════════════════════════════
+    # COMMON HTML RENDERING
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    max_c = max((cd[3] for cd in chart_data), default=1) or 1
+    def bar_row(label, lc, bc, cnt):
+        w = max(round(cnt / max_c * 100), 2) if cnt > 0 else 0
+        return (f'<div class="chart-row">'
+                f'<span class="chart-label {lc}">{label}</span>'
+                f'<div class="chart-bar-bg"><div class="chart-bar {bc}" style="width:{w}%;"></div></div>'
+                f'<span class="chart-count {lc}">{cnt}</span></div>')
+
+    chart_html  = "".join(bar_row(*cd) for cd in chart_data)
+    cards_html  = "".join(f'<div class="card {c["css"]}"><div class="card-num">{e(c["num"])}</div>'
+                          f'<div class="card-label">{e(c["label"])}</div></div>' for c in cards)
+    action_html = "".join(f'<li class="action-item {css}"><span class="action-tag">{e(tag)}</span>'
+                          f'<span class="action-text">{e(text)}</span></li>'
+                          for tag, css, text in actions)
+
+    try:
+        from datetime import datetime as _dt
+        _fmt = "%Y-%m-%d %H:%M:%S"
+        dur_str = str(_dt.strptime(end_time, _fmt) - _dt.strptime(start_time, _fmt))
+    except Exception:
+        dur_str = "—"
 
     # ── Host risk scoring ──────────────────────────────────────────────────────
     _PORT_SCORE = {
@@ -663,176 +1360,13 @@ def generate_executive_html_report(scan: dict) -> str:
         actions.append(("2 SEMANAS", "action-2semanas",
             "Revisar la configuración de compartición de archivos en red (Windows/SMB): este protocolo es el "
             "vector de entrada más común en ataques de ransomware. Deshabilitar en equipos que no lo necesiten."))
-    if any(s in all_svcs for s in ["rtsp", "jetdirect", "sccp", "sip"]):
-        actions.append(("30 DÍAS", "action-30dias",
-            "Segmentar la red en zonas separadas (VLANs) según el tipo de dispositivo: servidores, "
-            "equipos de usuario, cámaras, impresoras y teléfonos IP. Esto limita el impacto de cualquier incidente futuro."))
-    actions.append(("30 DÍAS", "action-30dias",
-        "Repetir el escaneo de seguridad en 30 días para verificar que las acciones correctivas "
-        "han sido implementadas y medir la reducción del riesgo."))
-
-    # ── Helpers ────────────────────────────────────────────────────────────────
-    def e(s): return _html.escape(str(s))
-
-    def risk_cls(score):
-        if score >= 6: return "risk-high"
-        if score >= 3: return "risk-medium"
-        return "risk-low"
-
-    def svc_tag(ps):
-        p   = _pnum(ps)
-        lbl = _SVC_LABEL.get(p, ps)
-        cls = " danger" if p in _DANGER else (" warn" if p in _WARN else "")
-        return f'<span class="service-tag{cls}">{e(lbl)}</span>'
-
-    host_cards = "".join(f"""
-      <div class="host-card {risk_cls(h['_score'])}">
-        <div class="host-ip">{e(h['ip'])}</div>
-        <div class="host-score">Puntuación de riesgo: {h['_score']}</div>
-        <div class="host-services">{''.join(svc_tag(ps) for ps in h.get('ports',[])[:8])}</div>
-      </div>""" for h in top6) or \
-      '<div style="color:#8A94A6;font-size:13px;padding:12px 0;">No se detectaron hosts prioritarios relevantes.</div>'
-
-    def _sort_ip(h):
-        try: return [int(p) for p in h['ip'].split('.')]
-        except: return [0,0,0,0]
-
-    inventory_rows = "".join(f"""
-      <tr>
-        <td style="font-family:monospace;font-weight:600;">{e(h['ip'])}</td>
-        <td>{e(h.get('hostname') or '—')}</td>
-        <td style="font-family:monospace;color:#5C6B8A;">{e(h.get('mac') or '—')}</td>
-        <td>{e(h.get('vendor') or '—')}</td>
-        <td style="color:#185FA5;">{e(", ".join(h.get('ports',[])) or '—')}</td>
-      </tr>""" for h in sorted(hosts, key=_sort_ip))
-
-
-    action_items = "".join(f"""
-      <li class="action-item {css}">
-        <span class="action-tag">{e(tag)}</span>
-        <span class="action-text">{e(text)}</span>
-      </li>""" for tag, css, text in actions)
-
-    def bar_row(label, lc, bc, cnt, pw):
-        w = pw if cnt > 0 else 0
-        return (f'<div class="chart-row">'
-                f'<span class="chart-label {lc}">{label}</span>'
-                f'<div class="chart-bar-bg"><div class="chart-bar {bc}" style="width:{w}%;"></div></div>'
-                f'<span class="chart-count {lc}">{cnt}</span></div>')
-
-    chart = (
-        bar_row("CRÍTICO", "label-critico", "bar-critico", counts["CRITICAL"], pct["CRITICAL"]) +
-        bar_row("ALTO",    "label-alto",    "bar-alto",    counts["HIGH"],     pct["HIGH"])     +
-        bar_row("MEDIO",   "label-medio",   "bar-medio",   counts["MEDIUM"],   pct["MEDIUM"])   +
-        bar_row("BAJO",    "label-bajo",    "bar-bajo",    counts["LOW"],      pct["LOW"])
-    )
-
-    try:
-        from datetime import datetime as _dt
-        _fmt = "%Y-%m-%d %H:%M:%S"
-        dur_str = str(_dt.strptime(end_time, _fmt) - _dt.strptime(start_time, _fmt))
-    except Exception:
-        dur_str = "—"
-
     return f"""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Reporte Ejecutivo — {e(client)}</title>
-<style>
-*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
-     font-size:14px;line-height:1.6;background:#F4F6F9;color:#1A1A2E}}
-.page{{max-width:900px;margin:32px auto;background:#fff;border-radius:10px;
-       box-shadow:0 4px 24px rgba(0,0,0,.10);overflow:hidden}}
-.report-header{{background:linear-gradient(135deg,#0D1B2A 0%,#1B3556 100%);
-               color:#fff;padding:36px 40px 28px}}
-.header-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}}
-.header-logo{{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#7BAFD4;font-weight:600}}
-.report-title{{font-size:22px;font-weight:700;margin:6px 0 2px;letter-spacing:-.3px}}
-.report-subtitle{{font-size:13px;color:#A8C4DC}}
-.badges{{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start}}
-.badge{{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;
-        letter-spacing:.06em;text-transform:uppercase;white-space:nowrap}}
-.badge-vpn{{background:#1E4D78;color:#7EC8E3;border:1px solid #2A6099}}
-.badge-risk-critico{{background:#A32D2D;color:#fff;border:1px solid #c84040}}
-.badge-risk-alto{{background:#854F0B;color:#fff;border:1px solid #b06a10}}
-.badge-risk-moderado{{background:#7D6008;color:#fff;border:1px solid #a8820a}}
-.badge-risk-bajo{{background:#3B6D11;color:#fff;border:1px solid #5a9e1a}}
-.header-meta{{margin-top:22px;display:grid;
-             grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px 24px}}
-.meta-label{{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#7BAFD4;font-weight:600}}
-.meta-value{{font-size:13px;color:#E8F1F8;font-weight:500}}
-.report-body{{padding:32px 40px}}
-.section{{margin-bottom:36px}}
-.section-title{{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.10em;
-               color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:8px;margin-bottom:18px}}
-.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}}
-.card{{border-radius:8px;padding:18px 16px 14px;text-align:center;border-width:1px;border-style:solid}}
-.card-num{{font-size:36px;font-weight:800;line-height:1}}
-.card-label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;margin-top:5px}}
-.card-hosts{{background:#E6F1FB;border-color:#B5D4F4;color:#185FA5}}
-.card-critico{{background:#FCEBEB;border-color:#F09595;color:#A32D2D}}
-.card-alto{{background:#FAEEDA;border-color:#FAC775;color:#854F0B}}
-.card-medio{{background:#E6F1FB;border-color:#B5D4F4;color:#185FA5}}
-.chart-wrap{{padding:6px 0}}
-.chart-row{{display:flex;align-items:center;gap:10px;margin-bottom:12px}}
-.chart-label{{width:78px;font-size:12px;font-weight:600;text-align:right;flex-shrink:0}}
-.chart-bar-bg{{flex:1;background:#F0F2F6;border-radius:4px;height:26px;overflow:hidden}}
-.chart-bar{{height:100%;border-radius:4px;min-width:0}}
-.chart-count{{font-size:13px;font-weight:700;width:28px;text-align:left;flex-shrink:0}}
-.bar-critico{{background:#C94040}}.bar-alto{{background:#D4780A}}
-.bar-medio{{background:#2274C8}}.bar-bajo{{background:#4E9E1A}}
-.label-critico{{color:#A32D2D}}.label-alto{{color:#854F0B}}
-.label-medio{{color:#185FA5}}.label-bajo{{color:#3B6D11}}
-.hosts-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}}
-.host-card{{border-radius:8px;border:1px solid #E0E6EF;border-left-width:5px;
-            padding:14px 16px;background:#FAFBFD}}
-.host-card.risk-high{{border-left-color:#C94040}}
-.host-card.risk-medium{{border-left-color:#D4780A}}
-.host-card.risk-low{{border-left-color:#2274C8}}
-.host-ip{{font-size:15px;font-weight:700;color:#1A1A2E;font-family:'SF Mono','Fira Code',monospace}}
-.host-score{{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#8A94A6;margin:2px 0 8px}}
-.host-services{{display:flex;flex-wrap:wrap;gap:5px}}
-.service-tag{{font-size:11px;padding:2px 8px;border-radius:12px;font-weight:500;
-              background:#E6EDF6;color:#3B5278}}
-.service-tag.danger{{background:#FCEBEB;color:#A32D2D}}
-.service-tag.warn{{background:#FAEEDA;color:#854F0B}}
-.actions-list{{list-style:none;display:flex;flex-direction:column;gap:10px}}
-.action-item{{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;
-              border-radius:8px;border-width:1px;border-style:solid}}
-.action-tag{{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
-             padding:3px 10px;border-radius:20px;white-space:nowrap;flex-shrink:0;margin-top:1px}}
-.action-text{{font-size:13px;line-height:1.5}}
-.action-urgente{{background:#FCEBEB;border-color:#F09595}}
-.action-urgente .action-tag{{background:#A32D2D;color:#fff}}
-.action-urgente .action-text{{color:#5A1515}}
-.action-2semanas{{background:#FAEEDA;border-color:#FAC775}}
-.action-2semanas .action-tag{{background:#854F0B;color:#fff}}
-.action-2semanas .action-text{{color:#4A2B05}}
-.action-30dias{{background:#E6F1FB;border-color:#B5D4F4}}
-.action-30dias .action-tag{{background:#185FA5;color:#fff}}
-.action-30dias .action-text{{color:#0D2E4E}}
-.report-footer{{background:#F0F2F6;border-top:1px solid #DDE2EC;padding:20px 40px;
-               display:flex;justify-content:space-between;align-items:flex-start;
-               flex-wrap:wrap;gap:12px}}
-.footer-meta{{font-size:11px;color:#5C6B8A;line-height:1.8}}
-.footer-meta strong{{color:#1A1A2E}}
-.footer-confidential{{font-size:10px;color:#8A94A6;text-align:right;max-width:260px;line-height:1.5}}
-.confidential-badge{{display:inline-block;background:#1A1A2E;color:#fff;font-size:9px;font-weight:700;
-                    letter-spacing:.15em;text-transform:uppercase;padding:2px 8px;border-radius:3px;margin-bottom:4px}}
-.inventory-table{{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px;}}
-.inventory-table th{{text-align:left;background:#E8ECF2;padding:10px 12px;color:#5C6B8A;font-weight:700;text-transform:uppercase;letter-spacing:.05em;}}
-.inventory-table td{{padding:10px 12px;border-bottom:1px solid #E0E6EF;color:#1A1A2E;}}
-.inventory-table tr:nth-child(even){{background:#FAFBFD;}}
-@media print{{
-  body{{background:#fff}}
-  .page{{box-shadow:none;border-radius:0;margin:0}}
-  .report-header,.card,.host-card,.action-item,.chart-bar{{
-    -webkit-print-color-adjust:exact;print-color-adjust:exact}}
-}}
-</style>
+<style>{_EXEC_CSS}</style>
 </head>
 <body>
 <div class="page">
@@ -840,7 +1374,7 @@ body{{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
     <div class="header-top">
       <div>
         <div class="header-logo">Reporte Ejecutivo de Seguridad &mdash; Datacom Security</div>
-        <div class="report-title">Análisis de Vulnerabilidades de Red</div>
+        <div class="report-title">{e(report_ctx)}</div>
         <div class="report-subtitle">{e(client)} &mdash; Gerencia General</div>
       </div>
       <div class="badges">
@@ -859,64 +1393,25 @@ body{{font-family:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
   </header>
 
   <div class="report-body">
-
     <section class="section">
       <div class="section-title">Resumen Ejecutivo</div>
-      <div class="cards">
-        <div class="card card-hosts">
-          <div class="card-num">{len(hosts)}</div>
-          <div class="card-label">Hosts Activos</div>
-        </div>
-        <div class="card card-critico">
-          <div class="card-num">{counts["CRITICAL"]}</div>
-          <div class="card-label">Críticos</div>
-        </div>
-        <div class="card card-alto">
-          <div class="card-num">{counts["HIGH"]}</div>
-          <div class="card-label">Altos</div>
-        </div>
-        <div class="card card-medio">
-          <div class="card-num">{counts["MEDIUM"]}</div>
-          <div class="card-label">Medios</div>
-        </div>
-      </div>
+      <div class="cards">{cards_html}</div>
     </section>
 
     <section class="section">
-      <div class="section-title">Distribución de Riesgo</div>
-      <div class="chart-wrap">{chart}</div>
+      <div class="section-title">Distribución de Hallazgos</div>
+      <div class="chart-wrap">{chart_html}</div>
     </section>
 
     <section class="section">
-      <div class="section-title">Hosts Prioritarios</div>
-      <div class="hosts-grid">{host_cards}</div>
-    </section>
-
-    <section class="section">
-      <div class="section-title">Inventario de Red Descubierto</div>
-      <div style="overflow-x:auto;">
-        <table class="inventory-table">
-          <thead>
-            <tr>
-              <th>IP</th>
-              <th>Hostname</th>
-              <th>Dirección MAC</th>
-              <th>Fabricante</th>
-              <th>Puertos Abiertos</th>
-            </tr>
-          </thead>
-          <tbody>
-            {inventory_rows}
-          </tbody>
-        </table>
-      </div>
+      <div class="section-title">{e(mid_title)}</div>
+      <div class="mid-grid">{mid_html}</div>
     </section>
 
     <section class="section">
       <div class="section-title">Acciones Recomendadas para Gerencia</div>
-      <ul class="actions-list">{action_items}</ul>
+      <ul class="actions-list">{action_html}</ul>
     </section>
-
   </div>
 
   <footer class="report-footer">
