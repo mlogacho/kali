@@ -58,8 +58,14 @@ network_maps: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
 
 # ── ZAP ────────────────────────────────────────────────────────────────────────
-ZAP_URL   = "http://192.168.122.136:8090"
-zap_scans: dict[str, dict] = {}
+ZAP_URL      = "http://192.168.122.136:8090"
+zap_scans:   dict[str, dict] = {}
+
+# ── Pentest Web Completo ────────────────────────────────────────────────────────
+PENTEST_VM     = "kali-2026"
+PENTEST_OUTDIR = "/home/kali/web_assessment"
+PENTEST_SCRIPT = "/home/kali/web_pentest_complete.sh"
+pentest_jobs:  dict[str, dict] = {}
 # Probe (sonda) state — registered probes and their scan results
 registered_probes: dict[str, dict] = {}   # vpn_ip → {name, subnets, last_seen, ...}
 probe_scan_results: dict[str, dict] = {}  # vpn_ip → {hosts: [...], timestamp, status}
@@ -4304,6 +4310,380 @@ def _zap_pdf_report(s: dict, scan_id: str) -> "Response":
                      as_attachment=True, download_name=fname)
 
 
+# ── Pentest Web Completo — backend ────────────────────────────────────────────
+
+import base64 as _b64
+
+def _ga(cmd_dict: dict) -> dict:
+    """Call QEMU guest agent via virsh."""
+    r = subprocess.run(
+        ["virsh", "qemu-agent-command", PENTEST_VM, json.dumps(cmd_dict)],
+        capture_output=True, text=True
+    )
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        return {}
+
+
+def _ga_run(cmd: str, wait: float = 3) -> str:
+    """Execute command in VM via guest agent and return stdout+stderr."""
+    r = _ga({"execute": "guest-exec", "arguments": {
+        "path": "/bin/bash", "arg": ["-c", cmd], "capture-output": True
+    }})
+    pid = r.get("return", {}).get("pid")
+    if not pid:
+        return ""
+    time.sleep(wait)
+    s = _ga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+    ret = s.get("return", {})
+    out = _b64.b64decode(ret.get("out-data", "")).decode(errors="replace") if ret.get("out-data") else ""
+    err = _b64.b64decode(ret.get("err-data", "")).decode(errors="replace") if ret.get("err-data") else ""
+    return (out + err).strip()
+
+
+def _ga_read_file(path: str) -> bytes:
+    """Read a file from the VM via guest agent, return raw bytes."""
+    r = _ga({"execute": "guest-file-open", "arguments": {"path": path, "mode": "r"}})
+    fh = r.get("return")
+    if fh is None:
+        return b""
+    content = b""
+    while True:
+        rd = _ga({"execute": "guest-file-read", "arguments": {"handle": fh, "count": 65536}})
+        ret = rd.get("return", {})
+        chunk_b64 = ret.get("buf-b64", "")
+        if chunk_b64:
+            content += _b64.b64decode(chunk_b64)
+        if ret.get("eof", True) or not chunk_b64:
+            break
+    _ga({"execute": "guest-file-close", "arguments": {"handle": fh}})
+    return content
+
+
+def _pentest_write_script(target: str, engineer: str) -> bool:
+    """Write the pentest script to the Kali VM with the given target."""
+    script = f'''#!/bin/bash
+# web_pentest_complete.sh — Datacom Security
+TARGET="{target}"
+OUTPUT_DIR="{PENTEST_OUTDIR}"
+ENGINEER="{engineer}"
+mkdir -p $OUTPUT_DIR
+LOG="$OUTPUT_DIR/pentest.log"
+
+log() {{ echo "[$(date '+%H:%M:%S')] $*" | tee -a $LOG; }}
+
+log "======================================"
+log " PENTEST WEB COMPLETO: $TARGET"
+log " Ingeniero: $ENGINEER"
+log " Guardando en: $OUTPUT_DIR"
+log "======================================"
+
+# 1. Nikto
+log "[1/8] Ejecutando Nikto..."
+nikto -h $TARGET -output $OUTPUT_DIR/nikto_report.html \\
+  -Format html -timeout 10 2>/dev/null
+log "  Nikto completado"
+
+# 2. SQLMap
+log "[2/8] Testing SQL Injection..."
+sqlmap -u "$TARGET/search?q=test" --batch --level=1 --risk=1 \\
+  --forms --crawl=2 --random-agent \\
+  --output-dir=$OUTPUT_DIR/sqlmap 2>/dev/null | tee $OUTPUT_DIR/sqlmap_summary.txt
+log "  SQLMap completado"
+
+# 3. Gobuster
+log "[3/8] Enumerando directorios..."
+gobuster dir -u $TARGET \\
+  -w /usr/share/wordlists/dirb/common.txt \\
+  -t 20 -k --no-progress \\
+  -o $OUTPUT_DIR/gobuster_results.txt 2>/dev/null
+log "  Gobuster: $(wc -l < $OUTPUT_DIR/gobuster_results.txt 2>/dev/null || echo 0) resultados"
+
+# 4. Testssl
+log "[4/8] Analizando SSL/TLS..."
+testssl.sh --quiet --color 0 --severity LOW \\
+  $TARGET > $OUTPUT_DIR/ssl_report.txt 2>/dev/null
+log "  testssl completado"
+
+# 5. Headers HTTP
+log "[5/8] Analizando headers HTTP..."
+{{
+  echo "=== Headers HTTP — $TARGET ==="
+  echo "Fecha: $(date)"
+  echo "Ingeniero: $ENGINEER"
+  echo ""
+  curl -sI --connect-timeout 10 $TARGET
+  echo ""
+  echo "=== Headers de seguridad ==="
+  HDRS=$(curl -sI --connect-timeout 10 $TARGET)
+  for h in "X-Frame-Options" "Content-Security-Policy" "X-Content-Type-Options" \\
+            "Strict-Transport-Security" "Permissions-Policy" "Referrer-Policy"; do
+    echo "$HDRS" | grep -qi "$h" && echo "  [OK]     $h" || echo "  [FALTA]  $h"
+  done
+}} > $OUTPUT_DIR/headers.txt
+log "  Headers analizados"
+
+# 6. APIs públicas
+log "[6/8] Enumerando APIs WordPress..."
+{{
+  echo "=== WP REST API ==="
+  curl -s --connect-timeout 10 "$TARGET/wp-json/" | jq . 2>/dev/null
+  echo ""
+  echo "=== Usuarios expuestos ==="
+  curl -s --connect-timeout 10 "$TARGET/wp-json/wp/v2/users" | \\
+    jq "[.[] | {{id:.id, name:.name, slug:.slug}}]" 2>/dev/null
+}} > $OUTPUT_DIR/api_endpoints.json
+log "  API enumerada"
+
+# 7. Nmap
+log "[7/8] Escaneo de servicios con Nmap..."
+DOMAIN=$(echo $TARGET | sed "s|https://||;s|http://||" | cut -d/ -f1)
+nmap -sT -Pn -sV -p 80,443,8080,8443 \\
+  --script http-headers,http-title,ssl-cert \\
+  $DOMAIN -oN $OUTPUT_DIR/nmap_report.txt 2>/dev/null
+log "  Nmap completado"
+
+# 8. Reporte final Markdown
+log "[8/8] Compilando reporte final..."
+NIKTO_ISSUES=$(grep -c "OSVDB\\|CVE" $OUTPUT_DIR/nikto_report.html 2>/dev/null || echo 0)
+GOBUSTER_HITS=$(grep -c "Status: 200" $OUTPUT_DIR/gobuster_results.txt 2>/dev/null || echo 0)
+HEADERS_MISSING=$(grep -c "\\[FALTA\\]" $OUTPUT_DIR/headers.txt 2>/dev/null || echo 0)
+
+cat > $OUTPUT_DIR/REPORTE_FINAL.md << MDEOF
+# Reporte de Pentest Web — $TARGET
+**Fecha:** $(date)
+**Ingeniero:** $ENGINEER
+
+---
+
+## Resumen
+
+| Herramienta | Resultado | Archivo |
+|---|---|---|
+| Nikto | ~${{NIKTO_ISSUES}} hallazgos | nikto_report.html |
+| SQL Injection | Ver detalle | sqlmap_summary.txt |
+| Gobuster | ${{GOBUSTER_HITS}} rutas (200 OK) | gobuster_results.txt |
+| SSL/TLS | Ver detalle | ssl_report.txt |
+| Headers HTTP | ${{HEADERS_MISSING}} headers ausentes | headers.txt |
+| WordPress API | Ver usuarios expuestos | api_endpoints.json |
+| Nmap | Ver servicios | nmap_report.txt |
+
+---
+
+## Hallazgos Críticos
+
+### Headers de seguridad ausentes
+$(grep "\\[FALTA\\]" $OUTPUT_DIR/headers.txt 2>/dev/null | sed "s/^/- /")
+
+### WordPress REST API
+- Endpoint /wp-json/wp/v2/users expuesto — ver api_endpoints.json
+
+---
+*Generado por Datacom Security Web Pentest Scanner*
+MDEOF
+
+log ""
+log "======================================"
+log "[+] PENTEST COMPLETADO"
+log "[+] Resultados en: $OUTPUT_DIR"
+ls -lh $OUTPUT_DIR/ >> $LOG 2>/dev/null
+log "======================================"
+'''
+    script_b64 = _b64.b64encode(script.encode()).decode()
+    result = _ga_run(
+        f'echo "{script_b64}" | base64 -d > {PENTEST_SCRIPT} && '
+        f'chmod +x {PENTEST_SCRIPT} && echo OK',
+        wait=3
+    )
+    return "OK" in result
+
+
+def _run_pentest_bg(job_id: str):
+    """Background worker: launch script in VM and tail log."""
+    state = pentest_jobs[job_id]
+    try:
+        # Ensure output dir exists
+        _ga_run(f"mkdir -p {PENTEST_OUTDIR} && chown kali:kali {PENTEST_OUTDIR}", wait=2)
+
+        # Write the script with the target/engineer filled in
+        if not _pentest_write_script(state["target"], state["engineer"]):
+            state["error"] = "Error escribiendo script en la VM"
+            return
+
+        # Delete old log so streaming starts clean
+        _ga_run(f"rm -f {PENTEST_OUTDIR}/pentest.log {PENTEST_OUTDIR}/pentest_output.log", wait=1)
+
+        # Launch the script in background inside the VM as kali user
+        _ga_run(
+            f"nohup sudo -u kali bash {PENTEST_SCRIPT} "
+            f"> {PENTEST_OUTDIR}/pentest_output.log 2>&1 &",
+            wait=3
+        )
+
+        # Tail the log until the script finishes
+        last_line = 0
+        idle_ticks = 0
+        max_idle   = 120   # 4 min timeout with no new lines → assume done
+
+        while True:
+            raw = _ga_run(f"cat {PENTEST_OUTDIR}/pentest.log 2>/dev/null", wait=1)
+            lines = raw.splitlines() if raw else []
+
+            if len(lines) > last_line:
+                new_lines = lines[last_line:]
+                state["log_lines"].extend(new_lines)
+                last_line = len(lines)
+                idle_ticks = 0
+
+                # Detect current phase from log
+                for ln in new_lines:
+                    for ph_num, ph_kw in enumerate([
+                        "Nikto", "SQL Injection", "directorios",
+                        "SSL/TLS", "headers", "APIs", "Nmap", "reporte"
+                    ], 1):
+                        if ph_kw.lower() in ln.lower() and f"[{ph_num}/8]" in ln:
+                            state["phase_num"] = ph_num
+                            state["phase"]     = ln.strip()
+
+                if any("PENTEST COMPLETADO" in l for l in new_lines):
+                    break
+            else:
+                idle_ticks += 1
+
+            # Check if script process is still alive
+            if idle_ticks > 0 and idle_ticks % 10 == 0:
+                procs = _ga_run(
+                    "pgrep -la 'nikto|sqlmap|gobuster|testssl|nmap|web_pentest' | head -3",
+                    wait=1
+                )
+                if not procs.strip():
+                    idle_ticks += 20  # accelerate exit if no process
+
+            if idle_ticks >= max_idle:
+                state["log_lines"].append("[!] Timeout esperando al script — puede haber finalizado")
+                break
+
+            time.sleep(2)
+
+        # Collect generated files
+        ls_out = _ga_run(f"ls {PENTEST_OUTDIR}/ 2>/dev/null", wait=2)
+        state["files"] = [
+            f for f in ls_out.splitlines()
+            if f and not f.startswith("sqlmap") and f != "pentest_output.log"
+        ]
+        state["phase_num"] = 8
+        state["phase"]     = "[8/8] Completado"
+
+    except Exception as exc:
+        state["error"] = str(exc)
+        state["log_lines"].append(f"[ERROR] {exc}")
+    finally:
+        state["done"] = True
+        state["end"]  = now_str()
+
+
+@app.route("/api/pentest/start", methods=["POST"])
+def api_pentest_start():
+    data     = request.json or {}
+    target   = data.get("target",   "https://datacom.ec").strip()
+    engineer = data.get("engineer", "Sin especificar").strip() or "Sin especificar"
+
+    if not re.match(r'^https?://', target):
+        return jsonify({"error": "URL debe empezar con http:// o https://"}), 400
+
+    job_id = str(uuid.uuid4())[:8]
+    pentest_jobs[job_id] = {
+        "id": job_id, "target": target, "engineer": engineer,
+        "start": now_str(), "end": None,
+        "phase": "Iniciando...", "phase_num": 0,
+        "log_lines": [], "files": [],
+        "done": False, "error": None,
+    }
+    threading.Thread(target=_run_pentest_bg, args=(job_id,), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/pentest/stream/<job_id>")
+def api_pentest_stream(job_id):
+    def generate():
+        sent = 0
+        while True:
+            s = pentest_jobs.get(job_id)
+            if not s:
+                yield f"data: {json.dumps({'error': 'job no encontrado'})}\n\n"
+                break
+            lines = s["log_lines"]
+            while sent < len(lines):
+                yield f"data: {json.dumps({'line': lines[sent], 'phase_num': s['phase_num'], 'phase': s['phase']})}\n\n"
+                sent += 1
+            if s["done"] and sent >= len(lines):
+                yield f"data: {json.dumps({'done': True, 'files': s['files'], 'error': s.get('error')})}\n\n"
+                break
+            time.sleep(0.5)
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/pentest/status/<job_id>")
+def api_pentest_status(job_id):
+    s = pentest_jobs.get(job_id)
+    if not s:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({
+        "phase": s["phase"], "phase_num": s["phase_num"],
+        "done": s["done"], "error": s["error"],
+        "files": s["files"], "log_lines": s["log_lines"][-20:],
+    })
+
+
+@app.route("/api/pentest/jobs")
+def api_pentest_jobs():
+    return jsonify([
+        {"id": j["id"], "target": j["target"], "engineer": j["engineer"],
+         "start": j["start"], "end": j.get("end"), "done": j["done"],
+         "phase_num": j["phase_num"]}
+        for j in reversed(list(pentest_jobs.values()))
+    ])
+
+
+@app.route("/api/pentest/download/<job_id>/<path:filename>")
+def api_pentest_download(job_id, filename):
+    s = pentest_jobs.get(job_id)
+    if not s:
+        return "Job not found", 404
+    # Security: only allow simple filenames from the output dir
+    safe = re.sub(r'[^a-zA-Z0-9._\-]', '', filename)
+    if safe != filename or '..' in filename:
+        return "Invalid filename", 400
+    filepath = f"{PENTEST_OUTDIR}/{safe}"
+    data = _ga_read_file(filepath)
+    if not data:
+        return "File not found or empty", 404
+    mime = ("text/html" if safe.endswith(".html") else
+            "application/json" if safe.endswith(".json") else
+            "text/plain")
+    return Response(data, mimetype=mime,
+                    headers={"Content-Disposition": f"attachment; filename={safe}"})
+
+
+@app.route("/api/pentest/view/<job_id>/<path:filename>")
+def api_pentest_view(job_id, filename):
+    """Serve file inline (for HTML reports)."""
+    s = pentest_jobs.get(job_id)
+    if not s:
+        return "Job not found", 404
+    safe = re.sub(r'[^a-zA-Z0-9._\-]', '', filename)
+    if safe != filename:
+        return "Invalid filename", 400
+    data = _ga_read_file(f"{PENTEST_OUTDIR}/{safe}")
+    if not data:
+        return "File not found", 404
+    mime = "text/html" if safe.endswith(".html") else "text/plain"
+    return Response(data, mimetype=mime)
+
+
 # ── Static assets (JS libs served locally — no CDN dependency) ─────────────────
 
 @app.route("/static/<path:filename>")
@@ -4665,6 +5045,7 @@ select option{background:var(--bg3)}
       <div class="tab" id="tab-btn-fuzz"     onclick="showTab('fuzz',this)">&#x1F4A5; Pentesting Externo</div>
       <div class="tab" id="tab-btn-chisel"   onclick="showTab('chisel',this);loadChiselStatus()">&#x1F50C; T&uacute;nel Chisel</div>
       <div class="tab" id="tab-btn-zap"      onclick="showTab('zap',this);zapCheckStatus()">&#x1F50D; ZAP Scanner</div>
+      <div class="tab" id="tab-btn-pentest"  onclick="showTab('pentest',this);pentestLoadJobs()">&#x1F4BB; Pentest Web</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -5423,6 +5804,104 @@ select option{background:var(--bg3)}
                 style="background:none;border:none;color:var(--dim);font-size:1.2rem;cursor:pointer">✕</button>
       </div>
       <div id="zmBody" style="font-size:.82rem;line-height:1.7;color:var(--fg)"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ══ PENTEST WEB COMPLETO TAB ════════════════════════════════════════════ -->
+<div class="tab-content" id="tab-pentest" style="flex-direction:column;overflow:auto;padding:20px;gap:16px">
+
+  <!-- Header -->
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <div>
+      <h2 style="margin:0;font-size:1rem;color:var(--blue)">&#x1F4BB; Pentest Web Completo — Sonda Kali Linux</h2>
+      <p style="margin:4px 0 0;font-size:.78rem;color:var(--dim)">
+        Nikto &bull; SQLMap &bull; Gobuster &bull; testssl &bull; Headers &bull; WP API &bull; Nmap
+        &bull; Ejecutado en kali-2026 (192.168.122.136)
+      </p>
+    </div>
+  </div>
+
+  <!-- Config form -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px;
+              display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end">
+    <div class="form-group" style="flex:2;min-width:240px">
+      <label>URL objetivo</label>
+      <input id="ptTarget" type="url" value="https://datacom.ec" autocomplete="off">
+    </div>
+    <div class="form-group" style="flex:1;min-width:200px">
+      <label>&#x1F464; Ingeniero responsable</label>
+      <input id="ptEngineer" type="text" placeholder="Nombre completo"
+             oninput="localStorage.setItem('ptEngineer',this.value)">
+    </div>
+    <button class="btn btn-blue" id="ptBtnStart" onclick="ptStart()" style="padding:8px 20px">
+      &#x25B6; Lanzar Pentest
+    </button>
+    <button class="btn btn-red" id="ptBtnStop" onclick="ptStop()" disabled style="padding:8px 16px">
+      &#x25A0; Detener
+    </button>
+  </div>
+
+  <!-- Phase progress -->
+  <div id="ptProgress" style="display:none;background:var(--bg2);border:1px solid var(--bg4);
+       border-radius:10px;padding:16px">
+    <div id="ptPhaseLabel" style="font-size:.85rem;font-weight:600;color:var(--fg);margin-bottom:12px">
+      Iniciando...
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(8,1fr);gap:6px" id="ptPhaseGrid">
+    </div>
+    <div style="margin-top:12px;height:4px;background:var(--bg4);border-radius:2px">
+      <div id="ptProgressBar" style="height:100%;background:var(--blue);border-radius:2px;
+           width:0%;transition:width .6s ease"></div>
+    </div>
+  </div>
+
+  <!-- Live terminal -->
+  <div id="ptTermWrap" style="display:none;flex-direction:column;flex:1;min-height:220px;
+       background:#090d13;border:1px solid var(--bg4);border-radius:8px;overflow:hidden">
+    <div style="padding:6px 12px;background:var(--bg3);border-bottom:1px solid var(--bg4);
+                font-size:.72rem;color:var(--dim);display:flex;justify-content:space-between">
+      <span>&#x1F4F9; Terminal — kali@192.168.122.136</span>
+      <button onclick="document.getElementById('ptTerm').innerHTML=''"
+              style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:.75rem">
+        Limpiar
+      </button>
+    </div>
+    <div id="ptTerm" style="flex:1;overflow-y:auto;padding:10px 14px;font-family:'Courier New',monospace;
+         font-size:.75rem;line-height:1.6;color:#c9d1d9;max-height:300px"></div>
+  </div>
+
+  <!-- Results -->
+  <div id="ptResults" style="display:none;flex-direction:column;gap:14px">
+    <div style="font-size:.78rem;font-weight:700;color:var(--dim);text-transform:uppercase;
+                letter-spacing:.07em;border-bottom:1px solid var(--bg4);padding-bottom:8px">
+      &#x1F4C2; Archivos generados — descargar reportes
+    </div>
+
+    <!-- File cards grid -->
+    <div id="ptFileGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
+    </div>
+
+    <!-- Job history -->
+    <div style="font-size:.78rem;font-weight:700;color:var(--dim);text-transform:uppercase;
+                letter-spacing:.07em;border-bottom:1px solid var(--bg4);padding-bottom:8px;margin-top:8px">
+      &#x1F4CB; Historial de escaneos
+    </div>
+    <div style="overflow-x:auto;border:1px solid var(--bg4);border-radius:8px">
+      <table style="width:100%;border-collapse:collapse;font-size:.8rem">
+        <thead>
+          <tr style="background:var(--bg3)">
+            <th style="padding:7px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">ID</th>
+            <th style="padding:7px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Ingeniero</th>
+            <th style="padding:7px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Objetivo</th>
+            <th style="padding:7px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Inicio</th>
+            <th style="padding:7px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Estado</th>
+            <th style="padding:7px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Acción</th>
+          </tr>
+        </thead>
+        <tbody id="ptJobsBody"></tbody>
+      </table>
     </div>
   </div>
 
@@ -7478,16 +7957,177 @@ function zapDownloadReport(fmt) {
   if (zapCurrentScan) window.open('/api/zap/report/' + zapCurrentScan + '?fmt=' + (fmt||'html'));
 }
 
-// Restore engineer name from localStorage
+// Restore engineer names from localStorage
 window.addEventListener('load', () => {
-  const saved = localStorage.getItem('zapEngineer');
-  const engEl = document.getElementById('zapEngineer');
-  if (saved && engEl) engEl.value = saved;
-  // Also sync with the global engineer bar
   const globalEng = document.getElementById('engineerInput');
-  if (globalEng && globalEng.value && engEl && !engEl.value)
-    engEl.value = globalEng.value;
+  // ZAP
+  const zapEl = document.getElementById('zapEngineer');
+  const zapSaved = localStorage.getItem('zapEngineer');
+  if (zapSaved && zapEl) zapEl.value = zapSaved;
+  if (globalEng && globalEng.value && zapEl && !zapEl.value) zapEl.value = globalEng.value;
+  // Pentest
+  const ptEl = document.getElementById('ptEngineer');
+  const ptSaved = localStorage.getItem('ptEngineer');
+  if (ptSaved && ptEl) ptEl.value = ptSaved;
+  if (globalEng && globalEng.value && ptEl && !ptEl.value) ptEl.value = globalEng.value;
 });
+
+// ── Pentest Web Completo ──────────────────────────────────────────────────────
+let ptCurrentJob = null;
+let ptSSE        = null;
+
+const PT_PHASES = ['Nikto','SQLMap','Gobuster','testssl','Headers','WP API','Nmap','Reporte'];
+const PT_FILE_META = {
+  'nikto_report.html':    {icon:'🕵️',label:'Nikto',       desc:'Vulnerabilidades web',        color:'#A32D2D',bg:'#FCEBEB'},
+  'sqlmap_summary.txt':   {icon:'💉',label:'SQLMap',       desc:'SQL Injection test',           color:'#854F0B',bg:'#FAEEDA'},
+  'gobuster_results.txt': {icon:'📂',label:'Gobuster',     desc:'Directorios encontrados',      color:'#185FA5',bg:'#E6F1FB'},
+  'ssl_report.txt':       {icon:'🔒',label:'SSL/TLS',      desc:'Análisis de certificados',     color:'#3B6D11',bg:'#EAF3DE'},
+  'headers.txt':          {icon:'📋',label:'Headers HTTP', desc:'Cabeceras de seguridad',       color:'#5C6B8A',bg:'#F0F2F6'},
+  'api_endpoints.json':   {icon:'🔌',label:'WordPress API',desc:'Endpoints y usuarios REST',   color:'#854F0B',bg:'#FAEEDA'},
+  'nmap_report.txt':      {icon:'🗺️',label:'Nmap',         desc:'Servicios y versiones',        color:'#185FA5',bg:'#E6F1FB'},
+  'REPORTE_FINAL.md':     {icon:'📄',label:'Reporte Final',desc:'Resumen ejecutivo Markdown',  color:'#1A1A2E',bg:'#F0F2F6'},
+  'pentest.log':          {icon:'📜',label:'Log completo', desc:'Registro con timestamps',      color:'#5C6B8A',bg:'#F0F2F6'},
+};
+
+function ptBuildPhaseGrid(current) {
+  const grid = document.getElementById('ptPhaseGrid');
+  if (!grid) return;
+  grid.innerHTML = PT_PHASES.map((name, i) => {
+    const n = i + 1;
+    let bg='var(--bg3)', col='var(--dim)', brd='var(--bg4)';
+    if (n < current)  { bg='#1a3a1a'; col='var(--green)'; brd='var(--green)'; }
+    if (n === current){ bg='#1a2a3a'; col='var(--blue)';  brd='var(--blue)'; }
+    return `<div style="background:${bg};border:1px solid ${brd};border-radius:6px;
+                 padding:6px 4px;text-align:center;font-size:.68rem;color:${col};
+                 font-weight:600;transition:.3s">
+              <div style="font-size:.6rem;opacity:.7">${n}/8</div>${esc(name)}</div>`;
+  }).join('');
+  const pct = Math.round(((current - 1) / 8) * 100);
+  const bar = document.getElementById('ptProgressBar');
+  if (bar) { bar.style.width = pct + '%'; bar.style.background = current > 8 ? 'var(--green)' : 'var(--blue)'; }
+}
+
+async function ptStart() {
+  const target   = document.getElementById('ptTarget').value.trim();
+  const engineer = document.getElementById('ptEngineer').value.trim() || 'Sin especificar';
+  if (!target) { alert('Ingresa una URL objetivo'); return; }
+  document.getElementById('ptProgress').style.display  = 'block';
+  document.getElementById('ptTermWrap').style.display  = 'flex';
+  document.getElementById('ptResults').style.display   = 'none';
+  document.getElementById('ptTerm').innerHTML = '';
+  document.getElementById('ptBtnStart').disabled = true;
+  document.getElementById('ptBtnStop').disabled  = false;
+  ptBuildPhaseGrid(1);
+
+  const d = await (await fetch('/api/pentest/start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({target, engineer})
+  })).json();
+  if (d.error) { alert('Error: '+d.error); ptDone(); return; }
+  ptCurrentJob = d.job_id;
+
+  if (ptSSE) ptSSE.close();
+  ptSSE = new EventSource('/api/pentest/stream/' + d.job_id);
+  ptSSE.onmessage = ev => {
+    const data = JSON.parse(ev.data);
+    if (data.line)      ptAppendLine(data.line);
+    if (data.phase_num) { ptBuildPhaseGrid(data.phase_num); document.getElementById('ptPhaseLabel').textContent = data.phase||''; }
+    if (data.done) {
+      ptSSE.close();
+      ptBuildPhaseGrid(9);
+      ptBuildFileGrid(data.files||[], d.job_id);
+      pentestLoadJobs();
+      ptDone();
+      if (data.error) ptAppendLine('[ERROR] '+data.error, true);
+    }
+  };
+  ptSSE.onerror = () => { ptSSE.close(); ptDone(); };
+}
+
+function ptAppendLine(line, isErr) {
+  const term = document.getElementById('ptTerm');
+  const div  = document.createElement('div');
+  const isPhase = /^\[\d+\/8\]/.test(line);
+  const isDone  = line.includes('COMPLETADO') || line.includes('======');
+  const isWarn  = line.startsWith('[!]') || line.includes('ERROR');
+  div.style.color = isErr ? 'var(--red)' : isPhase ? 'var(--blue)' :
+                    isDone ? 'var(--green)' : isWarn ? 'var(--yellow)' : '#c9d1d9';
+  if (isPhase || isDone) div.style.fontWeight = '700';
+  div.textContent = line;
+  term.appendChild(div);
+  term.scrollTop = term.scrollHeight;
+}
+
+function ptBuildFileGrid(files, jobId) {
+  const grid = document.getElementById('ptFileGrid');
+  if (!grid || !files.length) return;
+  const known  = Object.keys(PT_FILE_META);
+  const sorted = [...known.filter(f=>files.includes(f)), ...files.filter(f=>!known.includes(f))];
+  grid.innerHTML = sorted.map(fname => {
+    const m = PT_FILE_META[fname]||{icon:'📁',label:fname,desc:'Archivo',color:'#5C6B8A',bg:'#F0F2F6'};
+    const isHtml = fname.endsWith('.html');
+    const viewBtn = isHtml
+      ? `<a href="/api/pentest/view/${jobId}/${fname}" target="_blank"
+            style="background:var(--bg4);color:var(--fg);border-radius:4px;padding:3px 10px;
+                   font-size:.72rem;font-weight:600;text-decoration:none">Ver</a>` : '';
+    return `<div style="background:${m.bg};border:1px solid ${m.color}40;border-radius:8px;padding:14px;">
+              <div style="font-size:22px;margin-bottom:4px">${m.icon}</div>
+              <div style="font-weight:700;font-size:.82rem;color:${m.color}">${m.label}</div>
+              <div style="font-size:.72rem;color:#5C6B8A;margin:4px 0 10px">${m.desc}</div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <a href="/api/pentest/download/${jobId}/${fname}"
+                   style="background:${m.color};color:#fff;border-radius:4px;padding:3px 10px;
+                          font-size:.72rem;font-weight:600;text-decoration:none">&#x2B07; Descargar</a>
+                ${viewBtn}
+              </div>
+            </div>`;
+  }).join('');
+  document.getElementById('ptResults').style.display = 'flex';
+}
+
+async function pentestLoadJobs() {
+  try {
+    const jobs = await (await fetch('/api/pentest/jobs')).json();
+    const tbody = document.getElementById('ptJobsBody');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    if (!jobs.length) {
+      tbody.innerHTML='<tr><td colspan="6" style="text-align:center;padding:16px;color:var(--dim)">Sin escaneos previos</td></tr>';
+      return;
+    }
+    jobs.forEach(j => {
+      const tr  = document.createElement('tr');
+      const pct = Math.round((j.phase_num/8)*100);
+      tr.innerHTML =
+        `<td style="font-family:monospace;font-size:.75rem">${esc(j.id)}</td>`+
+        `<td>${esc(j.engineer||'—')}</td>`+
+        `<td style="font-family:monospace;font-size:.75rem">${esc(j.target)}</td>`+
+        `<td style="font-size:.75rem">${j.start||'—'}</td>`+
+        `<td><span style="padding:2px 8px;border-radius:10px;font-size:.7rem;font-weight:700;
+             background:${j.done?'#1a3a1a':'#1a2a3a'};color:${j.done?'var(--green)':'var(--blue)'}">
+             ${j.done?'Completado':`${pct}% — fase ${j.phase_num}/8`}</span></td>`+
+        `<td><button class="btn btn-gray btn-sm" onclick="ptReplayJob('${j.id}')"
+             style="padding:2px 8px;font-size:.7rem">Ver resultados</button></td>`;
+      tbody.appendChild(tr);
+    });
+    document.getElementById('ptResults').style.display = 'flex';
+  } catch(e) {}
+}
+
+async function ptReplayJob(jobId) {
+  const d = await (await fetch('/api/pentest/status/'+jobId)).json();
+  ptCurrentJob = jobId;
+  document.getElementById('ptTermWrap').style.display = 'flex';
+  document.getElementById('ptProgress').style.display  = 'block';
+  document.getElementById('ptTerm').innerHTML = '';
+  (d.log_lines||[]).forEach(l => ptAppendLine(l));
+  ptBuildPhaseGrid(d.phase_num||0);
+  document.getElementById('ptPhaseLabel').textContent = d.phase||'';
+  if (d.files&&d.files.length) ptBuildFileGrid(d.files, jobId);
+}
+
+function ptStop() { if (ptSSE) { ptSSE.close(); ptSSE=null; } ptDone(); }
+function ptDone() { document.getElementById('ptBtnStart').disabled=false; document.getElementById('ptBtnStop').disabled=true; }
 </script>
 </body>
 </html>
