@@ -3525,6 +3525,7 @@ def _run_zap_passive_scan(scan_id: str, target: str, use_ajax: bool, max_childre
         state["status"] = f"Error: {e}"
         state["phase"] = "error"
     finally:
+        state["end"]  = now_str()
         state["done"] = True
 
 
@@ -3539,10 +3540,11 @@ def api_zap_check():
 
 @app.route("/api/zap/scan", methods=["POST"])
 def api_zap_scan():
-    data        = request.json or {}
-    target      = data.get("target", "").strip()
-    use_ajax    = data.get("ajax_spider", True)
-    max_children= int(data.get("max_children", 10))
+    data         = request.json or {}
+    target       = data.get("target",      "").strip()
+    engineer     = data.get("engineer",    "Sin especificar").strip() or "Sin especificar"
+    use_ajax     = data.get("ajax_spider", True)
+    max_children = int(data.get("max_children", 10))
 
     if not target:
         return jsonify({"error": "target requerido"}), 400
@@ -3551,7 +3553,8 @@ def api_zap_scan():
 
     scan_id = str(uuid.uuid4())[:8]
     zap_scans[scan_id] = {
-        "id": scan_id, "target": target, "start": now_str(),
+        "id": scan_id, "target": target, "start": now_str(), "end": None,
+        "engineer": engineer,
         "phase": "init", "status": "Iniciando...",
         "spider_pct": 0, "ajax_status": "pending",
         "passive_remaining": 0,
@@ -3614,19 +3617,25 @@ def api_zap_results(scan_id):
 
 @app.route("/api/zap/report/<scan_id>")
 def api_zap_report(scan_id):
-    """Generate self-contained HTML executive report for ZAP scan."""
-    import html as _h
-    s = zap_scans.get(scan_id)
+    """Generate ZAP scan report — HTML (default) or PDF (?fmt=pdf)."""
+    fmt = request.args.get("fmt", "html")
+    s   = zap_scans.get(scan_id)
     if not s:
         return "Not found", 404
 
+    if fmt == "pdf":
+        return _zap_pdf_report(s, scan_id)
+
+    # ── HTML report ────────────────────────────────────────────────────────────
+    import html as _h
     def e(v): return _h.escape(str(v or ""))
 
-    counts  = s.get("counts", {})
-    alerts  = s.get("alerts", [])
-    urls    = s.get("urls", [])
-    target  = s.get("target","")
-    total_a = len(alerts)
+    counts   = s.get("counts", {})
+    alerts   = s.get("alerts", [])
+    urls     = s.get("urls",   [])
+    target   = s.get("target", "")
+    engineer = s.get("engineer", "Sin especificar")
+    total_a  = len(alerts)
 
     risk_color = {"High":"#C94040","Medium":"#D4780A","Low":"#2274C8","Informational":"#5C6B8A"}
     risk_bg    = {"High":"#FCEBEB","Medium":"#FAEEDA","Low":"#E6F1FB","Informational":"#F0F2F6"}
@@ -3643,23 +3652,28 @@ def api_zap_report(scan_id):
                  f'<td style="font-size:11px">{e(a["description"][:120])}</td>'
                  f'</tr>')
 
-    url_list = "".join(f"<li style='font-family:monospace;font-size:11px'>{e(u)}</li>" for u in sorted(urls)[:200])
+    url_list = "".join(f"<li style='font-family:monospace;font-size:11px'>{e(u)}</li>"
+                       for u in sorted(urls)[:200])
 
-    html = f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+    html_body = f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
 <title>ZAP Passive Scan — {e(target)}</title>
 <style>
 body{{font-family:system-ui,sans-serif;background:#F4F6F9;color:#1A1A2E;margin:0}}
 .page{{max-width:1100px;margin:24px auto;background:#fff;border-radius:10px;
        box-shadow:0 4px 24px rgba(0,0,0,.10);overflow:hidden}}
 .hdr{{background:linear-gradient(135deg,#0D1B2A,#1B3556);color:#fff;padding:28px 36px}}
-.hdr h1{{font-size:20px;margin:0 0 4px}}
-.hdr p{{color:#A8C4DC;margin:0;font-size:13px}}
+.hdr h1{{font-size:20px;margin:0 0 6px}}.hdr p{{color:#A8C4DC;margin:2px 0;font-size:13px}}
 .body{{padding:28px 36px}}
 .cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:28px}}
 .card{{border-radius:8px;padding:14px;text-align:center;border:1px solid}}
 .card .n{{font-size:32px;font-weight:800;line-height:1}}
 .card .l{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;margin-top:4px}}
-h2{{font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+.sig{{margin-top:28px;border-top:1px solid #DDE2EC;padding-top:18px;display:flex;
+      justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px}}
+.sig-block{{font-size:11px;color:#5C6B8A}}
+.sig-block strong{{color:#1A1A2E;font-size:13px;display:block;margin-top:6px}}
+.sig-line{{border-bottom:1px solid #1A1A2E;width:220px;margin:18px 0 4px}}
+h2{{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
     color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:6px;margin:24px 0 14px}}
 table{{width:100%;border-collapse:collapse;font-size:12px}}
 th{{background:#2c3e50;color:#fff;padding:8px 10px;text-align:left;font-size:11px}}
@@ -3667,16 +3681,17 @@ td{{padding:7px 10px;border-bottom:1px solid #E0E6EF;vertical-align:top}}
 tr:hover td{{background:#F8FAFC}}
 ul{{margin:0;padding-left:18px;columns:2;column-gap:20px}}
 li{{margin-bottom:3px;break-inside:avoid}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700}}
-@media print{{.page{{box-shadow:none}}}}
+@media print{{.page{{box-shadow:none;border-radius:0;margin:0}}
+              .hdr,.card,.sig{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
 </style></head><body>
 <div class="page">
 <div class="hdr">
-  <h1>🔍 ZAP Passive Scan Report</h1>
-  <p>Target: <strong style="color:#7EC8E3">{e(target)}</strong> &nbsp;|&nbsp;
-     Fecha: {e(s.get('start',''))} &nbsp;|&nbsp;
-     URLs descubiertas: {len(urls)} &nbsp;|&nbsp;
-     Alertas: {total_a}</p>
+  <h1>&#x1F50D; ZAP Passive Scan — Reporte de Seguridad</h1>
+  <p><strong style="color:#7EC8E3">{e(target)}</strong></p>
+  <p>Ingeniero: {e(engineer)} &nbsp;&nbsp;|&nbsp;&nbsp;
+     Inicio: {e(s.get('start',''))} &nbsp;&nbsp;|&nbsp;&nbsp;
+     Fin: {e(s.get('end','—'))} &nbsp;&nbsp;|&nbsp;&nbsp;
+     ID: <code style="font-size:11px;color:#90caf9">{e(scan_id)}</code></p>
 </div>
 <div class="body">
 <div class="cards">
@@ -3694,15 +3709,314 @@ li{{margin-bottom:3px;break-inside:avoid}}
 <h2>Alertas de seguridad ({total_a})</h2>
 <table>
   <tr><th>Riesgo</th><th>Vulnerabilidad</th><th>URL</th><th>Parámetro</th><th>Descripción</th></tr>
-  {rows if rows else '<tr><td colspan="5" style="text-align:center;color:#3B6D11;padding:20px">✓ Sin alertas detectadas</td></tr>'}
+  {rows or '<tr><td colspan="5" style="text-align:center;color:#3B6D11;padding:20px">&#x2713; Sin alertas detectadas</td></tr>'}
 </table>
 <h2>URLs descubiertas ({len(urls)})</h2>
 <ul>{url_list}</ul>
+<div class="sig">
+  <div class="sig-block">
+    Ingeniero responsable<br>
+    <div class="sig-line"></div>
+    <strong>{e(engineer)}</strong>
+    Seguridad Ofensiva — Datacom Security
+  </div>
+  <div class="sig-block" style="text-align:right">
+    Generado: {e(now_display())}<br>
+    Herramienta: OWASP ZAP 2.17<br>
+    <strong style="font-size:10px;color:#8A94A6">Confidencial — Uso interno</strong>
+  </div>
+</div>
 </div></div></body></html>"""
 
     fname = f"zap_report_{re.sub(r'[^a-zA-Z0-9._-]','_',target)}_{scan_id}.html"
-    return Response(html, mimetype="text/html",
+    return Response(html_body, mimetype="text/html",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
+def _zap_pdf_report(s: dict, scan_id: str) -> "Response":
+    """Generate a professional PDF report for a ZAP passive scan using reportlab."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, HRFlowable, KeepTogether)
+
+    W, H = A4
+
+    # Palette
+    C_NAVY   = colors.HexColor("#1a2e4a")
+    C_BLUE   = colors.HexColor("#1565c0")
+    C_BORDER = colors.HexColor("#c5cdd8")
+    C_HDR    = colors.HexColor("#2c3e50")
+    C_LABEL  = colors.HexColor("#546e7a")
+    C_BODY   = colors.HexColor("#212121")
+    C_ROW1   = colors.HexColor("#f0f4f8")
+    C_ROW2   = colors.white
+    C_CRIT   = colors.HexColor("#c62828")
+    C_HIGH   = colors.HexColor("#e65100")
+    C_MED    = colors.HexColor("#f9a825")
+    C_LOW    = colors.HexColor("#1565c0")
+    C_GREEN  = colors.HexColor("#2e7d32")
+    C_INFO   = colors.HexColor("#546e7a")
+    WHITE    = colors.white
+
+    engineer = s.get("engineer", "Sin especificar")
+    target   = s.get("target",   "N/A")
+    start_t  = s.get("start",    now_str())
+    end_t    = s.get("end",      now_str()) or now_str()
+    counts   = s.get("counts",   {})
+    alerts   = s.get("alerts",   [])
+    urls     = s.get("urls",     [])
+
+    buf = io.BytesIO()
+
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(C_NAVY)
+        canvas.rect(0, H - 1.4*cm, W, 1.4*cm, fill=1, stroke=0)
+        canvas.setFont("Helvetica-Bold", 7.5)
+        canvas.setFillColor(WHITE)
+        canvas.drawString(1.5*cm, H - 0.82*cm,
+                          "REPORTE ZAP PASSIVE SCAN — DATACOM SECURITY — CONFIDENCIAL")
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#90caf9"))
+        canvas.drawRightString(W - 1.5*cm, H - 0.82*cm, f"ID: {scan_id}")
+        canvas.setStrokeColor(C_BLUE)
+        canvas.setLineWidth(2)
+        canvas.line(0, H - 1.4*cm, W, H - 1.4*cm)
+        canvas.setStrokeColor(C_BORDER)
+        canvas.setLineWidth(0.5)
+        canvas.line(1.5*cm, 1.1*cm, W - 1.5*cm, 1.1*cm)
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(C_LABEL)
+        canvas.drawString(1.5*cm, 0.55*cm,
+                          f"Datacom Security  •  ZAP Passive Scan  •  Confidencial")
+        canvas.drawRightString(W - 1.5*cm, 0.55*cm, f"Página {doc.page}")
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.8*cm, rightMargin=1.8*cm,
+                            topMargin=2.0*cm, bottomMargin=1.8*cm)
+
+    base = getSampleStyleSheet()
+    def S(name, parent="Normal", **kw):
+        return ParagraphStyle(name, parent=base[parent], **kw)
+
+    st = {
+        "title": S("t",  fontSize=20, leading=26, textColor=WHITE,
+                   fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "sub":   S("s",  fontSize=10, leading=14, textColor=colors.HexColor("#90caf9"),
+                   fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "h1":    S("h1", fontSize=13, leading=18, textColor=C_NAVY,
+                   fontName="Helvetica-Bold", spaceBefore=14, spaceAfter=4),
+        "body":  S("b",  fontSize=9, leading=13, textColor=C_BODY,
+                   fontName="Helvetica", alignment=TA_JUSTIFY, spaceBefore=2, spaceAfter=3),
+        "code":  S("c",  fontSize=7.5, leading=11, textColor=colors.HexColor("#263238"),
+                   fontName="Courier", spaceBefore=1, spaceAfter=1),
+        "sign":  S("sg", fontSize=12, leading=16, textColor=C_NAVY,
+                   fontName="Helvetica-Bold", alignment=TA_CENTER),
+        "label": S("l",  fontSize=8, leading=12, textColor=C_LABEL,
+                   fontName="Helvetica-Bold"),
+    }
+    def hr(c=C_NAVY, t=0.6):
+        return HRFlowable(width="100%", thickness=t, color=c, spaceAfter=6, spaceBefore=4)
+
+    avail = W - 3.6*cm
+    story = []
+
+    # ── Cover ─────────────────────────────────────────────────────────────────
+    cover = Table(
+        [[Paragraph("REPORTE DE SEGURIDAD WEB", st["title"])],
+         [Paragraph("ZAP Passive Scan — Datacom Security", st["sub"])]],
+        colWidths=[avail]
+    )
+    cover.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C_NAVY),
+        ("TOPPADDING",    (0,0), (-1,-1), 18),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 18),
+        ("LEFTPADDING",   (0,0), (-1,-1), 20),
+        ("LINEBELOW",     (0,-1),(-1,-1), 3, C_BLUE),
+    ]))
+    story.append(cover)
+    story.append(Spacer(1, 0.5*cm))
+
+    # ── Meta table ────────────────────────────────────────────────────────────
+    story.append(Paragraph("Información del Test", st["h1"]))
+    story.append(hr())
+    meta = Table([
+        ["Ingeniero responsable", engineer],
+        ["Objetivo / URL",        target],
+        ["Fecha y hora de inicio", start_t],
+        ["Fecha y hora de fin",    end_t],
+        ["ID del escaneo",        scan_id],
+        ["Herramienta",           "OWASP ZAP 2.17 — Passive Scan + Spider + AJAX Spider"],
+    ], colWidths=[4.8*cm, 10.4*cm])
+    meta.setStyle(TableStyle([
+        ("FONTNAME",      (0,0),(0,-1), "Helvetica-Bold"),
+        ("FONTNAME",      (1,0),(1,-1), "Helvetica"),
+        ("FONTSIZE",      (0,0),(-1,-1), 8.5),
+        ("TEXTCOLOR",     (0,0),(0,-1), C_LABEL),
+        ("TEXTCOLOR",     (1,0),(1,-1), C_BODY),
+        ("TOPPADDING",    (0,0),(-1,-1), 5),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 5),
+        ("LEFTPADDING",   (0,0),(-1,-1), 8),
+        ("ROWBACKGROUNDS",(0,0),(-1,-1), [C_ROW1, C_ROW2]),
+        ("GRID",          (0,0),(-1,-1), 0.4, C_BORDER),
+        ("BOX",           (0,0),(-1,-1), 0.8, C_NAVY),
+    ]))
+    story.append(meta)
+
+    # ── Summary counts ────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph("Resumen de Hallazgos", st["h1"]))
+    story.append(hr())
+    risk_rows = [[
+        Paragraph("<b>Severidad</b>",  S("sh", fontSize=8.5, textColor=WHITE, fontName="Helvetica-Bold")),
+        Paragraph("<b>Cantidad</b>",   S("sh2",fontSize=8.5, textColor=WHITE, fontName="Helvetica-Bold", alignment=TA_CENTER)),
+        Paragraph("<b>Descripción</b>",S("sh3",fontSize=8.5, textColor=WHITE, fontName="Helvetica-Bold")),
+    ]]
+    sev_info = [
+        ("High",          C_CRIT,  "Vulnerabilidades de alto riesgo — acción inmediata requerida"),
+        ("Medium",        C_HIGH,  "Vulnerabilidades de riesgo medio — remediar en 30 días"),
+        ("Low",           C_LOW,   "Vulnerabilidades de bajo riesgo — remediar en 90 días"),
+        ("Informational", C_INFO,  "Hallazgos informativos — revisar según política de seguridad"),
+    ]
+    for sev, col, desc in sev_info:
+        cnt = counts.get(sev, 0)
+        risk_rows.append([
+            Paragraph(f"<b>{sev}</b>", S(f"sv{sev}", fontSize=8.5, textColor=col, fontName="Helvetica-Bold")),
+            Paragraph(str(cnt), S(f"sc{sev}", fontSize=9, textColor=col if cnt > 0 else C_BODY,
+                                  fontName="Helvetica-Bold" if cnt > 0 else "Helvetica",
+                                  alignment=TA_CENTER)),
+            Paragraph(desc, S(f"sd{sev}", fontSize=8.5, textColor=C_BODY, fontName="Helvetica")),
+        ])
+    risk_t = Table(risk_rows, colWidths=[3.2*cm, 2.0*cm, 10.0*cm])
+    risk_t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  C_HDR),
+        ("ALIGN",         (1,0),(1,-1),  "CENTER"),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("TOPPADDING",    (0,0),(-1,-1), 6),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 6),
+        ("LEFTPADDING",   (0,0),(-1,-1), 8),
+        ("GRID",          (0,0),(-1,-1), 0.4, C_BORDER),
+        ("BOX",           (0,0),(-1,-1), 0.8, C_NAVY),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW2, C_ROW1]),
+    ]))
+    story.append(risk_t)
+
+    # ── Alerts detail ─────────────────────────────────────────────────────────
+    if alerts:
+        story.append(Spacer(1, 0.4*cm))
+        story.append(Paragraph(f"Detalle de Alertas ({len(alerts)})", st["h1"]))
+        story.append(hr())
+        risk_col_map = {"High":C_CRIT,"Medium":C_HIGH,"Low":C_LOW,"Informational":C_INFO}
+        alert_rows = [[
+            Paragraph("<b>Riesgo</b>",        S("ah0",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>Vulnerabilidad</b>", S("ah1",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>URL</b>",            S("ah2",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+            Paragraph("<b>Parámetro</b>",      S("ah3",fontSize=8,textColor=WHITE,fontName="Helvetica-Bold")),
+        ]]
+        for i, a in enumerate(alerts[:150]):
+            col = risk_col_map.get(a["risk"], C_INFO)
+            bg  = C_ROW1 if i % 2 == 0 else C_ROW2
+            url_short = (a.get("url",""))[:70]
+            alert_rows.append([
+                Paragraph(f"<b>{a['risk']}</b>",
+                          S(f"ar{i}", fontSize=7.5, textColor=col, fontName="Helvetica-Bold")),
+                Paragraph(a.get("name","")[:60],
+                          S(f"an{i}", fontSize=7.5, textColor=C_BODY, fontName="Helvetica")),
+                Paragraph(url_short.replace("&","&amp;").replace("<","&lt;"),
+                          S(f"au{i}", fontSize=6.5, textColor=C_BLUE, fontName="Courier")),
+                Paragraph(a.get("param","")[:25] or "—",
+                          S(f"ap{i}", fontSize=7.5, textColor=C_BODY, fontName="Helvetica")),
+            ])
+        at = Table(alert_rows, colWidths=[2.0*cm, 5.0*cm, 5.6*cm, 2.6*cm])
+        at.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0),  C_HDR),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW1, C_ROW2]),
+            ("TOPPADDING",    (0,0),(-1,-1), 4),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 4),
+            ("LEFTPADDING",   (0,0),(-1,-1), 6),
+            ("VALIGN",        (0,0),(-1,-1), "TOP"),
+            ("GRID",          (0,0),(-1,-1), 0.3, C_BORDER),
+            ("BOX",           (0,0),(-1,-1), 0.8, C_NAVY),
+        ]))
+        story.append(at)
+        if len(alerts) > 150:
+            story.append(Paragraph(
+                f"[ ... {len(alerts)-150} alertas adicionales omitidas — ver reporte HTML completo ]",
+                S("tr", fontSize=7.5, textColor=C_LABEL, fontName="Helvetica-Oblique")))
+
+    # ── URLs discovered ───────────────────────────────────────────────────────
+    if urls:
+        story.append(Spacer(1, 0.3*cm))
+        story.append(Paragraph(f"URLs Descubiertas ({len(urls)})", st["h1"]))
+        story.append(hr())
+        for u in sorted(urls)[:300]:
+            clean = u[:120].replace("&","&amp;").replace("<","&lt;")
+            story.append(Paragraph(clean, st["code"]))
+        if len(urls) > 300:
+            story.append(Paragraph(
+                f"[ ... {len(urls)-300} URLs adicionales omitidas ]",
+                S("tr2", fontSize=7.5, textColor=C_LABEL, fontName="Helvetica-Oblique")))
+
+    # ── Signature ─────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.8*cm))
+    story.append(hr(C_NAVY, 1))
+    story.append(Spacer(1, 0.4*cm))
+    sig_data = [[
+        Paragraph("Firma del Ingeniero Responsable",
+                  S("slh", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold", alignment=TA_CENTER)),
+        Paragraph("Fecha y Hora del Test",
+                  S("sdh", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold", alignment=TA_CENTER)),
+    ],[
+        Table([
+            [Paragraph("_" * 38, S("ul",fontSize=10,textColor=C_LABEL,fontName="Helvetica",alignment=TA_CENTER))],
+            [Paragraph(engineer, st["sign"])],
+            [Paragraph("Ingeniero de Seguridad — Datacom Security",
+                       S("ro",fontSize=8,textColor=C_LABEL,fontName="Helvetica-Oblique",alignment=TA_CENTER))],
+        ], style=TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER"),
+                             ("TOPPADDING",(0,0),(-1,-1),5),
+                             ("BOTTOMPADDING",(0,0),(-1,-1),5)])),
+        Table([
+            [Paragraph(end_t, S("dt",fontSize=12,textColor=C_NAVY,fontName="Helvetica-Bold",alignment=TA_CENTER))],
+            [Paragraph("Fin del escaneo",
+                       S("dt2",fontSize=8,textColor=C_LABEL,fontName="Helvetica",alignment=TA_CENTER))],
+            [Paragraph(f"Generado: {now_display()}",
+                       S("dt3",fontSize=8,textColor=C_GREEN,fontName="Helvetica",alignment=TA_CENTER))],
+        ], style=TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER"),
+                             ("TOPPADDING",(0,0),(-1,-1),5),
+                             ("BOTTOMPADDING",(0,0),(-1,-1),5)])),
+    ]]
+    sig_t = Table(sig_data, colWidths=[8*cm, 7.2*cm])
+    sig_t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,0),  C_HDR),
+        ("BACKGROUND",    (0,1),(-1,-1), C_ROW1),
+        ("BOX",           (0,0),(-1,-1), 0.8, C_NAVY),
+        ("LINEAFTER",     (0,0),(0,-1),  0.5, C_BORDER),
+        ("ALIGN",         (0,0),(-1,-1), "CENTER"),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("TOPPADDING",    (0,0),(-1,0),  8),
+        ("BOTTOMPADDING", (0,0),(-1,0),  8),
+        ("TOPPADDING",    (0,1),(-1,1),  16),
+        ("BOTTOMPADDING", (0,1),(-1,1),  20),
+    ]))
+    story.append(sig_t)
+    story.append(Spacer(1, 0.3*cm))
+    story.append(Paragraph(
+        "Este informe ha sido generado automáticamente mediante OWASP ZAP Passive Scan por "
+        "Datacom Security. Su contenido es confidencial y de uso exclusivo del cliente indicado.",
+        S("disc", fontSize=7, leading=10, textColor=C_LABEL,
+          fontName="Helvetica-Oblique", alignment=TA_CENTER)))
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    buf.seek(0)
+
+    fname = f"zap_report_{re.sub(r'[^a-zA-Z0-9._-]','_',target)}_{scan_id}.pdf"
+    return send_file(io.BytesIO(buf.read()), mimetype="application/pdf",
+                     as_attachment=True, download_name=fname)
 
 
 # ── Static assets (JS libs served locally — no CDN dependency) ─────────────────
@@ -4673,7 +4987,12 @@ select option{background:var(--bg3)}
       <label>URL objetivo</label>
       <input id="zapTarget" type="url" placeholder="https://datacom.ec" autocomplete="off">
     </div>
-    <div class="form-group" style="flex:0 0 140px">
+    <div class="form-group" style="flex:1;min-width:200px">
+      <label>&#x1F464; Ingeniero responsable</label>
+      <input id="zapEngineer" type="text" placeholder="Nombre completo del ingeniero"
+             autocomplete="name" oninput="localStorage.setItem('zapEngineer',this.value)">
+    </div>
+    <div class="form-group" style="flex:0 0 130px">
       <label>Máx. URLs por nivel</label>
       <input id="zapMaxChildren" type="number" value="10" min="1" max="50" style="width:100%">
     </div>
@@ -4753,10 +5072,13 @@ select option{background:var(--bg3)}
       </div>
     </div>
 
-    <!-- Export button -->
-    <div style="display:flex;gap:8px;align-items:center">
-      <button class="btn btn-pdf" id="zapBtnReport" onclick="zapDownloadReport()" style="display:none">
-        &#x1F4CA; Descargar Reporte HTML
+    <!-- Export buttons -->
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-pdf" id="zapBtnReportPDF" onclick="zapDownloadReport('pdf')" style="display:none">
+        &#x1F4C4; Descargar PDF
+      </button>
+      <button class="btn btn-green btn-sm" id="zapBtnReportHTML" onclick="zapDownloadReport('html')" style="display:none">
+        &#x1F4CA; Descargar HTML
       </button>
       <span style="font-size:.78rem;color:var(--dim)" id="zapScanMeta"></span>
     </div>
@@ -6688,7 +7010,8 @@ async function zapCheckStatus() {
 }
 
 async function zapStartScan() {
-  const target = document.getElementById('zapTarget').value.trim();
+  const target   = document.getElementById('zapTarget').value.trim();
+  const engineer = document.getElementById('zapEngineer').value.trim() || 'Sin especificar';
   if (!target) { alert('Ingresa una URL objetivo (ej: https://datacom.ec)'); return; }
   if (!target.startsWith('http')) { alert('La URL debe empezar con http:// o https://'); return; }
 
@@ -6700,7 +7023,10 @@ async function zapStartScan() {
   document.getElementById('zapResults').style.display  = 'none';
   document.getElementById('zapBtnScan').disabled = true;
   document.getElementById('zapBtnStop').disabled = false;
-  document.getElementById('zapBtnReport') && (document.getElementById('zapBtnReport').style.display = 'none');
+  ['zapBtnReportPDF','zapBtnReportHTML'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  });
   zapAllAlerts = []; zapAllUrls = [];
   zapSetPhaseBar('spider', 0, false);
   zapSetPhaseBar('ajax',   0, false);
@@ -6708,7 +7034,7 @@ async function zapStartScan() {
   const r = await fetch('/api/zap/scan', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({target, ajax_spider: useAjax, max_children: maxChildren})
+    body: JSON.stringify({target, engineer, ajax_spider: useAjax, max_children: maxChildren})
   });
   const d = await r.json();
   if (d.error) { alert('Error: ' + d.error); zapScanDone(); return; }
@@ -6784,7 +7110,8 @@ async function zapFetchResults(scanId) {
     document.getElementById('rcU').textContent = zapAllUrls.length;
     document.getElementById('zapUrlTotal').textContent = zapAllUrls.length;
     document.getElementById('zapResults').style.display = 'flex';
-    document.getElementById('zapBtnReport').style.display = 'inline-flex';
+    document.getElementById('zapBtnReportPDF').style.display  = 'inline-flex';
+    document.getElementById('zapBtnReportHTML').style.display = 'inline-flex';
     zapRenderAlerts();
     zapRenderUrls();
   } catch(e) { console.error('ZAP results error', e); }
@@ -6862,15 +7189,19 @@ function zapScanDone() {
   document.getElementById('zapBtnStop').disabled = true;
 }
 
-function zapDownloadReport() {
-  if (zapCurrentScan) window.open('/api/zap/report/' + zapCurrentScan);
+function zapDownloadReport(fmt) {
+  if (zapCurrentScan) window.open('/api/zap/report/' + zapCurrentScan + '?fmt=' + (fmt||'html'));
 }
 
-// Auto-check ZAP when tab loads
+// Restore engineer name from localStorage
 window.addEventListener('load', () => {
-  // Check ZAP status if tab is active
-  if (document.getElementById('tab-zap') && document.getElementById('tab-zap').classList.contains('active'))
-    zapCheckStatus();
+  const saved = localStorage.getItem('zapEngineer');
+  const engEl = document.getElementById('zapEngineer');
+  if (saved && engEl) engEl.value = saved;
+  // Also sync with the global engineer bar
+  const globalEng = document.getElementById('engineerInput');
+  if (globalEng && globalEng.value && engEl && !engEl.value)
+    engEl.value = globalEng.value;
 });
 </script>
 </body>
