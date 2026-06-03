@@ -4133,40 +4133,63 @@ def _zap_pdf_report(s: dict, scan_id: str) -> "Response":
 
     # ── Priority action plan ──────────────────────────────────────────────────
     story.append(Spacer(1, 0.4*cm))
-    story.append(Paragraph("Prioridades (Orden de Crítica)", st["h1"]))
+    story.append(Paragraph("Prioridades (Orden de Critica)", st["h1"]))
     story.append(hr())
 
     prio = _zap_build_priorities(alerts, urls)
 
+    # No emojis in reportlab — use plain-text labels with colored styling
+    # bg_col = header background, code_bg = body background, txt_col = header text
     prio_sections = [
-        ("1️⃣  CRÍTICO — Implementar YA",            prio["critico"],    C_CRIT,  colors.HexColor("#FFF0F0"), colors.HexColor("#FFCACA")),
-        ("2️⃣  IMPORTANTE — Próximas semanas",       prio["importante"], C_HIGH,  colors.HexColor("#FFF8EC"), colors.HexColor("#FFD9A0")),
-        ("3️⃣  MENOR — Después",                     prio["menor"],      C_LOW,   colors.HexColor("#F0F4FF"), colors.HexColor("#C5D5F5")),
+        ("1.  CRITICO — Implementar YA",        prio["critico"],
+         C_CRIT,
+         colors.HexColor("#FFF0F0"), colors.HexColor("#FFCACA"),
+         colors.HexColor("#F5E6E6")),
+        ("2.  IMPORTANTE — Proximas semanas",   prio["importante"],
+         C_HIGH,
+         colors.HexColor("#FFF8EC"), colors.HexColor("#FFD9A0"),
+         colors.HexColor("#F5EFE0")),
+        ("3.  MENOR — Despues",                  prio["menor"],
+         C_LOW,
+         colors.HexColor("#F0F4FF"), colors.HexColor("#C5D5F5"),
+         colors.HexColor("#E8EEF8")),
     ]
 
-    for title, items, txt_col, bg_col, border_col in prio_sections:
-        # Header row
-        hdr_row = [[Paragraph(f"<b>{title}</b>",
-                               S(f"ph_{title[:4]}", fontSize=10, textColor=txt_col,
-                                 fontName="Helvetica-Bold"))]]
-        items_text = "\n".join(f"- {item}" for item in items) if items else "- Sin hallazgos en esta categoría"
-        body_row = [[Paragraph(items_text.replace("\n","<br/>"),
-                               S(f"pb_{title[:4]}", fontSize=8.5, leading=14,
-                                 textColor=colors.HexColor("#263238"),
-                                 fontName="Courier", backColor=colors.HexColor("#1A1E27"),
-                                 leftIndent=8, rightIndent=8, spaceBefore=4, spaceAfter=4))]]
-        prio_table = Table(hdr_row + body_row, colWidths=[avail])
+    for idx, (title, items, txt_col, hdr_bg, border_col, body_bg) in enumerate(prio_sections):
+        # Header row — bold colored title on light background
+        hdr_cell = Paragraph(
+            f"<b>{title}</b>",
+            S(f"ph{idx}", fontSize=11, textColor=txt_col, fontName="Helvetica-Bold")
+        )
+        # Body rows — one Paragraph per item, white text on medium-light background
+        item_lines = items if items else ["Sin hallazgos en esta categoria"]
+        body_paragraphs = [
+            Paragraph(
+                f"  -  {item}",
+                S(f"pb{idx}_{i}", fontSize=9, leading=15,
+                  textColor=colors.HexColor("#1A1A2E"),
+                  fontName="Helvetica", leftIndent=4)
+            )
+            for i, item in enumerate(item_lines)
+        ]
+
+        # Build as a two-row table: header | body
+        prio_table = Table(
+            [[hdr_cell], [body_paragraphs]],
+            colWidths=[avail]
+        )
         prio_table.setStyle(TableStyle([
-            ("BACKGROUND",    (0,0), (0,0),  bg_col),
-            ("BACKGROUND",    (0,1), (0,-1), colors.HexColor("#1A1E27")),
-            ("TOPPADDING",    (0,0), (-1,-1), 8),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-            ("LEFTPADDING",   (0,0), (-1,-1), 12),
-            ("BOX",           (0,0), (-1,-1), 1, border_col),
-            ("LINEBELOW",     (0,0), (0,0),   0.5, border_col),
-            ("ROUNDEDCORNERS",[6]),
+            ("BACKGROUND",    (0, 0), (0, 0),  hdr_bg),
+            ("BACKGROUND",    (0, 1), (0, -1), body_bg),
+            ("TOPPADDING",    (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 14),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 14),
+            ("BOX",           (0, 0), (-1, -1), 1.2, border_col),
+            ("LINEBELOW",     (0, 0), (0,  0),  0.8, border_col),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
         ]))
-        story.append(KeepTogether([prio_table, Spacer(1, 0.22*cm)]))
+        story.append(KeepTogether([prio_table, Spacer(1, 0.25*cm)]))
 
     # ── Alerts detail ─────────────────────────────────────────────────────────
     if alerts:
