@@ -4315,9 +4315,10 @@ def _zap_pdf_report(s: dict, scan_id: str) -> "Response":
 import base64 as _b64
 
 def _ga(cmd_dict: dict) -> dict:
-    """Call QEMU guest agent via virsh."""
+    """Call QEMU guest agent via virsh (qemu:///system — required for system VMs)."""
     r = subprocess.run(
-        ["virsh", "qemu-agent-command", PENTEST_VM, json.dumps(cmd_dict)],
+        ["virsh", "-c", "qemu:///system", "qemu-agent-command",
+         PENTEST_VM, json.dumps(cmd_dict)],
         capture_output=True, text=True
     )
     try:
@@ -4490,11 +4491,26 @@ log "[+] Resultados en: $OUTPUT_DIR"
 ls -lh $OUTPUT_DIR/ >> $LOG 2>/dev/null
 log "======================================"
 '''
-    script_b64 = _b64.b64encode(script.encode()).decode()
+    # Use guest-file-write API — no shell escaping issues, handles any size
+    r_open = _ga({"execute": "guest-file-open",
+                  "arguments": {"path": PENTEST_SCRIPT, "mode": "w"}})
+    fh = r_open.get("return")
+    if fh is None:
+        return False
+
+    # Write script in 64KB chunks
+    raw = script.encode("utf-8")
+    for i in range(0, len(raw), 65536):
+        chunk_b64 = _b64.b64encode(raw[i:i + 65536]).decode()
+        _ga({"execute": "guest-file-write",
+             "arguments": {"handle": fh, "buf-b64": chunk_b64}})
+
+    _ga({"execute": "guest-file-close", "arguments": {"handle": fh}})
+
+    # Set permissions
     result = _ga_run(
-        f'echo "{script_b64}" | base64 -d > {PENTEST_SCRIPT} && '
-        f'chmod +x {PENTEST_SCRIPT} && echo OK',
-        wait=3
+        f"chmod +x {PENTEST_SCRIPT} && chown kali:kali {PENTEST_SCRIPT} && echo OK",
+        wait=2
     )
     return "OK" in result
 
