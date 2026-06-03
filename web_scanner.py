@@ -56,6 +56,10 @@ SERVER_PUBLIC_IP = _detect_server_public_ip()
 active_scans: dict[str, dict] = {}
 network_maps: dict[str, dict] = {}
 vpn_state = {"active": False, "client": "", "iface": ""}
+
+# ── ZAP ────────────────────────────────────────────────────────────────────────
+ZAP_URL   = "http://192.168.122.136:8090"
+zap_scans: dict[str, dict] = {}
 # Probe (sonda) state — registered probes and their scan results
 registered_probes: dict[str, dict] = {}   # vpn_ip → {name, subnets, last_seen, ...}
 probe_scan_results: dict[str, dict] = {}  # vpn_ip → {hosts: [...], timestamp, status}
@@ -3371,6 +3375,336 @@ td{{padding:3px 8px;border-bottom:1px solid #21262d;vertical-align:top}}
                         headers={"Content-Disposition": f"attachment; filename={safe_fname}"})
     return "fmt inválido", 400
 
+# ── ZAP Passive Scanner ────────────────────────────────────────────────────────
+
+def _zap_get(path: str, timeout: int = 30):
+    """Call ZAP REST API and return parsed JSON."""
+    import urllib.request, urllib.parse
+    url = ZAP_URL + path
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        raise RuntimeError(f"ZAP API error ({url}): {e}")
+
+
+def _run_zap_passive_scan(scan_id: str, target: str, use_ajax: bool, max_children: int):
+    import urllib.parse
+    state = zap_scans[scan_id]
+
+    def upd(msg, **kw):
+        state["status"] = msg
+        state.update(kw)
+
+    try:
+        # ── 0. Verify ZAP is up ───────────────────────────────────────────────
+        upd("Verificando conexión con ZAP...")
+        ver = _zap_get("/JSON/core/view/version/")
+        upd(f"ZAP {ver.get('version','?')} conectado. Iniciando sesión...")
+
+        # ── 1. New session ────────────────────────────────────────────────────
+        _zap_get("/JSON/core/action/newSession/?overwrite=true")
+        _zap_get("/JSON/pscan/action/enableAllScanners/")
+        upd("Sesión ZAP lista. Configurando spider...")
+
+        # ── 2. Set scan context ───────────────────────────────────────────────
+        enc = urllib.parse.quote(target, safe="")
+
+        # ── 3. Spider tradicional ─────────────────────────────────────────────
+        state["phase"] = "spider"
+        upd(f"Spider explorando {target}...")
+        r = _zap_get(f"/JSON/spider/action/scan/?url={enc}&recurse=true&maxChildren={max_children}")
+        spider_id = r.get("scan", "0")
+
+        while True:
+            prog = int(_zap_get(f"/JSON/spider/view/status/?scanId={spider_id}").get("status", 0))
+            state["spider_pct"] = prog
+            urls_r = _zap_get(f"/JSON/spider/view/results/?scanId={spider_id}")
+            state["urls"] = urls_r.get("results", [])
+            upd(f"Spider: {prog}% — {len(state['urls'])} URLs encontradas")
+            if prog >= 100:
+                break
+            time.sleep(2)
+
+        upd(f"Spider completado. {len(state['urls'])} URLs. Obteniendo formularios...")
+
+        # ── 4. Forms & inputs ─────────────────────────────────────────────────
+        try:
+            forms_r = _zap_get(f"/JSON/spider/view/fullResults/?scanId={spider_id}")
+            state["forms"] = [
+                u for u in forms_r.get("fullResults", {}).get("urlsInScope", [])
+                if u.get("method", "GET").upper() == "POST"
+            ]
+        except Exception:
+            state["forms"] = []
+
+        # ── 5. AJAX Spider ────────────────────────────────────────────────────
+        if use_ajax:
+            state["phase"] = "ajax"
+            upd(f"AJAX Spider explorando contenido JavaScript...")
+            _zap_get(f"/JSON/ajaxSpider/action/scan/?url={enc}&inScope=false")
+
+            elapsed = 0
+            while elapsed < 120:
+                s = _zap_get("/JSON/ajaxSpider/view/status/")
+                ajax_st = s.get("status", "stopped")
+                state["ajax_status"] = ajax_st
+                upd(f"AJAX Spider: {ajax_st}")
+                if ajax_st == "stopped":
+                    break
+                # Merge URLs
+                try:
+                    extra = _zap_get("/JSON/core/view/urls/").get("urls", [])
+                    combined = list(set(state["urls"] + extra))
+                    state["urls"] = combined
+                except Exception:
+                    pass
+                time.sleep(3)
+                elapsed += 3
+            upd(f"AJAX Spider completado. {len(state['urls'])} URLs totales.")
+
+        # ── 6. Wait for passive scan ──────────────────────────────────────────
+        state["phase"] = "passive"
+        upd("Esperando que el escaneo pasivo procese todas las URLs...")
+        elapsed = 0
+        while elapsed < 180:
+            remaining = int(_zap_get("/JSON/pscan/view/recordsToScan/").get("recordsToScan", 0))
+            state["passive_remaining"] = remaining
+            upd(f"Escaneo pasivo: {remaining} registros pendientes...")
+            if remaining == 0:
+                break
+            time.sleep(2)
+            elapsed += 2
+
+        # ── 7. Collect alerts ─────────────────────────────────────────────────
+        state["phase"] = "alerts"
+        upd("Recopilando alertas y hallazgos...")
+        alerts_r = _zap_get(f"/JSON/core/view/alerts/?baseurl={enc}&start=0&count=2000")
+        raw_alerts = alerts_r.get("alerts", [])
+
+        # Deduplicate by (name, url)
+        seen, alerts = set(), []
+        for a in raw_alerts:
+            key = (a.get("name",""), a.get("url",""))
+            if key not in seen:
+                seen.add(key)
+                alerts.append({
+                    "risk":        a.get("risk", "Informational"),
+                    "confidence":  a.get("confidence", "Low"),
+                    "name":        a.get("name", ""),
+                    "url":         a.get("url", ""),
+                    "description": a.get("description", "")[:300],
+                    "solution":    a.get("solution", "")[:300],
+                    "reference":   a.get("reference", ""),
+                    "cweid":       a.get("cweid", ""),
+                    "wascid":      a.get("wascid", ""),
+                    "param":       a.get("param", ""),
+                    "attack":      a.get("attack", ""),
+                    "evidence":    a.get("evidence", "")[:100],
+                })
+        state["alerts"] = sorted(alerts, key=lambda x: {"High":0,"Medium":1,"Low":2,"Informational":3}.get(x["risk"],4))
+
+        # ── 8. Final URL list from core ───────────────────────────────────────
+        try:
+            all_urls = _zap_get("/JSON/core/view/urls/").get("urls", [])
+            state["urls"] = list(set(state.get("urls",[]) + all_urls))
+        except Exception:
+            pass
+
+        # Counts
+        counts = {"High":0,"Medium":0,"Low":0,"Informational":0}
+        for a in state["alerts"]:
+            counts[a["risk"]] = counts.get(a["risk"], 0) + 1
+        state["counts"] = counts
+
+        upd(f"Completado: {len(state['alerts'])} alertas | {len(state['urls'])} URLs | "
+            f"{counts['High']} Altos | {counts['Medium']} Medios", phase="done")
+
+    except Exception as e:
+        state["error"] = str(e)
+        state["status"] = f"Error: {e}"
+        state["phase"] = "error"
+    finally:
+        state["done"] = True
+
+
+@app.route("/api/zap/check")
+def api_zap_check():
+    try:
+        r = _zap_get("/JSON/core/view/version/", timeout=5)
+        return jsonify({"ok": True, "version": r.get("version","?"), "url": ZAP_URL})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "url": ZAP_URL})
+
+
+@app.route("/api/zap/scan", methods=["POST"])
+def api_zap_scan():
+    data        = request.json or {}
+    target      = data.get("target", "").strip()
+    use_ajax    = data.get("ajax_spider", True)
+    max_children= int(data.get("max_children", 10))
+
+    if not target:
+        return jsonify({"error": "target requerido"}), 400
+    if not re.match(r'^https?://', target):
+        return jsonify({"error": "URL debe empezar con http:// o https://"}), 400
+
+    scan_id = str(uuid.uuid4())[:8]
+    zap_scans[scan_id] = {
+        "id": scan_id, "target": target, "start": now_str(),
+        "phase": "init", "status": "Iniciando...",
+        "spider_pct": 0, "ajax_status": "pending",
+        "passive_remaining": 0,
+        "urls": [], "forms": [], "alerts": [],
+        "counts": {"High":0,"Medium":0,"Low":0,"Informational":0},
+        "done": False, "error": None,
+    }
+    threading.Thread(
+        target=_run_zap_passive_scan,
+        args=(scan_id, target, use_ajax, max_children),
+        daemon=True
+    ).start()
+    return jsonify({"scan_id": scan_id})
+
+
+@app.route("/api/zap/stream/<scan_id>")
+def api_zap_stream(scan_id):
+    def generate():
+        last_status = None
+        while True:
+            s = zap_scans.get(scan_id)
+            if not s:
+                yield f"data: {json.dumps({'error': 'scan_id inválido'})}\n\n"
+                break
+            payload = {
+                "status":            s["status"],
+                "phase":             s["phase"],
+                "spider_pct":        s["spider_pct"],
+                "ajax_status":       s["ajax_status"],
+                "passive_remaining": s["passive_remaining"],
+                "url_count":         len(s["urls"]),
+                "alert_count":       len(s["alerts"]),
+                "counts":            s["counts"],
+                "done":              s["done"],
+                "error":             s["error"],
+            }
+            if payload["status"] != last_status or payload["done"]:
+                last_status = payload["status"]
+                yield f"data: {json.dumps(payload)}\n\n"
+            if s["done"]:
+                break
+            time.sleep(1)
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+
+@app.route("/api/zap/results/<scan_id>")
+def api_zap_results(scan_id):
+    s = zap_scans.get(scan_id)
+    if not s:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({
+        "alerts": s["alerts"],
+        "urls":   s["urls"][:500],
+        "forms":  s["forms"][:100],
+        "counts": s["counts"],
+    })
+
+
+@app.route("/api/zap/report/<scan_id>")
+def api_zap_report(scan_id):
+    """Generate self-contained HTML executive report for ZAP scan."""
+    import html as _h
+    s = zap_scans.get(scan_id)
+    if not s:
+        return "Not found", 404
+
+    def e(v): return _h.escape(str(v or ""))
+
+    counts  = s.get("counts", {})
+    alerts  = s.get("alerts", [])
+    urls    = s.get("urls", [])
+    target  = s.get("target","")
+    total_a = len(alerts)
+
+    risk_color = {"High":"#C94040","Medium":"#D4780A","Low":"#2274C8","Informational":"#5C6B8A"}
+    risk_bg    = {"High":"#FCEBEB","Medium":"#FAEEDA","Low":"#E6F1FB","Informational":"#F0F2F6"}
+
+    rows = ""
+    for a in alerts:
+        rc = risk_color.get(a["risk"],"#999")
+        bg = risk_bg.get(a["risk"],"#fff")
+        rows += (f'<tr style="background:{bg}">'
+                 f'<td><span style="color:{rc};font-weight:700">{e(a["risk"])}</span></td>'
+                 f'<td>{e(a["name"])}</td>'
+                 f'<td style="font-family:monospace;font-size:11px;word-break:break-all">{e(a["url"][:80])}</td>'
+                 f'<td style="font-size:11px">{e(a["param"])}</td>'
+                 f'<td style="font-size:11px">{e(a["description"][:120])}</td>'
+                 f'</tr>')
+
+    url_list = "".join(f"<li style='font-family:monospace;font-size:11px'>{e(u)}</li>" for u in sorted(urls)[:200])
+
+    html = f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+<title>ZAP Passive Scan — {e(target)}</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#F4F6F9;color:#1A1A2E;margin:0}}
+.page{{max-width:1100px;margin:24px auto;background:#fff;border-radius:10px;
+       box-shadow:0 4px 24px rgba(0,0,0,.10);overflow:hidden}}
+.hdr{{background:linear-gradient(135deg,#0D1B2A,#1B3556);color:#fff;padding:28px 36px}}
+.hdr h1{{font-size:20px;margin:0 0 4px}}
+.hdr p{{color:#A8C4DC;margin:0;font-size:13px}}
+.body{{padding:28px 36px}}
+.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:28px}}
+.card{{border-radius:8px;padding:14px;text-align:center;border:1px solid}}
+.card .n{{font-size:32px;font-weight:800;line-height:1}}
+.card .l{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;margin-top:4px}}
+h2{{font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+    color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:6px;margin:24px 0 14px}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+th{{background:#2c3e50;color:#fff;padding:8px 10px;text-align:left;font-size:11px}}
+td{{padding:7px 10px;border-bottom:1px solid #E0E6EF;vertical-align:top}}
+tr:hover td{{background:#F8FAFC}}
+ul{{margin:0;padding-left:18px;columns:2;column-gap:20px}}
+li{{margin-bottom:3px;break-inside:avoid}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700}}
+@media print{{.page{{box-shadow:none}}}}
+</style></head><body>
+<div class="page">
+<div class="hdr">
+  <h1>🔍 ZAP Passive Scan Report</h1>
+  <p>Target: <strong style="color:#7EC8E3">{e(target)}</strong> &nbsp;|&nbsp;
+     Fecha: {e(s.get('start',''))} &nbsp;|&nbsp;
+     URLs descubiertas: {len(urls)} &nbsp;|&nbsp;
+     Alertas: {total_a}</p>
+</div>
+<div class="body">
+<div class="cards">
+  <div class="card" style="background:#FCEBEB;border-color:#F09595;color:#A32D2D">
+    <div class="n">{counts.get('High',0)}</div><div class="l">Alto</div></div>
+  <div class="card" style="background:#FAEEDA;border-color:#FAC775;color:#854F0B">
+    <div class="n">{counts.get('Medium',0)}</div><div class="l">Medio</div></div>
+  <div class="card" style="background:#E6F1FB;border-color:#B5D4F4;color:#185FA5">
+    <div class="n">{counts.get('Low',0)}</div><div class="l">Bajo</div></div>
+  <div class="card" style="background:#F0F2F6;border-color:#DDE2EC;color:#5C6B8A">
+    <div class="n">{counts.get('Informational',0)}</div><div class="l">Info</div></div>
+  <div class="card" style="background:#EAF3DE;border-color:#C0DD97;color:#3B6D11">
+    <div class="n">{len(urls)}</div><div class="l">URLs</div></div>
+</div>
+<h2>Alertas de seguridad ({total_a})</h2>
+<table>
+  <tr><th>Riesgo</th><th>Vulnerabilidad</th><th>URL</th><th>Parámetro</th><th>Descripción</th></tr>
+  {rows if rows else '<tr><td colspan="5" style="text-align:center;color:#3B6D11;padding:20px">✓ Sin alertas detectadas</td></tr>'}
+</table>
+<h2>URLs descubiertas ({len(urls)})</h2>
+<ul>{url_list}</ul>
+</div></div></body></html>"""
+
+    fname = f"zap_report_{re.sub(r'[^a-zA-Z0-9._-]','_',target)}_{scan_id}.html"
+    return Response(html, mimetype="text/html",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+
 # ── Static assets (JS libs served locally — no CDN dependency) ─────────────────
 
 @app.route("/static/<path:filename>")
@@ -3453,6 +3787,21 @@ select option{background:var(--bg3)}
 .btn-orange{background:#9a5700;color:#fff}
 .btn-gray{background:var(--bg4);color:var(--fg)}
 .btn-pdf{background:#7c3aed;color:#fff}
+/* ZAP Scanner */
+.zap-phase{background:var(--bg3);border-radius:8px;padding:10px 12px}
+.zp-label{font-size:.72rem;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.zp-bar-bg{height:6px;background:var(--bg4);border-radius:3px;overflow:hidden;margin-bottom:4px}
+.zp-bar{height:100%;background:var(--blue);border-radius:3px;transition:width .6s ease}
+.zp-bar.done{background:var(--green)}
+.zp-bar.err{background:var(--red)}
+.zp-pct{font-size:.7rem;color:var(--dim)}
+.zap-card{border-radius:8px;padding:14px 12px;text-align:center}
+.zap-filter{border-radius:20px;padding:3px 10px;font-size:.72rem;font-weight:700;cursor:pointer;transition:.15s}
+.zap-filter.active{outline:2px solid var(--blue)}
+.zap-risk-High{color:var(--c-crit);font-weight:700}
+.zap-risk-Medium{color:var(--c-high);font-weight:700}
+.zap-risk-Low{color:var(--c-low);font-weight:700}
+.zap-risk-Informational{color:var(--dim);font-weight:600}
 .btn-sm{padding:4px 10px;font-size:.78rem}
 .scan-config{padding:12px 16px;border-bottom:1px solid var(--bg4);flex-shrink:0}
 .toolbar{display:flex;gap:8px;padding:8px 16px;border-bottom:1px solid var(--bg4);
@@ -3716,6 +4065,7 @@ select option{background:var(--bg3)}
       <div class="tab" id="tab-btn-nebula"   onclick="showTab('nebula',this);loadNebulaTab()">&#x1F300; Nebula VPN</div>
       <div class="tab" id="tab-btn-fuzz"     onclick="showTab('fuzz',this)">&#x1F4A5; Pentesting Externo</div>
       <div class="tab" id="tab-btn-chisel"   onclick="showTab('chisel',this);loadChiselStatus()">&#x1F50C; T&uacute;nel Chisel</div>
+      <div class="tab" id="tab-btn-zap"      onclick="showTab('zap',this);zapCheckStatus()">&#x1F50D; ZAP Scanner</div>
     </div>
 
     <!-- SCANNER TAB -->
@@ -4299,6 +4649,174 @@ select option{background:var(--bg3)}
       <button class="btn btn-gray btn-sm" onclick="refreshChiselLog()">&#x21BB; Refrescar log</button>
     </div>
     <pre id="cs-log" style="background:var(--bg1);border:1px solid var(--bg4);border-radius:8px;padding:12px;font-size:.75rem;max-height:200px;overflow:auto;white-space:pre-wrap">— sin log aún —</pre>
+  </div>
+
+</div>
+
+<!-- ══ ZAP PASSIVE SCANNER TAB ══════════════════════════════════════════ -->
+<div class="tab-content" id="tab-zap" style="flex-direction:column;overflow:auto;padding:20px;gap:16px">
+
+  <!-- Header -->
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <div>
+      <h2 style="margin:0;font-size:1rem;color:var(--blue)">&#x1F50D; ZAP Passive Scanner — Exploración Automática</h2>
+      <p style="margin:4px 0 0;font-size:.78rem;color:var(--dim)">Spider + AJAX Spider + Escaneo Pasivo — sin modificar el sitio objetivo</p>
+    </div>
+    <div id="zapStatusBadge" style="margin-left:auto;padding:4px 14px;border-radius:20px;font-size:.75rem;font-weight:700;background:var(--bg3);color:var(--dim)">
+      Verificando ZAP...
+    </div>
+  </div>
+
+  <!-- Config form -->
+  <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px;display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end">
+    <div class="form-group" style="flex:2;min-width:260px">
+      <label>URL objetivo</label>
+      <input id="zapTarget" type="url" placeholder="https://datacom.ec" autocomplete="off">
+    </div>
+    <div class="form-group" style="flex:0 0 140px">
+      <label>Máx. URLs por nivel</label>
+      <input id="zapMaxChildren" type="number" value="10" min="1" max="50" style="width:100%">
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding-bottom:4px">
+      <input type="checkbox" id="zapAjax" checked style="width:14px;height:14px">
+      <label for="zapAjax" style="font-size:.82rem;color:var(--fg);cursor:pointer">AJAX Spider (JS)</label>
+    </div>
+    <button class="btn btn-blue" id="zapBtnScan" onclick="zapStartScan()" style="padding:8px 20px">
+      &#x25B6; Iniciar Escaneo
+    </button>
+    <button class="btn btn-red" id="zapBtnStop" onclick="zapStopScan()" disabled style="padding:8px 16px">
+      &#x25A0; Detener
+    </button>
+  </div>
+
+  <!-- Progress -->
+  <div id="zapProgress" style="display:none;background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:16px;gap:12px;flex-direction:column">
+    <div id="zapStatusMsg" style="font-size:.85rem;color:var(--fg);font-weight:600">Iniciando...</div>
+
+    <!-- Phase indicators -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px">
+      <div class="zap-phase" id="zp-spider">
+        <div class="zp-label">&#x1F578; Spider</div>
+        <div class="zp-bar-bg"><div class="zp-bar" id="zp-spider-bar" style="width:0%"></div></div>
+        <div class="zp-pct" id="zp-spider-pct">0%</div>
+      </div>
+      <div class="zap-phase" id="zp-ajax">
+        <div class="zp-label">&#x26A1; AJAX Spider</div>
+        <div class="zp-bar-bg"><div class="zp-bar" id="zp-ajax-bar" style="width:0%"></div></div>
+        <div class="zp-pct" id="zp-ajax-pct">—</div>
+      </div>
+      <div class="zap-phase" id="zp-passive">
+        <div class="zp-label">&#x1F6E1; Pasivo</div>
+        <div class="zp-bar-bg"><div class="zp-bar" id="zp-passive-bar" style="width:100%"></div></div>
+        <div class="zp-pct" id="zp-passive-pct">pendiente</div>
+      </div>
+      <div class="zap-phase" id="zp-alerts">
+        <div class="zp-label">&#x26A0; Alertas</div>
+        <div class="zp-bar-bg"><div class="zp-bar" id="zp-alerts-bar" style="width:0%;background:var(--c-high)"></div></div>
+        <div class="zp-pct" id="zp-alerts-pct">0</div>
+      </div>
+    </div>
+
+    <!-- Live counters -->
+    <div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:4px">
+      <span style="font-size:.78rem;color:var(--dim)">URLs: <b id="zapUrlCount" style="color:var(--blue)">0</b></span>
+      <span style="font-size:.78rem;color:var(--c-crit)">Alto: <b id="zapCntH">0</b></span>
+      <span style="font-size:.78rem;color:var(--c-high)">Medio: <b id="zapCntM">0</b></span>
+      <span style="font-size:.78rem;color:var(--c-low)">Bajo: <b id="zapCntL">0</b></span>
+      <span style="font-size:.78rem;color:var(--dim)">Info: <b id="zapCntI">0</b></span>
+    </div>
+  </div>
+
+  <!-- Results tabs -->
+  <div id="zapResults" style="display:none;flex-direction:column;gap:14px">
+    <!-- Summary cards -->
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px">
+      <div class="zap-card" style="background:#FCEBEB;border:1px solid #F09595;color:#A32D2D">
+        <div style="font-size:28px;font-weight:800;line-height:1" id="rcH">0</div>
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-top:4px">Alto</div>
+      </div>
+      <div class="zap-card" style="background:#FAEEDA;border:1px solid #FAC775;color:#854F0B">
+        <div style="font-size:28px;font-weight:800;line-height:1" id="rcM">0</div>
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-top:4px">Medio</div>
+      </div>
+      <div class="zap-card" style="background:#E6F1FB;border:1px solid #B5D4F4;color:#185FA5">
+        <div style="font-size:28px;font-weight:800;line-height:1" id="rcL">0</div>
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-top:4px">Bajo</div>
+      </div>
+      <div class="zap-card" style="background:#F0F2F6;border:1px solid #DDE2EC;color:#5C6B8A">
+        <div style="font-size:28px;font-weight:800;line-height:1" id="rcI">0</div>
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-top:4px">Info</div>
+      </div>
+      <div class="zap-card" style="background:#EAF3DE;border:1px solid #C0DD97;color:#3B6D11">
+        <div style="font-size:28px;font-weight:800;line-height:1" id="rcU">0</div>
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-top:4px">URLs</div>
+      </div>
+    </div>
+
+    <!-- Export button -->
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-pdf" id="zapBtnReport" onclick="zapDownloadReport()" style="display:none">
+        &#x1F4CA; Descargar Reporte HTML
+      </button>
+      <span style="font-size:.78rem;color:var(--dim)" id="zapScanMeta"></span>
+    </div>
+
+    <!-- Alerts filter -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <span style="font-size:.78rem;color:var(--dim);font-weight:700">Filtrar:</span>
+      <button class="btn btn-sm zap-filter active" data-risk="all"    onclick="zapFilter('all',this)"   style="background:#2c3e50;color:#fff">Todos</button>
+      <button class="btn btn-sm zap-filter"         data-risk="High"   onclick="zapFilter('High',this)"  style="background:#FCEBEB;color:#A32D2D;border:1px solid #F09595">Alto</button>
+      <button class="btn btn-sm zap-filter"         data-risk="Medium" onclick="zapFilter('Medium',this)"style="background:#FAEEDA;color:#854F0B;border:1px solid #FAC775">Medio</button>
+      <button class="btn btn-sm zap-filter"         data-risk="Low"    onclick="zapFilter('Low',this)"   style="background:#E6F1FB;color:#185FA5;border:1px solid #B5D4F4">Bajo</button>
+      <button class="btn btn-sm zap-filter"         data-risk="Informational" onclick="zapFilter('Informational',this)" style="background:#F0F2F6;color:#5C6B8A">Info</button>
+      <input id="zapSearchAlert" type="text" placeholder="Buscar alerta..." oninput="zapSearch(this.value)"
+             style="margin-left:auto;max-width:200px;padding:4px 8px;border-radius:6px;
+                    background:var(--bg3);border:1px solid var(--bg4);color:var(--fg);font-size:.82rem">
+    </div>
+
+    <!-- Alerts table -->
+    <div style="overflow-x:auto;border:1px solid var(--bg4);border-radius:8px">
+      <table style="width:100%;border-collapse:collapse;font-size:.8rem">
+        <thead>
+          <tr style="background:var(--bg3)">
+            <th style="padding:8px 10px;text-align:left;white-space:nowrap;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Riesgo</th>
+            <th style="padding:8px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Vulnerabilidad</th>
+            <th style="padding:8px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">URL</th>
+            <th style="padding:8px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Parámetro</th>
+            <th style="padding:8px 10px;text-align:left;color:var(--dim);font-size:.72rem;font-weight:700;text-transform:uppercase">Acciones</th>
+          </tr>
+        </thead>
+        <tbody id="zapAlertsBody"></tbody>
+      </table>
+      <div id="zapNoAlerts" style="display:none;text-align:center;padding:24px;color:var(--green);font-size:.85rem">
+        ✓ Sin alertas para el filtro seleccionado
+      </div>
+    </div>
+
+    <!-- URL list -->
+    <div>
+      <div style="font-size:.78rem;font-weight:700;color:var(--dim);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px">
+        URLs descubiertas (<span id="zapUrlTotal">0</span>)
+      </div>
+      <div id="zapUrlList" style="background:var(--bg2);border:1px solid var(--bg4);border-radius:8px;
+           padding:10px;max-height:220px;overflow-y:auto;font-family:'Courier New',monospace;font-size:.72rem;
+           display:grid;grid-template-columns:1fr 1fr;gap:2px 16px;color:var(--blue)">
+      </div>
+    </div>
+  </div>
+
+  <!-- Alert detail modal -->
+  <div id="zapModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;
+       align-items:center;justify-content:center">
+    <div style="background:var(--bg2);border:1px solid var(--bg4);border-radius:10px;padding:24px;
+                max-width:640px;width:95vw;max-height:80vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <h3 id="zmTitle" style="margin:0;font-size:.95rem;color:var(--blue)"></h3>
+        <button onclick="document.getElementById('zapModal').style.display='none'"
+                style="background:none;border:none;color:var(--dim);font-size:1.2rem;cursor:pointer">✕</button>
+      </div>
+      <div id="zmBody" style="font-size:.82rem;line-height:1.7;color:var(--fg)"></div>
+    </div>
   </div>
 
 </div>
@@ -6140,6 +6658,220 @@ function copyCmd(id) {
     btns.forEach(b => { const orig = b.textContent; b.textContent = '✓ Copiado'; setTimeout(()=>b.textContent=orig,1500); });
   });
 }
+
+// ── ZAP Passive Scanner ────────────────────────────────────────────────────────
+let zapCurrentScan = null;
+let zapSSE         = null;
+let zapAllAlerts   = [];
+let zapAllUrls     = [];
+let zapRiskFilter  = 'all';
+
+async function zapCheckStatus() {
+  const badge = document.getElementById('zapStatusBadge');
+  try {
+    const r = await fetch('/api/zap/check');
+    const d = await r.json();
+    if (d.ok) {
+      badge.textContent = '✓ ZAP ' + d.version + ' conectado';
+      badge.style.background = '#1a3a1a';
+      badge.style.color = 'var(--green)';
+    } else {
+      badge.textContent = '✗ ZAP no disponible';
+      badge.style.background = '#3a1a1a';
+      badge.style.color = 'var(--red)';
+    }
+  } catch(e) {
+    badge.textContent = '✗ Error conectando ZAP';
+    badge.style.background = '#3a1a1a';
+    badge.style.color = 'var(--red)';
+  }
+}
+
+async function zapStartScan() {
+  const target = document.getElementById('zapTarget').value.trim();
+  if (!target) { alert('Ingresa una URL objetivo (ej: https://datacom.ec)'); return; }
+  if (!target.startsWith('http')) { alert('La URL debe empezar con http:// o https://'); return; }
+
+  const useAjax     = document.getElementById('zapAjax').checked;
+  const maxChildren = parseInt(document.getElementById('zapMaxChildren').value) || 10;
+
+  // Reset UI
+  document.getElementById('zapProgress').style.display = 'flex';
+  document.getElementById('zapResults').style.display  = 'none';
+  document.getElementById('zapBtnScan').disabled = true;
+  document.getElementById('zapBtnStop').disabled = false;
+  document.getElementById('zapBtnReport') && (document.getElementById('zapBtnReport').style.display = 'none');
+  zapAllAlerts = []; zapAllUrls = [];
+  zapSetPhaseBar('spider', 0, false);
+  zapSetPhaseBar('ajax',   0, false);
+
+  const r = await fetch('/api/zap/scan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({target, ajax_spider: useAjax, max_children: maxChildren})
+  });
+  const d = await r.json();
+  if (d.error) { alert('Error: ' + d.error); zapScanDone(); return; }
+
+  zapCurrentScan = d.scan_id;
+  document.getElementById('zapScanMeta').textContent = 'Scan ID: ' + d.scan_id + '  |  Target: ' + target;
+
+  if (zapSSE) zapSSE.close();
+  zapSSE = new EventSource('/api/zap/stream/' + d.scan_id);
+  zapSSE.onmessage = e => {
+    const d = JSON.parse(e.data);
+    zapUpdateProgress(d);
+    if (d.done) { zapSSE.close(); zapFetchResults(zapCurrentScan); zapScanDone(); }
+  };
+}
+
+function zapUpdateProgress(d) {
+  document.getElementById('zapStatusMsg').textContent = d.status || '';
+  document.getElementById('zapUrlCount').textContent  = d.url_count || 0;
+  const c = d.counts || {};
+  document.getElementById('zapCntH').textContent = c.High          || 0;
+  document.getElementById('zapCntM').textContent = c.Medium        || 0;
+  document.getElementById('zapCntL').textContent = c.Low           || 0;
+  document.getElementById('zapCntI').textContent = c.Informational || 0;
+
+  // Spider bar
+  if (d.spider_pct !== undefined) {
+    zapSetPhaseBar('spider', d.spider_pct, d.spider_pct >= 100);
+    document.getElementById('zp-spider-pct').textContent = d.spider_pct + '%';
+  }
+  // AJAX bar
+  const aj = d.ajax_status;
+  if (aj === 'running') {
+    zapSetPhaseBar('ajax', 50, false);
+    document.getElementById('zp-ajax-pct').textContent = 'explorando...';
+  } else if (aj === 'stopped' || d.phase === 'passive' || d.phase === 'alerts' || d.phase === 'done') {
+    zapSetPhaseBar('ajax', 100, true);
+    document.getElementById('zp-ajax-pct').textContent = '✓';
+  }
+  // Passive bar
+  if (d.phase === 'passive') {
+    const rem = d.passive_remaining || 0;
+    document.getElementById('zp-passive-pct').textContent = rem + ' pendientes';
+    zapSetPhaseBar('passive', rem === 0 ? 100 : 60, rem === 0);
+  } else if (d.phase === 'alerts' || d.phase === 'done') {
+    zapSetPhaseBar('passive', 100, true);
+    document.getElementById('zp-passive-pct').textContent = '✓';
+  }
+  // Alerts bar (visual cue)
+  const total = (c.High||0)+(c.Medium||0)+(c.Low||0)+(c.Informational||0);
+  document.getElementById('zp-alerts-pct').textContent = total;
+  if (total > 0) document.getElementById('zp-alerts-bar').style.width = Math.min(total*2, 100) + '%';
+}
+
+function zapSetPhaseBar(phase, pct, done) {
+  const bar = document.getElementById('zp-' + phase + '-bar');
+  if (!bar) return;
+  bar.style.width = pct + '%';
+  bar.classList.toggle('done', done);
+}
+
+async function zapFetchResults(scanId) {
+  try {
+    const r = await fetch('/api/zap/results/' + scanId);
+    const d = await r.json();
+    zapAllAlerts = d.alerts || [];
+    zapAllUrls   = d.urls   || [];
+    const c = d.counts || {};
+    document.getElementById('rcH').textContent = c.High          || 0;
+    document.getElementById('rcM').textContent = c.Medium        || 0;
+    document.getElementById('rcL').textContent = c.Low           || 0;
+    document.getElementById('rcI').textContent = c.Informational || 0;
+    document.getElementById('rcU').textContent = zapAllUrls.length;
+    document.getElementById('zapUrlTotal').textContent = zapAllUrls.length;
+    document.getElementById('zapResults').style.display = 'flex';
+    document.getElementById('zapBtnReport').style.display = 'inline-flex';
+    zapRenderAlerts();
+    zapRenderUrls();
+  } catch(e) { console.error('ZAP results error', e); }
+}
+
+function zapRenderAlerts() {
+  const tbody = document.getElementById('zapAlertsBody');
+  const none  = document.getElementById('zapNoAlerts');
+  const search = (document.getElementById('zapSearchAlert').value || '').toLowerCase();
+  const filtered = zapAllAlerts.filter(a =>
+    (zapRiskFilter === 'all' || a.risk === zapRiskFilter) &&
+    (!search || a.name.toLowerCase().includes(search) || (a.url||'').toLowerCase().includes(search))
+  );
+  tbody.innerHTML = '';
+  if (!filtered.length) { none.style.display = 'block'; return; }
+  none.style.display = 'none';
+  const riskColor = {High:'#A32D2D',Medium:'#854F0B',Low:'#185FA5',Informational:'#5C6B8A'};
+  const riskBg    = {High:'rgba(252,235,235,.35)',Medium:'rgba(250,238,218,.35)',
+                     Low:'rgba(230,241,251,.35)',Informational:'transparent'};
+  filtered.forEach(a => {
+    const tr = document.createElement('tr');
+    tr.style.background = riskBg[a.risk] || 'transparent';
+    tr.innerHTML =
+      `<td style="white-space:nowrap"><span style="color:${riskColor[a.risk]||'#999'};font-weight:700;font-size:.75rem">${esc(a.risk)}</span></td>` +
+      `<td style="font-weight:600;font-size:.8rem">${esc(a.name)}</td>` +
+      `<td style="font-family:'Courier New',monospace;font-size:.7rem;word-break:break-all;max-width:220px">${esc((a.url||'').substring(0,80))}</td>` +
+      `<td style="font-family:monospace;font-size:.75rem;color:var(--yellow)">${esc(a.param||'—')}</td>` +
+      `<td><button class="btn btn-gray btn-sm" onclick="zapShowDetail(${zapAllAlerts.indexOf(a)})" style="padding:2px 8px;font-size:.7rem">Ver</button></td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function zapRenderUrls() {
+  const el = document.getElementById('zapUrlList');
+  el.innerHTML = zapAllUrls.slice(0,400).map(u =>
+    `<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(u)}">${esc(u)}</div>`
+  ).join('');
+}
+
+function zapFilter(risk, btn) {
+  zapRiskFilter = risk;
+  document.querySelectorAll('.zap-filter').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  zapRenderAlerts();
+}
+
+function zapSearch(val) { zapRenderAlerts(); }
+
+function zapShowDetail(idx) {
+  const a = zapAllAlerts[idx];
+  if (!a) return;
+  const rColor = {High:'#A32D2D',Medium:'#854F0B',Low:'#185FA5',Informational:'#5C6B8A'};
+  document.getElementById('zmTitle').textContent = a.name;
+  document.getElementById('zmTitle').style.color = rColor[a.risk] || 'var(--blue)';
+  document.getElementById('zmBody').innerHTML =
+    `<div style="margin-bottom:10px"><b>Riesgo:</b> <span style="color:${rColor[a.risk]||'#999'}">${esc(a.risk)}</span>
+     &nbsp;|&nbsp; <b>Confianza:</b> ${esc(a.confidence)}
+     ${a.cweid ? '&nbsp;|&nbsp; <b>CWE:</b> ' + esc(a.cweid) : ''}</div>` +
+    (a.url ? `<div style="margin-bottom:8px"><b>URL:</b> <code style="font-size:.78rem;word-break:break-all">${esc(a.url)}</code></div>` : '') +
+    (a.param ? `<div style="margin-bottom:8px"><b>Parámetro:</b> <code>${esc(a.param)}</code></div>` : '') +
+    (a.attack ? `<div style="margin-bottom:8px"><b>Ataque:</b> <code style="font-size:.75rem">${esc(a.attack)}</code></div>` : '') +
+    (a.evidence ? `<div style="margin-bottom:8px"><b>Evidencia:</b> <code style="font-size:.75rem">${esc(a.evidence)}</code></div>` : '') +
+    `<div style="margin-bottom:8px"><b>Descripción:</b><br><p style="margin:4px 0">${esc(a.description)}</p></div>` +
+    (a.solution ? `<div style="margin-bottom:8px"><b>Solución:</b><br><p style="margin:4px 0;color:var(--green)">${esc(a.solution)}</p></div>` : '');
+  document.getElementById('zapModal').style.display = 'flex';
+}
+
+function zapStopScan() {
+  if (zapSSE) { zapSSE.close(); zapSSE = null; }
+  zapScanDone();
+}
+
+function zapScanDone() {
+  document.getElementById('zapBtnScan').disabled = false;
+  document.getElementById('zapBtnStop').disabled = true;
+}
+
+function zapDownloadReport() {
+  if (zapCurrentScan) window.open('/api/zap/report/' + zapCurrentScan);
+}
+
+// Auto-check ZAP when tab loads
+window.addEventListener('load', () => {
+  // Check ZAP status if tab is active
+  if (document.getElementById('tab-zap') && document.getElementById('tab-zap').classList.contains('active'))
+    zapCheckStatus();
+});
 </script>
 </body>
 </html>
