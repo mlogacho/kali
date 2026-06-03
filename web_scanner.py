@@ -3615,6 +3615,120 @@ def api_zap_results(scan_id):
     })
 
 
+def _zap_build_priorities(alerts: list, urls: list) -> dict:
+    """
+    Build priority lists (CRITICO / IMPORTANTE / MENOR) from ZAP alerts.
+    Returns dict with three lists of action strings.
+    """
+    names     = {a["name"] for a in alerts}
+    risks     = {a["name"]: a["risk"] for a in alerts}
+    all_names = [a["name"] for a in alerts]
+
+    critico    = []
+    importante = []
+    menor      = []
+
+    # ── Known header findings → map to priority ────────────────────────────────
+    header_map = {
+        "X-Frame-Options Header Not Set":           ("critico",    "Agregar X-Frame-Options: SAMEORIGIN"),
+        "Content Security Policy (CSP) Header Not Found": ("critico", "Implementar Content Security Policy (CSP) básica"),
+        "Missing Anti-clickjacking Header":         ("critico",    "Agregar X-Frame-Options: SAMEORIGIN (anti-clickjacking)"),
+        "Strict-Transport-Security Header Not Set": ("importante", "Implementar HSTS (HTTP Strict-Transport-Security)"),
+        "X-Content-Type-Options Header Missing":    ("importante", "Agregar X-Content-Type-Options: nosniff"),
+        "Permissions Policy Header Not Set":        ("menor",      "Configurar Permissions-Policy header"),
+        "Referrer Policy Header Not Set":           ("menor",      "Agregar Referrer-Policy: strict-origin-when-cross-origin"),
+        "Cache-control Header Not Set":             ("menor",      "Configurar Cache-Control headers apropiados"),
+        "Timestamp Disclosure":                     ("menor",      "Ocultar timestamps en cabeceras HTTP"),
+        "Server Leaks Version Information":         ("menor",      "Ocultar versión del servidor (ServerTokens Prod)"),
+        "Server Leaks Information via X-Powered-By": ("menor",    "Eliminar header X-Powered-By"),
+        "X-Powered-By Information Leakage":         ("menor",      "Eliminar header X-Powered-By"),
+        "Information Disclosure - Suspicious Comments": ("menor",  "Eliminar comentarios sensibles del código fuente"),
+        "Subresource Integrity Attribute Missing":  ("importante", "Implementar Sub Resource Integrity (SRI) en scripts externos"),
+        "Cross-Domain JavaScript Source File Inclusion": ("importante", "Revisar inclusión de scripts de dominios externos"),
+        "Application Error Disclosure":             ("critico",    "Deshabilitar mensajes de error detallados en producción"),
+        "SQL Injection":                            ("critico",    "Corregir inyección SQL — usar consultas parametrizadas"),
+        "Cross Site Scripting (Reflected)":         ("critico",    "Corregir XSS reflejado — sanitizar entradas/salidas"),
+        "Cross Site Scripting (Stored)":            ("critico",    "Corregir XSS almacenado — sanitizar datos de usuario"),
+        "Remote File Inclusion":                    ("critico",    "Corregir inclusión remota de archivos"),
+        "Path Traversal":                           ("critico",    "Corregir path traversal — validar rutas de archivo"),
+        "Remote Code Execution":                    ("critico",    "Corregir ejecución remota de código"),
+        "Open Redirect":                            ("importante", "Corregir redirección abierta — validar URLs de destino"),
+        "Cookie Without Secure Flag":               ("importante", "Agregar atributo Secure a todas las cookies"),
+        "Cookie Without HttpOnly Flag":             ("importante", "Agregar atributo HttpOnly a cookies de sesión"),
+        "Cookie SameSite Attribute Missing":        ("importante", "Agregar atributo SameSite a cookies"),
+        "Session ID in URL Rewrite":                ("importante", "No transmitir Session ID en la URL"),
+        "Private IP Disclosure":                    ("menor",      "Evitar exponer IPs privadas en respuestas HTTP"),
+        "Hash Disclosure":                          ("importante", "Evitar exponer hashes en respuestas"),
+        "Insecure JSF ViewState":                   ("importante", "Cifrar ViewState de JSF"),
+        "Vulnerable JS Library":                    ("critico",    "Actualizar librerías JavaScript vulnerables"),
+        "CSP: Wildcard Directive":                  ("importante", "Corregir directivas wildcard en CSP"),
+        "User Agent Fuzzer":                        ("menor",      "Verificar comportamiento con diferentes User-Agents"),
+        "User Controllable HTML Element Attribute":  ("importante", "Sanitizar atributos HTML controlados por usuario"),
+        "Absence of Anti-CSRF Tokens":              ("importante", "Implementar tokens CSRF en formularios POST"),
+        "Anti-CSRF Tokens Check":                   ("importante", "Verificar validación de tokens CSRF en Contact Form 7"),
+        "Weak Authentication Method":               ("critico",    "Reforzar método de autenticación"),
+        "Directory Browsing":                       ("importante", "Deshabilitar listado de directorios en el servidor"),
+        "Source Code Disclosure":                   ("critico",    "Corregir exposición de código fuente"),
+    }
+
+    assigned = set()
+    for alert_name, priority_action in header_map.items():
+        if alert_name in names:
+            priority, action = priority_action
+            if priority == "critico":
+                critico.append(action)
+            elif priority == "importante":
+                importante.append(action)
+            else:
+                menor.append(action)
+            assigned.add(alert_name)
+
+    # ── Unmatched alerts by risk level ─────────────────────────────────────────
+    for a in alerts:
+        n = a["name"]
+        if n in assigned:
+            continue
+        r = a["risk"]
+        item = n[:80]
+        if r == "High":
+            critico.append(f"Corregir: {item}")
+        elif r == "Medium":
+            importante.append(f"Revisar: {item}")
+        elif r == "Low":
+            menor.append(f"Evaluar: {item}")
+        assigned.add(n)
+
+    # ── Always-add best practices if missing ──────────────────────────────────
+    if not any("CSP" in x or "Content Security" in x for x in critico + importante):
+        critico.append("Implementar Content Security Policy (CSP) básica")
+    if not any("X-Frame" in x or "clickjacking" in x for x in critico):
+        critico.append("Agregar X-Frame-Options: SAMEORIGIN")
+    if not any("HSTS" in x or "Strict-Transport" in x for x in importante):
+        importante.append("Implementar HSTS (HTTP Strict-Transport-Security)")
+    if not any("SRI" in x or "Integrity" in x for x in importante):
+        importante.append("Implementar Sub Resource Integrity (SRI) en scripts externos")
+    if not any("CSRF" in x for x in importante):
+        importante.append("Verificar tokens CSRF en formularios (Contact Form 7)")
+    if not any("Cache" in x for x in menor):
+        menor.append("Configurar Cache-Control headers apropiados")
+    if not any("X-Powered" in x or "Powered" in x for x in menor):
+        menor.append("Eliminar header X-Powered-By (evitar exposición de tecnología)")
+
+    # Deduplicate preserving order
+    def dedup(lst):
+        seen, out = set(), []
+        for x in lst:
+            if x not in seen:
+                seen.add(x); out.append(x)
+        return out
+
+    return {
+        "critico":    dedup(critico),
+        "importante": dedup(importante),
+        "menor":      dedup(menor),
+    }
+
+
 @app.route("/api/zap/report/<scan_id>")
 def api_zap_report(scan_id):
     """Generate ZAP scan report — HTML (default) or PDF (?fmt=pdf)."""
@@ -3637,6 +3751,12 @@ def api_zap_report(scan_id):
     engineer = s.get("engineer", "Sin especificar")
     total_a  = len(alerts)
 
+    # Build priority sections
+    prio = _zap_build_priorities(alerts, urls)
+
+    def prio_items_html(items, bullet="- "):
+        return "\n".join(f"{bullet}{e(item)}" for item in items) if items else f"{bullet}Sin hallazgos en esta categoría"
+
     risk_color = {"High":"#C94040","Medium":"#D4780A","Low":"#2274C8","Informational":"#5C6B8A"}
     risk_bg    = {"High":"#FCEBEB","Medium":"#FAEEDA","Low":"#E6F1FB","Informational":"#F0F2F6"}
 
@@ -3658,42 +3778,105 @@ def api_zap_report(scan_id):
     html_body = f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
 <title>ZAP Passive Scan — {e(target)}</title>
 <style>
-body{{font-family:system-ui,sans-serif;background:#F4F6F9;color:#1A1A2E;margin:0}}
-.page{{max-width:1100px;margin:24px auto;background:#fff;border-radius:10px;
-       box-shadow:0 4px 24px rgba(0,0,0,.10);overflow:hidden}}
-.hdr{{background:linear-gradient(135deg,#0D1B2A,#1B3556);color:#fff;padding:28px 36px}}
-.hdr h1{{font-size:20px;margin:0 0 6px}}.hdr p{{color:#A8C4DC;margin:2px 0;font-size:13px}}
-.body{{padding:28px 36px}}
-.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:28px}}
-.card{{border-radius:8px;padding:14px;text-align:center;border:1px solid}}
-.card .n{{font-size:32px;font-weight:800;line-height:1}}
-.card .l{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;margin-top:4px}}
-.sig{{margin-top:28px;border-top:1px solid #DDE2EC;padding-top:18px;display:flex;
-      justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px}}
-.sig-block{{font-size:11px;color:#5C6B8A}}
-.sig-block strong{{color:#1A1A2E;font-size:13px;display:block;margin-top:6px}}
-.sig-line{{border-bottom:1px solid #1A1A2E;width:220px;margin:18px 0 4px}}
-h2{{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
-    color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:6px;margin:24px 0 14px}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#F4F6F9;color:#1A1A2E}}
+.page{{max-width:960px;margin:28px auto;background:#fff;border-radius:12px;
+       box-shadow:0 4px 28px rgba(0,0,0,.11);overflow:hidden}}
+/* Header */
+.hdr{{background:linear-gradient(135deg,#0D1B2A 0%,#1B3556 100%);color:#fff;padding:32px 40px 26px}}
+.hdr h1{{font-size:21px;font-weight:700;margin:0 0 6px;letter-spacing:-.3px}}
+.hdr p{{color:#A8C4DC;margin:3px 0;font-size:13px}}
+.hdr-meta{{display:flex;gap:28px;margin-top:16px;flex-wrap:wrap}}
+.hdr-meta-item .label{{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#7BAFD4;font-weight:600}}
+.hdr-meta-item .value{{font-size:13px;color:#E8F1F8;font-weight:500;margin-top:2px}}
+/* Body */
+.body{{padding:32px 40px}}
+/* Cards */
+.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:32px}}
+.card{{border-radius:8px;padding:16px 12px;text-align:center;border:1px solid}}
+.card .n{{font-size:34px;font-weight:800;line-height:1}}
+.card .l{{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-top:5px}}
+/* Section title */
+.section-title{{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.10em;
+                color:#5C6B8A;border-bottom:2px solid #E8ECF2;padding-bottom:7px;margin:28px 0 16px}}
+/* Priority block */
+.prio-wrap{{display:flex;flex-direction:column;gap:18px;margin-bottom:32px}}
+.prio-block{{border-radius:10px;overflow:hidden;border:1px solid}}
+.prio-block-hdr{{padding:12px 18px;display:flex;align-items:center;gap:10px}}
+.prio-num{{font-size:22px;line-height:1}}
+.prio-title{{font-size:15px;font-weight:700;letter-spacing:-.2px}}
+.prio-code{{background:#1A1E27;border-radius:0 0 9px 9px;padding:16px 20px;
+            font-family:'Courier New',Consolas,monospace;font-size:13px;
+            line-height:1.9;white-space:pre-wrap;word-break:break-word}}
+.prio-critico   .prio-block-hdr{{background:#FFF0F0;border-bottom:1px solid #FFCACA}}
+.prio-critico   .prio-title{{color:#A32D2D}}
+.prio-critico   .prio-code{{color:#FF9999}}
+.prio-importante .prio-block-hdr{{background:#FFF8EC;border-bottom:1px solid #FFD9A0}}
+.prio-importante .prio-title{{color:#854F0B}}
+.prio-importante .prio-code{{color:#FFD080}}
+.prio-menor     .prio-block-hdr{{background:#F0F4FF;border-bottom:1px solid #C5D5F5}}
+.prio-menor     .prio-title{{color:#2B4DA0}}
+.prio-menor     .prio-code{{color:#90AAEE}}
+/* Alerts table */
 table{{width:100%;border-collapse:collapse;font-size:12px}}
-th{{background:#2c3e50;color:#fff;padding:8px 10px;text-align:left;font-size:11px}}
-td{{padding:7px 10px;border-bottom:1px solid #E0E6EF;vertical-align:top}}
-tr:hover td{{background:#F8FAFC}}
-ul{{margin:0;padding-left:18px;columns:2;column-gap:20px}}
-li{{margin-bottom:3px;break-inside:avoid}}
-@media print{{.page{{box-shadow:none;border-radius:0;margin:0}}
-              .hdr,.card,.sig{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
+th{{background:#2c3e50;color:#fff;padding:9px 11px;text-align:left;font-size:11px;font-weight:600}}
+td{{padding:8px 11px;border-bottom:1px solid #E8ECF2;vertical-align:top}}
+tr:hover td{{background:#F7F9FC}}
+/* URLs */
+.url-grid{{display:grid;grid-template-columns:1fr 1fr;gap:3px 18px;
+           font-family:'Courier New',monospace;font-size:11px;color:#185FA5;max-height:240px;
+           overflow-y:auto;background:#F7F9FC;border:1px solid #E0E6EF;
+           border-radius:8px;padding:12px 14px}}
+.url-item{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+/* Signature */
+.sig{{margin-top:32px;border-top:2px solid #E8ECF2;padding-top:22px;
+      display:grid;grid-template-columns:1fr 1fr;gap:20px}}
+.sig-left,.sig-right{{font-size:11px;color:#5C6B8A;line-height:1.7}}
+.sig-line{{border-bottom:1px solid #1A1A2E;margin:22px 0 6px;width:200px}}
+.sig-name{{font-size:14px;font-weight:700;color:#1A1A2E}}
+.sig-right{{text-align:right}}
+.confidential{{display:inline-block;background:#1A1A2E;color:#fff;font-size:9px;
+               font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+               padding:2px 8px;border-radius:3px;margin-top:6px}}
+@media print{{
+  body{{background:#fff}}
+  .page{{box-shadow:none;border-radius:0;margin:0}}
+  .hdr,.card,.prio-block,.prio-code{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+}}
 </style></head><body>
 <div class="page">
+
+<!-- HEADER -->
 <div class="hdr">
-  <h1>&#x1F50D; ZAP Passive Scan — Reporte de Seguridad</h1>
-  <p><strong style="color:#7EC8E3">{e(target)}</strong></p>
-  <p>Ingeniero: {e(engineer)} &nbsp;&nbsp;|&nbsp;&nbsp;
-     Inicio: {e(s.get('start',''))} &nbsp;&nbsp;|&nbsp;&nbsp;
-     Fin: {e(s.get('end','—'))} &nbsp;&nbsp;|&nbsp;&nbsp;
-     ID: <code style="font-size:11px;color:#90caf9">{e(scan_id)}</code></p>
+  <h1>&#x1F50D; Reporte de Seguridad Web — ZAP Passive Scan</h1>
+  <p style="color:#7EC8E3;font-size:14px;font-weight:600">{e(target)}</p>
+  <div class="hdr-meta">
+    <div class="hdr-meta-item">
+      <div class="label">Ingeniero</div>
+      <div class="value">{e(engineer)}</div>
+    </div>
+    <div class="hdr-meta-item">
+      <div class="label">Inicio del escaneo</div>
+      <div class="value">{e(s.get('start','—'))}</div>
+    </div>
+    <div class="hdr-meta-item">
+      <div class="label">Fin del escaneo</div>
+      <div class="value">{e(s.get('end','—'))}</div>
+    </div>
+    <div class="hdr-meta-item">
+      <div class="label">ID</div>
+      <div class="value" style="font-family:monospace;font-size:12px">{e(scan_id)}</div>
+    </div>
+    <div class="hdr-meta-item">
+      <div class="label">Herramienta</div>
+      <div class="value">OWASP ZAP 2.17</div>
+    </div>
+  </div>
 </div>
+
 <div class="body">
+
+<!-- SUMMARY CARDS -->
 <div class="cards">
   <div class="card" style="background:#FCEBEB;border-color:#F09595;color:#A32D2D">
     <div class="n">{counts.get('High',0)}</div><div class="l">Alto</div></div>
@@ -3706,27 +3889,69 @@ li{{margin-bottom:3px;break-inside:avoid}}
   <div class="card" style="background:#EAF3DE;border-color:#C0DD97;color:#3B6D11">
     <div class="n">{len(urls)}</div><div class="l">URLs</div></div>
 </div>
-<h2>Alertas de seguridad ({total_a})</h2>
+
+<!-- PRIORITIES -->
+<div class="section-title">Prioridades (Orden de Crítica)</div>
+<div class="prio-wrap">
+
+  <div class="prio-block prio-critico" style="border-color:#FFCACA">
+    <div class="prio-block-hdr">
+      <span class="prio-num">1️⃣</span>
+      <span class="prio-title">CRÍTICO (Implementar YA)</span>
+    </div>
+    <div class="prio-code">{prio_items_html(prio["critico"])}</div>
+  </div>
+
+  <div class="prio-block prio-importante" style="border-color:#FFD9A0">
+    <div class="prio-block-hdr">
+      <span class="prio-num">2️⃣</span>
+      <span class="prio-title">IMPORTANTE (Próximas semanas)</span>
+    </div>
+    <div class="prio-code">{prio_items_html(prio["importante"])}</div>
+  </div>
+
+  <div class="prio-block prio-menor" style="border-color:#C5D5F5">
+    <div class="prio-block-hdr">
+      <span class="prio-num">3️⃣</span>
+      <span class="prio-title">MENOR (Después)</span>
+    </div>
+    <div class="prio-code">{prio_items_html(prio["menor"])}</div>
+  </div>
+
+</div>
+
+<!-- ALERTS TABLE -->
+<div class="section-title">Detalle de Alertas ({total_a})</div>
 <table>
   <tr><th>Riesgo</th><th>Vulnerabilidad</th><th>URL</th><th>Parámetro</th><th>Descripción</th></tr>
   {rows or '<tr><td colspan="5" style="text-align:center;color:#3B6D11;padding:20px">&#x2713; Sin alertas detectadas</td></tr>'}
 </table>
-<h2>URLs descubiertas ({len(urls)})</h2>
-<ul>{url_list}</ul>
+
+<!-- URLS -->
+<div class="section-title" style="margin-top:28px">URLs Descubiertas ({len(urls)})</div>
+<div class="url-grid">
+  {"".join(f'<div class="url-item" title="{e(u)}">{e(u)}</div>' for u in sorted(urls)[:400])}
+</div>
+
+<!-- SIGNATURE -->
 <div class="sig">
-  <div class="sig-block">
-    Ingeniero responsable<br>
+  <div class="sig-left">
+    Ingeniero responsable del escaneo
     <div class="sig-line"></div>
-    <strong>{e(engineer)}</strong>
+    <div class="sig-name">{e(engineer)}</div>
     Seguridad Ofensiva — Datacom Security
   </div>
-  <div class="sig-block" style="text-align:right">
-    Generado: {e(now_display())}<br>
-    Herramienta: OWASP ZAP 2.17<br>
-    <strong style="font-size:10px;color:#8A94A6">Confidencial — Uso interno</strong>
+  <div class="sig-right">
+    <div>Generado: {e(now_display())}</div>
+    <div>Objetivo: {e(target)}</div>
+    <div>Escaneo: {e(s.get('start','—'))} → {e(s.get('end','—'))}</div>
+    <div><span class="confidential">Confidencial</span></div>
   </div>
 </div>
-</div></div></body></html>"""
+
+</div><!-- /body -->
+</div><!-- /page -->
+</body></html>"""
 
     fname = f"zap_report_{re.sub(r'[^a-zA-Z0-9._-]','_',target)}_{scan_id}.html"
     return Response(html_body, mimetype="text/html",
@@ -3905,6 +4130,43 @@ def _zap_pdf_report(s: dict, scan_id: str) -> "Response":
         ("ROWBACKGROUNDS",(0,1),(-1,-1), [C_ROW2, C_ROW1]),
     ]))
     story.append(risk_t)
+
+    # ── Priority action plan ──────────────────────────────────────────────────
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph("Prioridades (Orden de Crítica)", st["h1"]))
+    story.append(hr())
+
+    prio = _zap_build_priorities(alerts, urls)
+
+    prio_sections = [
+        ("1️⃣  CRÍTICO — Implementar YA",            prio["critico"],    C_CRIT,  colors.HexColor("#FFF0F0"), colors.HexColor("#FFCACA")),
+        ("2️⃣  IMPORTANTE — Próximas semanas",       prio["importante"], C_HIGH,  colors.HexColor("#FFF8EC"), colors.HexColor("#FFD9A0")),
+        ("3️⃣  MENOR — Después",                     prio["menor"],      C_LOW,   colors.HexColor("#F0F4FF"), colors.HexColor("#C5D5F5")),
+    ]
+
+    for title, items, txt_col, bg_col, border_col in prio_sections:
+        # Header row
+        hdr_row = [[Paragraph(f"<b>{title}</b>",
+                               S(f"ph_{title[:4]}", fontSize=10, textColor=txt_col,
+                                 fontName="Helvetica-Bold"))]]
+        items_text = "\n".join(f"- {item}" for item in items) if items else "- Sin hallazgos en esta categoría"
+        body_row = [[Paragraph(items_text.replace("\n","<br/>"),
+                               S(f"pb_{title[:4]}", fontSize=8.5, leading=14,
+                                 textColor=colors.HexColor("#263238"),
+                                 fontName="Courier", backColor=colors.HexColor("#1A1E27"),
+                                 leftIndent=8, rightIndent=8, spaceBefore=4, spaceAfter=4))]]
+        prio_table = Table(hdr_row + body_row, colWidths=[avail])
+        prio_table.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (0,0),  bg_col),
+            ("BACKGROUND",    (0,1), (0,-1), colors.HexColor("#1A1E27")),
+            ("TOPPADDING",    (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ("LEFTPADDING",   (0,0), (-1,-1), 12),
+            ("BOX",           (0,0), (-1,-1), 1, border_col),
+            ("LINEBELOW",     (0,0), (0,0),   0.5, border_col),
+            ("ROUNDEDCORNERS",[6]),
+        ]))
+        story.append(KeepTogether([prio_table, Spacer(1, 0.22*cm)]))
 
     # ── Alerts detail ─────────────────────────────────────────────────────────
     if alerts:
